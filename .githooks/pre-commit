@@ -1,0 +1,35 @@
+#!/bin/sh
+# ============================================================================
+#  阻止把「填了令牌的 config.json」提交上去
+#  这个文件是设计给用户填 api_key 的，一旦填着提交，令牌就公开泄漏了。
+#  生效方式：git config core.hooksPath .githooks
+# ============================================================================
+
+fail=0
+
+for f in $(git diff --cached --name-only --diff-filter=ACM); do
+  case "$f" in
+    *config.json)
+      # 只看暂存区里的内容
+      content=$(git show ":$f" 2>/dev/null)
+      if printf '%s' "$content" | grep -qE '"api_key"[[:space:]]*:[[:space:]]*"[^"]+"'; then
+        echo "✗ 拒绝提交：$f 里填了 api_key —— 令牌会被公开。"
+        echo "  请先把 api_key 清空成 \"\" 再提交。"
+        fail=1
+      fi
+      ;;
+  esac
+done
+
+# 兜底：扫一遍暂存内容里像 sk- 开头的令牌
+if [ "$fail" -eq 0 ]; then
+  hits=$(git diff --cached -U0 | grep -E '^\+.*["'"'"']sk-[A-Za-z0-9]{20,}' | head -5)
+  if [ -n "$hits" ]; then
+    echo "✗ 拒绝提交：暂存内容里出现疑似令牌（sk- 开头）："
+    printf '%s\n' "$hits"
+    echo "  如果确认不是密钥，用 git commit --no-verify 跳过。"
+    fail=1
+  fi
+fi
+
+exit $fail
