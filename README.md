@@ -1,4 +1,4 @@
-# MSSK Image（`imagegen-relay`）
+﻿# MSSK Image（`imagegen-relay`）
 
 给 Codex 用的生图技能，专配 **MSSK 中转站**（`relay.msskwithth.com:9443`）。
 装完直接说话就能出图——**不用装 Node.js / Python / Go，不用配环境变量，不用重启客户端**。
@@ -19,7 +19,7 @@
 ```text
 帮我安装 imagegen-relay 这个 Codex 技能：
 
-1. 把 https://github.com/MSSK-TH/mssk-image2-skill 克隆到一个临时目录
+1. 把 https://github.com/MSSK-TH/mssk-image-skill 克隆到一个临时目录
 2. 把里面的 imagegen-relay 文件夹整个拷贝到 "$env:USERPROFILE\.codex\skills\imagegen-relay"
 3. 对拷过去的全部文件执行 Unblock-File
 4. 克隆用的临时目录用完删掉
