@@ -1,4 +1,4 @@
-﻿# MSSK Image（`imagegen-relay`）
+# MSSK Image（`imagegen-relay`）
 
 给 Codex 用的生图技能，专配 **MSSK 中转站**（`relay.msskwithth.com:9443`）。
 装完直接说话就能出图——**不用装 Node.js / Python / Go，不用配环境变量，不用重启客户端**。
@@ -53,6 +53,13 @@
 ```
 
 令牌去中转站后台「令牌」页新建：**额度不限、分组留空、永不过期、不要开模型限制**。
+
+> ⚠️ **安全**：`config.json` 里的令牌**只属于你**。
+> 不要把它提交回仓库、不要发群里、不要把整个技能目录打包外发。
+> 本仓自带一个 pre-commit 钩子会拦截"填了令牌的 config.json"：
+> ```
+> git config core.hooksPath .githooks   # 克隆后跑一次即可生效
+> ```
 **一人一把，别互相传。**
 
 ### 3. 开一个新对话，说
