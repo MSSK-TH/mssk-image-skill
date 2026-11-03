@@ -1,0 +1,23 @@
+# 同步/修改时留下的备份
+_backup/
+*.bak
+*.bak-old
+*.bak-*
+
+# 编辑器与系统垃圾
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# 本地输出
+output/
+tmp/
+
+# 密钥文件：只提交 .env.example，真实 .env 永不入库
+.env
+.env.*
+!.env.example
+*.pem
+shimk_*

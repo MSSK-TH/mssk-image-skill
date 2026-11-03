@@ -1,0 +1,37 @@
+imagegen-relay  —— 版本戳
+==================================================
+version : 1.2.0
+date    : 2026-10-16（原生端点接入，v1.2.0）
+baseline: 官方 imagegen（.system/imagegen）；其中 6 个文件逐字节完全一致：
+          prompting.md / sample-prompts.md / remove_chroma_key.py / LICENSE.txt / 两个图标
+
+默认值（出厂状态）
+------------------
+  图像模型            gpt-image-2（本中转站唯一）
+  reference 路线模型  gpt-6-astra
+  --preflight         off      ← 不自动改你的提示词
+  --retry-refusal     0        ← 被拒不自动重发（一次算一次）
+  --deadline          600 秒   ← 单任务硬上限，杜绝"跑 20 分钟才失败"
+
+已固化的能力
+------------
+  · 两条路线：reference（/v1/responses + 图像工具，模型自己融合参考图）
+              generate / edit / generate-batch（/v1/images/*，官方 fallback 同构）
+  · Codex JSON 契约与 OpenAI multipart 契约自动探测（edit）
+  · 输出层安审判别：按延迟区分"提示词层 / 输出图层"，附消融实测数据
+  · 内容安全拒绝处理流程（Relay fact 7）+ 紧凑中性简报模板
+  · 人物简报规则：必须写明服装，但写成"一句覆盖/一致性约束"，不逐件列举
+  · 心跳日志 + 干净报错（不再吐 traceback）
+
+实测基线（同一渠道、同一参考图）
+--------------------------------
+  逐件列举服装的长简报                    0 / 5   全拒
+  一句话覆盖约束的紧凑简报                2 / 2   通过（且保留原服装）
+  跨 4 张参考图 8 次单跑                  3 / 8   ≈ 37%（输出层判定随机）
+
+可选择的开关（默认都关着）
+--------------------------
+  --preflight auto|always   自动中和风险词 + 追加覆盖约束（每条改动都会打印）
+  --retry-refusal N         被拒后换中性措辞重发 N 次
+  --reasoning-effort high   reference 路线给改写模型开高（不要用 -high 模型 ID，会 500）
+  --report-json PATH        落一份 JSON 报告（含最终提示词、actual_size、耗时）
