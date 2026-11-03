@@ -1,7 +1,12 @@
 # MSSK Image（`imagegen-relay`）
 
 给 Codex 用的生图技能，专配 **MSSK 中转站**（`relay.msskwithth.com:9443`）。
-装完直接说话就能出图——**不用装 Node.js / Python / Go，不用配环境变量，不用重启客户端**。
+装完直接说话就能出图——**不用装 Node.js / Go，不用配环境变量，不用重启客户端**。
+
+> **前置条件只有一个：Python 3.9+ 在 PATH 里**（Windows 上是 `python` 或 `py`）。
+> 除此之外不需要任何依赖 —— 不用 `pip install`。
+> 只有用 `--max-dim` / `--exact-size` / `--output-format` 这几个高级参数时才需要 Pillow
+> （装了 `uv` 的话 launcher 会自动带上 Pillow，不用手动装）。
 
 > **v1.2.0（2026-10-16）起，本技能替代旧的 `mssk-image2`。**
 > 最大变化：图像请求直连上游的**原生图像端点**（和官方 Codex 内置生图走同一条路），
@@ -26,7 +31,7 @@
 5. 完成后告诉我结果
 ```
 
-> ⚠️ 这个仓库是 **private**，克隆需要你自己有权限（SSH key 或 token）。
+> ✅ 这个仓库是 **public**，直接 `git clone` 就行，**不需要任何权限**（不用 SSH key、不用找管理员）。
 
 **方式二：从本地文件夹安装**
 
@@ -138,6 +143,9 @@ SPEC.md          行为规格：路由矩阵、参数语义、错误语义、不
 | 报 `[moderation_blocked]` | 内容安全判定。**重试**或换参考图；别再找"审核开关"了，没有 |
 | 提示 `Output already exists` | 加 `--force`，或换个输出路径 |
 | 完全不出图 | 先确认 `config.json` 里的令牌没过期；再看 shim 容器是否在跑 |
+| `Python 3 was not found` | 装 Python 3.9+，或确认 `python` 在 PATH 里 |
+| `SSL: UNEXPECTED_EOF_WHILE_READING` / 连不上 | **开 Clash 的时候容易踩**：如果 `msskwithth.com` 没走 DIRECT，或 DNS 用了 `1.1.1.1`（国内直连不通）→ 解析超时 5 秒 → 打不开。把域名加进 DIRECT 规则并指定国内 DNS；最省事的办法是**访问本站时不挂代理**（本来就该直连，更快） |
+| 401 / `invalid token` | 令牌填错，或建令牌时**没留空分组**、开了模型限制 |
 
 运维命令（在 VPS 上）：
 
