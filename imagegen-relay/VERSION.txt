@@ -1,9 +1,19 @@
 imagegen-relay  —— 版本戳
 ==================================================
-version : 1.2.0
-date    : 2026-10-16（原生端点接入，v1.2.0）
+version : 1.3.0
+date    : 2026-11-06（GIF 动图 + 多图返回，v1.3.0）
 baseline: 官方 imagegen（.system/imagegen）；其中 6 个文件逐字节完全一致：
           prompting.md / sample-prompts.md / remove_chroma_key.py / LICENSE.txt / 两个图标
+
+v1.3.0 新增（2026-11-06 实测）
+------------------------------
+  · 动图 GIF：data[i].mime_type=image/gif 时按原字节保存（不重编码、不丢帧），
+    自动改扩展名 .gif，跳过 --exact-size / --downscale，并写出 <name>-sprite.png
+    + 打印 animation（rows/columns/frame_count/frame_duration_ms）
+  · --gif-speed {0.25..2}：8 档，走 style.mssk_gif_speed（顶层字段会被 new-api 丢掉），
+    只缩放 animation.frame_duration_ms，GIF 文件本身仍是 1x
+  · 多图：上游一次可能回多张（实测 4~5 张），data[] 每项写一个文件
+    （base.png → base.png / base-1.png / …），不再只有第一张
 
 默认值（出厂状态）
 ------------------
@@ -22,6 +32,8 @@ baseline: 官方 imagegen（.system/imagegen）；其中 6 个文件逐字节完
   · 内容安全拒绝处理流程（Relay fact 7）+ 紧凑中性简报模板
   · 人物简报规则：必须写明服装，但写成"一句覆盖/一致性约束"，不逐件列举
   · 心跳日志 + 干净报错（不再吐 traceback）
+  · 动图 GIF + sprite sheet + 8 档速度（v1.3.0）
+  · 一次多图全部落地（v1.3.0）
 
 实测基线（同一渠道、同一参考图）
 --------------------------------

@@ -280,7 +280,36 @@ The difference is nearly always one of three things: a different endpoint (chat/
 `images/edits`), a different upstream channel behind the same model name (`new-api` routes by token
 group), or a different reference image. Change something in this skill only after that comparison.
 
+### 10. Animated GIF (verified 2026-11-06)
+
+Ask for a **loop animation** in the prompt (`…的动画GIF，循环播放`) and the relay's web pipeline
+returns a real animated GIF: `mime_type: "image/gif"`, `GIF89a`, 9-16 frames — plus two extra fields
+in the same `data[i]` item:
+
+```json
+{"b64_json":"…","mime_type":"image/gif",
+ "sprite_sheet":"…","animation":{"rows":3,"columns":3,"frame_count":9,"frame_duration_ms":120}}
+```
+
+- `sprite_sheet` is a PNG grid the web UI plays on a canvas (it lives in the upstream
+  `parts[0].metadata.generation`, **not** in the message metadata). The CLI writes it next to the
+  GIF as `<name>-sprite.png` and prints the grid + frame timing.
+- **Never re-encode the GIF.** Pillow keeps only the first frame, so any "convert / resize /
+  exact-size" step destroys the animation. The CLI detects `GIF87a`/`GIF89a`, forces a `.gif`
+  extension, writes the bytes verbatim, and skips `--exact-size` / `--downscale` with a warning.
+- **`--gif-speed {0.25,0.5,0.75,1,1.25,1.5,1.75,2}`** picks one of the 8 official speed tiers. It
+  rides in `style.mssk_gif_speed` (top-level custom fields are dropped by new-api) and only changes
+  `animation.frame_duration_ms` (= base / speed) for the web player; the delivered GIF file stays
+  the 1x original.
+- One turn can return **several images at once** (upstream emits one `image_asset_pointer` per
+  message). The relay returns every new asset as its own `data[i]`; the CLI writes one file per
+  entry (`--out base.png` → `base.png`, `base-1.png`, …). Do not assume `data.length == 1`.
+
+Asking for "4 张不同的图" sometimes yields 1 and sometimes 4-5 — upstream decides. If the count
+matters, say it twice and check `data.length` before reporting.
+
 ## When to use
+
 
 - Generate a new image (concept art, product shot, cover, website hero, character sheet)
 - Generate a new image using one or more reference images for style, composition, or mood

@@ -144,6 +144,11 @@ Mask notes:
 - Downscaled copies use the default suffix `-web` unless you override it.
 - Non-PNG `--output-format` values (and `--output-compression`) are produced by local re-encoding
   and need Pillow. Without Pillow the CLI stops with a message that shows how to run through `uv`.
+- **Animated GIF** (2026-11-06): when the relay returns `mime_type: image/gif`, the CLI forces a
+  `.gif` extension, writes the upstream bytes **verbatim** (Pillow would keep only frame 1), skips
+  `--exact-size` / `--downscale`, and writes the accompanying sprite grid as `<name>-sprite.png`.
+  `data[]` can hold **several** images per turn: `--out base.png` then writes `base.png`,
+  `base-1.png`, `base-2.png`, … one file per entry.
 
 ## Recipes
 

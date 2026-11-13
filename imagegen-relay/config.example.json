@@ -1,0 +1,4 @@
+{
+  "api_url": "https://relay.example.com:9443/v1",
+  "api_key": "sk-your-relay-token-here"
+}

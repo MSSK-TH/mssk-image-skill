@@ -373,6 +373,56 @@ def _skill_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+# ---------------------------------------------------------------- 上游对话钥匙
+# 【2026-11-06】网页版能"在同一对话里改图"，是因为它每次请求都带 style.mssk_conv；
+# 本 CLI 以前不带 → 每次都是新对话（改几次就多出几个对话）。
+# 现在把钥匙存在 config.json 旁边，连续调用自动续接；--new-conv 换一把，--conv-key 指定。
+def _conv_key_path() -> Path:
+    return _skill_root() / ".conv-key"
+
+
+def _new_conv_key() -> str:
+    import uuid
+    return "skill-" + uuid.uuid4().hex[:12]
+
+
+def _resolve_conv_key(args: argparse.Namespace) -> str:
+    explicit = getattr(args, "conv_key", None)
+    if explicit:
+        return str(explicit)
+    path = _conv_key_path()
+    if getattr(args, "new_conv", False) or not path.exists():
+        key = _new_conv_key()
+        try:
+            path.write_text(key, encoding="utf-8")
+        except Exception:
+            pass
+        return key
+    try:
+        key = path.read_text(encoding="utf-8").strip()
+    except Exception:
+        key = ""
+    if not key:
+        key = _new_conv_key()
+        try:
+            path.write_text(key, encoding="utf-8")
+        except Exception:
+            pass
+    return key
+
+
+def _style_payload(args: argparse.Namespace) -> Dict[str, Any]:
+    """new-api 会丢顶层自定义字段 → 自定义参数一律走 style（json.RawMessage 能透传）。"""
+    style: Dict[str, Any] = {}
+    key = _resolve_conv_key(args)
+    if key:
+        style["mssk_conv"] = key
+    gif_speed = getattr(args, "gif_speed", None)
+    if gif_speed:
+        style["mssk_gif_speed"] = str(gif_speed)
+    return style
+
+
 def _load_config_json() -> Dict[str, Any]:
     cfg_path = _skill_root() / "config.json"
     if not cfg_path.exists():
@@ -701,6 +751,32 @@ class ImageResult:
     actual_size: Optional[str]
     revised_prompt: Optional[str]
     source: str
+    # 【2026-11-06】GIF 支持：relay 会回 mime_type / sprite_sheet / animation
+    mime: Optional[str] = None
+    sprite: Optional[bytes] = None
+    animation: Optional[Dict[str, Any]] = None
+
+
+def _looks_like_gif(raw: bytes) -> bool:
+    return raw[:6] in (b"GIF87a", b"GIF89a")
+
+
+def _result_extra(item: Dict[str, Any]) -> Dict[str, Any]:
+    """[relay GIF] 取出 mime / sprite sheet / animation 三个附加字段。"""
+    mime = item.get("mime_type")
+    sprite_b64 = item.get("sprite_sheet")
+    sprite: Optional[bytes] = None
+    if isinstance(sprite_b64, str) and sprite_b64:
+        try:
+            sprite = base64.b64decode(sprite_b64)
+        except Exception:
+            sprite = None
+    anim = item.get("animation")
+    return {
+        "mime": str(mime) if mime else None,
+        "sprite": sprite,
+        "animation": anim if isinstance(anim, dict) else None,
+    }
 
 
 def _parse_images(payload: Dict[str, Any], *, creds: RelayCredentials, timeout: float) -> List[ImageResult]:
@@ -724,6 +800,7 @@ def _parse_images(payload: Dict[str, Any], *, creds: RelayCredentials, timeout: 
                     actual_size=item.get("size"),
                     revised_prompt=item.get("revised_prompt"),
                     source="b64_json",
+                    **_result_extra(item),
                 )
             )
             continue
@@ -738,6 +815,7 @@ def _parse_images(payload: Dict[str, Any], *, creds: RelayCredentials, timeout: 
                     actual_size=item.get("size"),
                     revised_prompt=item.get("revised_prompt"),
                     source="url",
+                    **_result_extra(item),
                 )
             )
             continue
@@ -1333,6 +1411,7 @@ class WrittenArtifact:
     pixels: Optional[Tuple[int, int]] = None
     revised_prompt: Optional[str] = None
     source: str = "b64_json"
+    mime: Optional[str] = None
 
 
 def _exact_size_image_bytes(
@@ -1516,29 +1595,49 @@ def _write_results(
     exact_fit: str = "cover",
 ) -> List[WrittenArtifact]:
     artifacts: List[WrittenArtifact] = []
+    # 【2026-11-06】多图：上游一次可能给多张（data.length > n）。按结果数补足输出路径，
+    # 否则第二张起会被 index >= len(outputs) 直接丢掉。
+    if len(results) > len(outputs) and outputs:
+        base = outputs[0]
+        extra = [base.with_name(f"{base.stem}-{i}{base.suffix}") for i in range(1, len(results))]
+        outputs = list(outputs) + extra
     for index, result in enumerate(results):
         if index >= len(outputs):
             break
         out_path = outputs[index]
+        is_gif = _looks_like_gif(result.raw) or (result.mime or "").lower() == "image/gif"
+        if is_gif and out_path.suffix.lower() != ".gif":
+            # 上游给的是动图 GIF，扩展名必须跟着改，否则下载/预览端会按 PNG 解
+            out_path = out_path.with_name(out_path.stem + ".gif")
         if out_path.exists() and not force:
             _die(f"Output already exists: {out_path} (use --force to overwrite)")
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        payload = _convert_image_bytes(
-            result.raw, output_format=output_format, output_compression=output_compression
-        )
-        if exact_size is None and _EXACT_SIZE_REQUEST is not None:
-            exact_size = _EXACT_SIZE_REQUEST
-            exact_fit = _EXACT_FIT_REQUEST
-        if exact_size is not None:
-            # [relay] upstream ignores `size`; deliver the requested pixels locally instead.
-            payload = _exact_size_image_bytes(
-                payload,
-                target=exact_size,
-                fit=exact_fit,
-                output_format=output_format,
-                output_compression=output_compression,
+        if is_gif:
+            # 【2026-11-06】GIF 绝不能重编码：PIL 只会保留第一帧 → 动画直接没了。
+            # 原样写字节，同时跳过 --exact-size / --downscale 这类会解码重采样的一步。
+            if output_format not in ("png", None) or output_compression:
+                _warn("[gif] 动图按原字节保存，--output-format/--output-compression 已忽略")
+            if exact_size is not None or downscale_max_dim is not None:
+                _warn("[gif] 动图跳过 --exact-size/--downscale（重采样会丢动画）")
+            payload = result.raw
+        else:
+            payload = _convert_image_bytes(
+                result.raw, output_format=output_format, output_compression=output_compression
             )
+        if not is_gif:
+            if exact_size is None and _EXACT_SIZE_REQUEST is not None:
+                exact_size = _EXACT_SIZE_REQUEST
+                exact_fit = _EXACT_FIT_REQUEST
+            if exact_size is not None:
+                # [relay] upstream ignores `size`; deliver the requested pixels locally instead.
+                payload = _exact_size_image_bytes(
+                    payload,
+                    target=exact_size,
+                    fit=exact_fit,
+                    output_format=output_format,
+                    output_compression=output_compression,
+                )
         out_path.write_bytes(payload)
         print(f"Wrote {out_path}")
 
@@ -1548,9 +1647,25 @@ def _write_results(
             pixels=_image_size_of(payload),
             revised_prompt=result.revised_prompt,
             source=result.source,
+            mime=result.mime or ("image/gif" if is_gif else None),
         )
 
-        if downscale_max_dim is not None:
+        # sprite sheet（九宫格）+ animation 元数据：前端 canvas 播放/调速靠它
+        if result.sprite:
+            sprite_path = out_path.with_name(out_path.stem + "-sprite.png")
+            try:
+                sprite_path.write_bytes(result.sprite)
+                anim = result.animation or {}
+                extra = (
+                    f"{anim.get('rows')}x{anim.get('columns')} 帧数={anim.get('frame_count')} "
+                    f"每帧={anim.get('frame_duration_ms')}ms"
+                    if anim else "无 animation 元数据"
+                )
+                print(f"Wrote {sprite_path}  (sprite sheet {extra})")
+            except Exception as exc:
+                _warn(f"[gif] sprite sheet 写入失败：{exc}")
+
+        if downscale_max_dim is not None and not is_gif:
             derived = _derive_downscale_path(out_path, downscale_suffix)
             if derived.exists() and not force:
                 _die(f"Output already exists: {derived} (use --force to overwrite)")
@@ -1746,6 +1861,11 @@ def _generate(args: argparse.Namespace) -> None:
         ]
 
     wire = _wire_payload(args.model, prompt, args.n, args.size)
+    _style = _style_payload(args)
+    if _style:
+        wire["style"] = _style
+        _info(f"[会话] 续接钥匙 mssk_conv={_style.get('mssk_conv', '-')}"
+              + (f"；速度档 {_style['mssk_gif_speed']}x" if 'mssk_gif_speed' in _style else ""))
 
     if args.dry_run:
         preview = dict(payload)
@@ -1931,6 +2051,9 @@ def _edit(args: argparse.Namespace) -> None:
             json_payload["quality"] = args.quality
         if args.background:
             json_payload["background"] = args.background
+        _style = _style_payload(args)
+        if _style:
+            json_payload["style"] = _style
         try:
             (response, decoded), contract = _post_edit_with_retries(
                 creds,
@@ -2530,6 +2653,28 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--fit", dest="exact_fit", choices=("cover", "contain"), default="cover",
                         help="with --exact-size: cover = crop to fill (default), contain = letterbox")
     parser.add_argument("--downscale-suffix", default=DEFAULT_DOWNSCALE_SUFFIX)
+    # 【2026-11-06】上游对话钥匙：默认复用上次的（改图会接着同一个对话），--new-conv 换新的
+    parser.add_argument(
+        "--conv-key",
+        dest="conv_key",
+        default=None,
+        help="指定上游对话钥匙（style.mssk_conv）。同一个钥匙 = 同一个上游对话，改图会基于上一张",
+    )
+    parser.add_argument(
+        "--new-conv",
+        dest="new_conv",
+        action="store_true",
+        help="换一把新钥匙（开一个全新上游对话）；之后继续沿用这把",
+    )
+    # 【2026-11-06】GIF 速度档：1 = 原速，0.25~2 共 8 档（对齐官方）。
+    # 走 style.mssk_gif_speed —— new-api 会丢掉顶层自定义字段，style 是 json.RawMessage 能透传。
+    parser.add_argument(
+        "--gif-speed",
+        dest="gif_speed",
+        default=None,
+        choices=["0.25", "0.5", "0.75", "1", "1.25", "1.5", "1.75", "2"],
+        help="GIF 播放速度档位（0.25~2，8 档）。只影响动图的 frame_duration_ms，GIF 文件本身是 1x",
+    )
 
     # [relay] relay-specific switches
     parser.add_argument("--base-url", help="override the relay base URL (token still comes from config.json)")
