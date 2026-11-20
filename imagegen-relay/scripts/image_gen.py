@@ -575,7 +575,10 @@ def _style_payload(args: argparse.Namespace) -> Dict[str, Any]:
     if agent_model:
         style["mssk_model"] = str(agent_model)
     effort = getattr(args, "effort", None)
-    if effort:
+    # ⚠️ none 表示「即时」= **不传** thinking_effort。
+    #    webpipe 会把任意非空字符串原样塞进 body.thinking_effort，
+    #    传字符串 "none" 会被上游判成非法字段（实测 400）。这是 2026-11-19 修掉的 bug。
+    if effort and str(effort).strip().lower() not in ("", "none", "undefined", "null", "auto"):
         style["mssk_effort"] = str(effort)
     return style
 
@@ -2216,6 +2219,19 @@ def _edit(args: argparse.Namespace) -> None:
         _style = _style_payload(args)
         if _style:
             json_payload["style"] = _style
+            # 【2026-11-19 修复】multipart 契约（new-api / OpenAI 兼容走这条）不看 style，
+            #   shim 在 multipart 分支只读顶层 web_* 字段。之前这里没映射，
+            #   导致「带参考图改图时 --web-mode/--effort/--conv-key 全部失效」。
+            if _style.get("mssk_conv"):
+                fields["web_conv_key"] = _style["mssk_conv"]
+            if _style.get("mssk_mode"):
+                fields["web_mode"] = _style["mssk_mode"]
+            if _style.get("mssk_model"):
+                fields["web_model"] = _style["mssk_model"]
+            if _style.get("mssk_effort"):
+                fields["web_effort"] = _style["mssk_effort"]
+            if _style.get("mssk_gif_speed"):
+                fields["gif_speed"] = _style["mssk_gif_speed"]
         try:
             (response, decoded), contract = _post_edit_with_retries(
                 creds,
