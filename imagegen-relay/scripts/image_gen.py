@@ -2369,6 +2369,20 @@ def _data_uri_for(path: Path, max_dim: int) -> str:
 
 
 def _reference(args: argparse.Namespace) -> None:
+    # 【2026-11-19】这条路走 /v1/responses（由对话模型驱动图像工具），
+    #   shim 在该路由是原样透传，不读 style.mssk_*，所以下面这些参数无效。
+    #   宁可明确说一句，也不要静默忽略 —— 否则用户以为续接/档位生效了。
+    _ignored = [
+        ("conv_key", "--conv-key"), ("web_mode", "--web-mode"),
+        ("effort", "--effort"), ("agent_model", "--agent-model"),
+    ]
+    _for_this_route = [flag for attr, flag in _ignored if getattr(args, attr, None)]
+    if _for_this_route:
+        _warn(
+            "[reference] 以下参数在这条路由上无效（走 /v1/responses，不经 style 透传）："
+            + " ".join(_for_this_route)
+            + "；请改用 --reasoning-effort 控制推理强度"
+        )
     """[relay] Reference-to-image through Responses + the hosted image tool.
 
     This is the relay counterpart of the official skill's *built-in* path: the chat
@@ -2653,6 +2667,12 @@ def _run_generate_batch(args: argparse.Namespace) -> int:
             n,
             str(payload.get("size", args.size)),
         )
+        # 【2026-11-19 修复】batch 也要带 surface/档位/上游模型，否则批量出图时这些参数静默失效。
+        #   批量是「一批独立提示词」，所以去掉 mssk_conv —— 不让所有图挤进同一个上游会话。
+        _batch_style = _style_payload(args)
+        _batch_style.pop("mssk_conv", None)
+        if _batch_style:
+            wire["style"] = dict(wire.get("style") or {}, **_batch_style)
         try:
             print(f"{job_label} starting", file=sys.stderr)
             started = time.time()
@@ -2801,7 +2821,8 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
         "--effort",
         choices=tuple(EFFORT_ORDER),
         default=None,
-        help="网页管线推理档（与 web 前端同名）：none/minimal/low/medium/high/xhigh/max/ultra",
+        help="网页管线推理档：none/minimal/low/medium/high/xhigh/max/ultra（仅 generate/edit 生效；"
+        "reference 路由请用 --reasoning-effort）",
     )
     parser.add_argument(
         "--agent-model",
