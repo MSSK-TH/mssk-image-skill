@@ -966,7 +966,7 @@ def _report_pipeline(payload, model):
     _LAST_PIPELINE.update({"pipeline": via, "note": note, "degraded_reason": reason or None})
     # 与 web 端一致：降级要像「备用通道」标签那样醒目，不能混在普通输出里
     if degraded:
-        _warn(f"⚠️ 本次图片来自备用通道（{note}）—— 不是网页管线出的图")
+        _warn(f"本次图片来自备用通道（{note}）—— 不是网页管线出的图")
     else:
         _info(f"[pipeline] {note}")
     return dict(_LAST_PIPELINE)
