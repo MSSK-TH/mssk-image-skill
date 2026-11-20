@@ -21,3 +21,6 @@ tmp/
 !.env.example
 *.pem
 shimk_*
+
+# 装的是令牌，只应存在本机
+imagegen-relay/config.json

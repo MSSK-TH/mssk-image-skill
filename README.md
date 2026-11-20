@@ -8,10 +8,13 @@
 > 只有用 `--max-dim` / `--exact-size` / `--output-format` 这几个高级参数时才需要 Pillow
 > （装了 `uv` 的话 launcher 会自动带上 Pillow，不用手动装）。
 
-> **v1.2.0（2026-10-16）起，本技能替代旧的 `mssk-image2`。**
-> 最大变化：图像请求直连上游的**原生图像端点**（和官方 Codex 内置生图走同一条路），
-> 速度快 2～3 倍、失败信息带原因；并新增多图、透明背景、精确尺寸。
-> 行为规格见 [`SPEC.md`](SPEC.md)，历史决策与实测数据见仓库外 `交接-生图链路与技能-v2.md`。
+> **v1.4.0（2026-11-19）**：网页管线的三个开关终于能用命令行控制了
+> （`--web-mode` / `--effort` / `--agent-model`，走 `style.mssk_*` 透传）；
+> 失败可以编程处理（`CODE=` / `RETRYABLE=` / `HINT=`，配 `--report-json`）；
+> 会话钥匙改成**按项目隔离**（原来同机两人会互相覆盖）。
+>
+> 更早：v1.3.0 加了 GIF 动图与多图返回；v1.2.0 起图像请求直连上游原生端点（快 2～3 倍）。
+> 行为契约看 `imagegen-relay/SKILL.md` 与 `imagegen-relay/references/relay-api.md`。
 
 ---
 
@@ -48,6 +51,13 @@
 
 ### 2. 填你自己的令牌
 
+仓库里**没有** `config.json`（防止有人把令牌提交上去）。先复制一份：
+
+```bash
+cp imagegen-relay/config.example.json imagegen-relay/config.json
+```
+
+
 打开 `%USERPROFILE%\.codex\skills\imagegen-relay\config.json`：
 
 ```json
@@ -82,6 +92,15 @@
 | 「要 1024×1536 的竖版」 | 精确尺寸（见下） | +1 秒 |
 | 「要透明底」 | 透明 PNG（RGBA） | 同上 |
 
+**网页管线三件套**（只对网页管线生效，原生端点会忽略）：
+
+| 你想要 | 怎么说 / 怎么传 |
+|---|---|
+| 切工作模式（做卡片、素材、要反复改） | `--web-mode work`（默认 `chat`，生图通过率更高） |
+| 要更细的推理 | `--effort extended`（档位表跑 `image_gen.py tiers`） |
+| 想看有哪些档 | `image_gen.py tiers` 或 `tiers --mode work --json` |
+| 在同一个对话里继续改 | 同一目录下连续调用即可；多任务并行加 `--conv-key 名字` |
+
 **尺寸怎么控**（重要，三层别混）：
 
 | 你想要 | 怎么说 / 怎么传 | 效果 |
@@ -114,24 +133,26 @@
 ## 目录里有什么
 
 ```
-imagegen-relay/
-├── SKILL.md                 技能说明（Codex 读这个决定怎么做事）
-├── VERSION.txt              版本戳 + 出厂默认值
-├── config.json              你的令牌（安装后自己填）
-├── bin/                     run.cmd / run.ps1 / run.sh（把 config.json 注入环境后调 CLI）
-├── scripts/image_gen.py     CLI 本体（generate / edit / reference / generate-batch / models）
-├── references/              提示词规范、示例、CLI 参考、本站 API 备忘
-└── assets/                  图标
+imagegen-relay/                  ← 一个标准 skill 目录，整体拷进 .codex/skills/ 即可
+├── SKILL.md                    技能说明（Codex 读这个决定怎么做事）
+├── VERSION.txt                 版本戳 + 出厂默认值
+├── LICENSE.txt                 许可证
+├── config.example.json         配置模板（复制成 config.json 后填令牌）
+├── agents/openai.yaml          技能在客户端里的标题/图标/默认指令
+├── bin/                        run.cmd / run.ps1 / run.sh（注入 config.json 后调 CLI）
+├── scripts/
+│   ├── image_gen.py            CLI 本体（generate / edit / reference / batch / models / tiers）
+│   ├── relay_errors.py         失败分类（CODE=/HINT= 来源）
+│   └── remove_chroma_key.py    抠图兜底（与官方 skill 逐字节一致）
+├── references/                 提示词规范、示例、CLI 参考、本站 API 备忘、网络说明
+└── assets/                     图标
 ```
 
-配套组件：
+仓库根只有 `README.md`（本文件）、`.gitignore`、`.gitattributes`、`.githooks/`（防令牌误提交）。
 
-```
-SPEC.md          行为规格：路由矩阵、参数语义、错误语义、不变量、验收测试
-```
-
-> 服务端实现（`imagegen-shim`、生图站、网页管线）**不在本仓** —— 在私有仓
-> `MSSK-TH/mssk-image-relay`。本仓只放团队要安装的技能本体。
+> **`config.json` 不在仓库里** —— 它装的是你的令牌，只应存在于你本机。
+> 服务端实现（`imagegen-shim`、生图站、网页管线）也不在本仓，在私有仓 `MSSK-TH/mssk-image-relay`。
+> 本仓只放团队要安装的技能本体。
 
 ---
 
@@ -161,6 +182,26 @@ cd /opt/codex-relay/deploy && sudo sed -i 's/NATIVE_IMAGES=1/NATIVE_IMAGES=0/' d
 ---
 
 ## 变更记录
+
+**v1.4.0（2026-11-19）**
+
+- 网页管线三件套：`--web-mode chat|work`、`--effort`（推理档）、`--agent-model`（上游模型 slug），
+  全部走 `style.mssk_*`（顶层字段会被 new-api 丢掉）
+- 新增 `tiers` 子命令：列出推理档（与 web 界面同一套中文标签）
+- **失败可编程**：stderr 打印 `CODE=` / `RETRYABLE=` / `HINT=` / `RAW=`；`--report-json` 失败时
+  也落一份 `{ok:false,error:{...}}`
+- **会话钥匙按项目隔离**：`<当前项目>/.imagegen/conv-<hash>`（原来是一个全局文件，
+  同机两人或两个项目会互相覆盖）；`--conv-key` 仍可显式指定
+- 修复：`--effort none` 不再误传 `thinking_effort`；`edit` 的 multipart 契约补上
+  `web_conv_key/web_mode/web_effort`（此前带参考图时这些参数**静默失效**）
+- 修文档：SKILL.md 增「参数推断表」「只在三种情况才问用户」「错误码→行动」三节
+
+**v1.3.0（2026-11-06）**
+
+- GIF 动图：按原字节保存，自动改扩展名，写出 `-sprite.png` 并打印帧元数据
+- `--gif-speed {0.25..2}` 调播放速度（只改帧时长，文件本身 1x）
+- 上游一次返回多张时全部落盘（`base.png → base-1.png …`）
+- 新增会话钥匙 `--conv-key` / `--new-conv`
 
 **v1.2.0（2026-10-16）**
 
