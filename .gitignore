@@ -24,3 +24,8 @@ shimk_*
 
 # 装的是令牌，只应存在本机
 imagegen-relay/config.json
+
+# Python 字节码（跨机无用，且会随版本变动）
+__pycache__/
+*.pyc
+*.pyo
