@@ -320,6 +320,10 @@ group), or a different reference image. Change something in this skill only afte
 
 ### 10. Animated GIF (verified 2026-11-06)
 
+
+**Measured 2026-11-19**: an 8-frame request came back as a real GIF (438x438, 8 frames,
+120 ms/frame, loop=0, 115 KB). No `-sprite.png` was written because the upstream did not
+attach a sprite sheet that time -- the sprite file only appears when upstream includes one.
 Ask for a **loop animation** in the prompt (`…的动画GIF，循环播放`) and the relay's web pipeline
 returns a real animated GIF: `mime_type: "image/gif"`, `GIF89a`, 9-16 frames — plus two extra fields
 in the same `data[i]` item:
