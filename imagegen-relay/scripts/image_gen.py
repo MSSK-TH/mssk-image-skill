@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -44,6 +45,19 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib import error as urlerror
 from urllib import request as urlrequest
+
+try:  # [relay] 与 image-web/lib/errors.mjs 同步维护（以本文件为准）
+    from relay_errors import describe_failure
+except Exception:  # 单文件运行时也不该炸
+    def describe_failure(text: str = "", *, http_status=None, **_kw):  # type: ignore
+        return {
+            "code": "upstream_error",
+            "hint": "错误分类模块缺失（relay_errors.py 不在同目录）",
+            "retryable": True,
+            "zh": "出图失败",
+            "http_status": http_status,
+            "raw": str(text or "")[:600],
+        }
 
 # --------------------------------------------------------------------------
 # Constants
@@ -344,6 +358,118 @@ def _force_utf8_stdio() -> None:
             pass
 
 
+def _emit_failure(exc: "RelayError", args: argparse.Namespace) -> None:
+    """失败统一出口（对齐 image-web：HTTP 状态 + 结构化 code/hint/retryable）。
+
+    输出三行到 stderr，机器可读：
+        一句中文摘要
+        CODE=<错误码>   RETRYABLE=yes|no
+        HINT=<下一步该做什么>
+    --report-json 时同时落一份失败记录，字段与成功记录同构。
+    """
+    desc = describe_failure(
+        (exc.raw or "") + " " + str(exc),
+        http_status=getattr(exc, "status", None),
+    )
+    code = getattr(exc, "code", None) or desc["code"]
+    retryable = bool(getattr(exc, "retryable", False)) or desc["retryable"]
+
+    print(f"Error: {desc['zh']}", file=sys.stderr)
+    print(f"CODE={code}   RETRYABLE={'yes' if retryable else 'no'}", file=sys.stderr)
+    print(f"HINT={desc['hint']}", file=sys.stderr)
+    if str(exc) and str(exc) not in desc["zh"]:
+        print(f"RAW={str(exc)[:600]}", file=sys.stderr)
+
+    report_path = getattr(args, "report_json", None)
+    if report_path:
+        try:
+            target = Path(report_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "command": getattr(args, "command", None),
+                        "model": getattr(args, "model", None),
+                        "error": {
+                            "code": code,
+                            "hint": desc["hint"],
+                            "retryable": retryable,
+                            "zh": desc["zh"],
+                            "http_status": desc["http_status"],
+                            "raw": desc["raw"],
+                        },
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    raise SystemExit(1)
+
+
+# ---------------------------------------------------------------- 网页管线档位
+# 【2026-11-19】与 image-web/public/app.js 的 EFFORT_LABEL 保持一致：
+#   web 前端用 presetMap[模型][档位] -> {slug, effort}，这里用「档位 -> effort」一维表。
+# 为什么不在运行时去查 /web/models：
+#   那个接口是 shim 的**顶层路由**，而中转站（new-api）只转发 /v1/*，
+#   所以经中转站永远查不到；直连 shim 才查得到（--shim-url）。
+#   因此这里给一份保守的内置表，真实可用值以出图报错为准（bad_request 会提示降档）。
+# 注意这里有**两套名字**，别混（2026-11-19 实测校正）：
+#   ① web 前端 EFFORT_LABEL 的 key（none/minimal/low/medium/high/xhigh/max/ultra）
+#      只是界面选项标识，**不是**发给上游的值；
+#   ② 真正塞进 thinking_effort 的是上游自己声明的值：
+#      work 模式滑杆 = minimal/low/standard/extended/max（webpipe 第 472-476 行）
+#      chat 模式 = 上游 intelligence_presets[].thinking_effort（可能是 medium/high/xhigh/ultra）
+# 所以这里**两套都收**，标签用 web 那套中文，避免用户背两套词。
+EFFORT_LABEL: Dict[str, str] = {
+    "none": "无（最快，不传推理档）",
+    "minimal": "最低",
+    "low": "低",
+    "standard": "中",
+    "medium": "中",
+    "high": "高",
+    "extended": "极高",
+    "xhigh": "极高",
+    "max": "最高",
+    "ultra": "Ultra",
+}
+# work 模式滑杆的官方五档（webpipe WORK_PRESETS），chat 模式用它那套动态值
+EFFORT_ORDER = [
+    "none", "minimal", "low", "standard", "medium",
+    "high", "extended", "xhigh", "max", "ultra",
+]
+WORK_EFFORTS = ("minimal", "low", "standard", "extended", "max")
+
+
+def _cmd_tiers(args: argparse.Namespace) -> int:
+    """打印网页管线可用的推理档（与 web 前端同一套名字）。"""
+    mode = getattr(args, "mode", None) or "chat"
+    tiers = []
+    for key in EFFORT_ORDER:
+        if mode == "work" and key not in WORK_EFFORTS:
+            continue  # 工作模式只有这 5 档滑杆（没有「即时」）
+        tiers.append({"effort": key, "label": EFFORT_LABEL[key]})
+    if getattr(args, "json", False):
+        print(json.dumps({"mode": mode, "tiers": tiers}, ensure_ascii=False, indent=2))
+        return 0
+    print(f"网页管线推理档（surface={mode}）")
+    print("-" * 46)
+    for t in tiers:
+        print("  %-8s %s" % (t["effort"], t["label"]))
+    print()
+    print("用法：--effort extended")
+    print("说明：档位越高越慢、越容易被上游拒；不确定就用默认（不传）。")
+    if mode == "chat":
+        print("      工作模式（--web-mode work）只有 minimal/low/standard/extended/max 五档。")
+    else:
+        print("      工作模式的档位就是上游滑杆的五档，没有「即时」。")
+    return 0
+
+
 def _die(message: str, code: int = 1) -> None:
     print(f"Error: {message}", file=sys.stderr)
     raise SystemExit(code)
@@ -378,7 +504,27 @@ def _skill_root() -> Path:
 # 本 CLI 以前不带 → 每次都是新对话（改几次就多出几个对话）。
 # 现在把钥匙存在 config.json 旁边，连续调用自动续接；--new-conv 换一把，--conv-key 指定。
 def _conv_key_path() -> Path:
-    return _skill_root() / ".conv-key"
+    """会话钥匙按「用户 + 当前项目目录」隔离（对齐 image-web 的 sha256(user)+conv.id）。
+
+    【2026-11-19】原来存在 skill 安装目录下一个 .conv-key：
+      同一台机器上两个人用、或一个人同时做两个项目时，后一次会覆盖前一次，
+      表现为「改图改到了别人的会话上」。改成跟 git 一样跟着项目走。
+    --conv-key 仍可显式覆盖（多任务并行时必须用）。
+    """
+    import getpass
+
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = "anon"
+    scope = f"{user}:{Path.cwd()}"
+    tag = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:12]
+    d = Path.cwd() / ".imagegen"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return _skill_root() / f".conv-{tag}"
+    return d / f"conv-{tag}"
 
 
 def _new_conv_key() -> str:
@@ -420,6 +566,17 @@ def _style_payload(args: argparse.Namespace) -> Dict[str, Any]:
     gif_speed = getattr(args, "gif_speed", None)
     if gif_speed:
         style["mssk_gif_speed"] = str(gif_speed)
+    # 【2026-11-19】网页管线的三件套：surface / 上游推理模型 / 推理档。
+    #   原生管线不认这三个字段（会忽略），所以无脑带上不会伤到原生路。
+    web_mode = getattr(args, "web_mode", None)
+    if web_mode:
+        style["mssk_mode"] = str(web_mode)
+    agent_model = getattr(args, "agent_model", None)
+    if agent_model:
+        style["mssk_model"] = str(agent_model)
+    effort = getattr(args, "effort", None)
+    if effort:
+        style["mssk_effort"] = str(effort)
     return style
 
 
@@ -509,11 +666,13 @@ class RelayError(RuntimeError):
         status: Optional[int] = None,
         retryable: bool = False,
         raw: Optional[str] = None,
+        code: Optional[str] = None,
     ):
         super().__init__(message)
         self.status = status
         self.retryable = retryable
         self.raw = raw
+        self.code = code
 
 
 @dataclass
@@ -782,7 +941,10 @@ def _result_extra(item: Dict[str, Any]) -> Dict[str, Any]:
 def _parse_images(payload: Dict[str, Any], *, creds: RelayCredentials, timeout: float) -> List[ImageResult]:
     data = payload.get("data")
     if not isinstance(data, list) or not data:
-        raise RelayError(f"relay returned no images: {json.dumps(payload)[:MAX_ERROR_TEXT]}")
+        raise RelayError(
+                f"relay returned no images: {json.dumps(payload)[:MAX_ERROR_TEXT]}",
+                code="no_image_data",
+            )
 
     results: List[ImageResult] = []
     for index, item in enumerate(data):
@@ -2612,6 +2774,24 @@ def _models_command(args: argparse.Namespace) -> None:
 
 def _add_shared_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    # 【2026-11-19】网页管线三件套（只对网页管线生效，原生路会忽略）
+    parser.add_argument(
+        "--web-mode",
+        choices=("chat", "work"),
+        default=None,
+        help="网页管线的 surface：chat（默认，生图通过率更高）/ work（做卡片/素材，可反复改）",
+    )
+    parser.add_argument(
+        "--effort",
+        choices=tuple(EFFORT_ORDER),
+        default=None,
+        help="网页管线推理档（与 web 前端同名）：none/minimal/low/medium/high/xhigh/max/ultra",
+    )
+    parser.add_argument(
+        "--agent-model",
+        default=None,
+        help="直接指定上游推理模型 slug（默认自动；一般用 --effort 就够）",
+    )
     parser.add_argument("--prompt")
     parser.add_argument("--prompt-file")
     parser.add_argument("--n", type=int, default=1)
@@ -2772,6 +2952,13 @@ def main() -> int:
     models_parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     models_parser.add_argument("--report-json")
     models_parser.set_defaults(func=_models_command)
+    # [relay] 网页管线的推理档表（与 web 前端同一套名字），纯本地输出，不发请求
+    tiers_parser = subparsers.add_parser(
+        "tiers", help="List web-pipeline reasoning tiers (same names as the web UI)"
+    )
+    tiers_parser.add_argument("--mode", choices=("chat", "work"), default="chat")
+    tiers_parser.add_argument("--json", action="store_true")
+    tiers_parser.set_defaults(func=_cmd_tiers)
 
     # [relay] the official skill's *primary* path, wired to this relay:
     # reference-image generation through Responses + the hosted image_generation tool.
@@ -2812,7 +2999,7 @@ def main() -> int:
     _EXACT_SIZE_REQUEST = getattr(args, "exact_size", None)
     _EXACT_FIT_REQUEST = getattr(args, "exact_fit", "cover")
 
-    if args.command == "models":
+    if args.command in ("models", "tiers"):
         args.func(args)
         return 0
 
@@ -2858,7 +3045,7 @@ def main() -> int:
     except RelayError as exc:
         # [relay] content-safety refusals, token problems and channel errors must read as a
         # one-line message, never as a Python traceback.
-        _die(str(exc))
+        _emit_failure(exc, args)
     except KeyboardInterrupt:
         _die("interrupted; nothing was written", code=130)
     return 0

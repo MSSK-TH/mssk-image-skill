@@ -116,6 +116,44 @@ backdrop/floor/shadow, clean alpha edges with detail preserved in semi-transpare
 preserve the alpha channel when saving. If the subject is complex and the alpha comes back dirty,
 fall back to `scripts/remove_chroma_key.py` on a flat-colour render.
 
+### 5b. Web-pipeline controls: surface, effort, agent model (2026-11-19)
+
+The web pipeline has three knobs the native endpoint does not have. All three travel in the
+request's `style` object (`mssk_mode` / `mssk_effort` / `mssk_model`) because `new-api` drops
+unknown **top-level** JSON fields but passes `json.RawMessage` through untouched.
+
+```bash
+image_gen.py generate --prompt "..." --web-mode work --effort extended
+image_gen.py tiers                 # list the tiers (same names as the web UI)
+image_gen.py tiers --mode work --json
+```
+
+| Flag | Values | Default | Notes |
+| --- | --- | --- | --- |
+| `--web-mode` | `chat` / `work` | `chat` | `chat` has the higher pass rate. `work` suits cards / site assets / long iterative edits. Native endpoint ignores it |
+| `--effort` | see `tiers` | unset (instant) | Goes straight into `thinking_effort`. Two naming sets coexist -- **work** slider = `minimal/low/standard/extended/max`; **chat** uses whatever the account's presets declare (`medium/high/xhigh/ultra` seen). Both are accepted here |
+| `--agent-model` | slug | auto | Pick the upstream reasoning model explicitly. Rarely needed -- prefer `--effort` |
+
+Rules:
+
+- **Higher effort is not "better"** -- it is slower and gets refused more often. Do not raise it
+  unless the user asks for more detail, legible text, or repeated refinement.
+- An unsupported effort comes back as `bad_request`; drop one tier and retry once.
+- `work` has no instant tier. Asking for `--web-mode work --effort none` is a contradiction.
+
+### 5c. Conversation continuity is per project (changed 2026-11-19)
+
+`--conv-key` used to live in one file next to `config.json`, so two people (or two projects) on the
+same machine overwrote each other and edits landed in someone else's upstream conversation. The key
+now lives in `<current project>/.imagegen/conv-<hash(user+cwd)>` -- git-style isolation, matching how
+the web app scopes it by `sha256(user) + conversation id`.
+
+- Same directory, consecutive calls -> automatically the same upstream conversation.
+- Two projects in parallel -> isolated automatically.
+- Several threads **inside one project** -> pass `--conv-key <task-name>` explicitly. The web UI does
+  the same thing by giving each conversation its own id.
+- `--new-conv` starts a fresh thread.
+
 ### 6. One render takes 20-60 s
 
 That is normal. The CLI waits up to `--timeout` seconds (default 300) and prints a timing line
@@ -349,6 +387,36 @@ Route first (Relay fact 1):
   the relay's image path is unavailable. It is slower (measured **57 s**) and the model's rewrite can
   lengthen or alter the brief.
 - Many distinct assets -> one `generate` call each, or `generate-batch`.
+
+### Infer the parameters; ask only what cannot be inferred
+
+Users speak in outcomes, not flags. Read the brief and fill these in yourself -- **do not
+interrogate them** for choices you can derive:
+
+| The user says | Set |
+| --- | --- |
+| "transparent background" / "cut it out" / "no backdrop" | `--background transparent` (see Relay fact 5 -- prompt-emulated) |
+| "poster" / "wide" / "16:9" / "banner" | `--preset 16:9@2k` |
+| "phone wallpaper" / "vertical" / "9:16" | `--preset 9:16@2k` |
+| "avatar" / "icon" / "square" | `--size 1024x1024` |
+| "4K" / "high-res" | `--preset <ratio>@4k` |
+| "more detail" / "legible text" / "refine it" | `--effort extended` |
+| "just a quick idea" / "rough" | `--effort minimal` |
+| "card" / "site asset" / "I'll iterate on this" | `--web-mode work` |
+| "give me four options" / "three variants" | `--n 4` (text route only) |
+| "same character" / "like this one" | `pass the image -> edit` |
+| "animated" / "loop" / "sticker" / "gif" | ask for a described frame sequence; `--gif-speed` defaults to 1, use `1.5` when they add "keep it small" |
+
+**Ask only when the answer changes the outcome and you cannot derive it:**
+
+1. No size cue at all in the brief ("draw me something") -- square vs. landscape is a big rework.
+2. They refer to "the image I made earlier" and this project has no conversation key yet -- new
+   render, or continue which thread?
+3. They ask for several variants **and** supplied a reference image -- the edit route forces `n=1`;
+   say so instead of silently returning one.
+
+Everything else: decide, then **state what you decided** in one line ("16:9, transparent background
+via prompt") rather than asking first.
 
 Intent:
 
@@ -625,6 +693,42 @@ question such as "Tell me what to adjust and I'll edit it" is fine.
 | 4K / higher resolution requested | upstream fixed at ~1.57 MP | say no plainly; the only control is the aspect ratio |
 | Skill not loaded / launcher missing | installed but not refreshed | have the user **open a new conversation** |
 
+### Machine-readable failures (2026-11-19)
+
+Every failure now prints three parseable lines to **stderr** after the human sentence:
+
+```
+Error: 中转站返回 HTTP 401，没有出图
+CODE=token_invalid   RETRYABLE=no
+HINT=中转站不认这个令牌：检查 config.json 里的 api_key …
+RAW=relay rejected the token (HTTP 401): Invalid token …
+```
+
+`--report-json <path>` also writes a failure record (`ok: false` + `error.{code,hint,retryable,
+http_status,raw}`), so a caller never has to parse prose.
+
+Use `CODE` to decide, not the sentence:
+
+| `CODE` | `RETRYABLE` | What to do |
+| --- | --- | --- |
+| `no_image_data` | **yes** | re-send once -- measured to come back empty in clusters |
+| `content_refusal` | yes | stochastic upstream image-safety gate; one retry is meaningful, but a more conservative reference image passes faster |
+| `bad_request` | yes | unsupported parameter (usually effort tier) -- drop one tier and retry once |
+| `content_safety` | no | the render finished and was then judged; retrying is a lottery, swapping the reference wins |
+| `model_refusal` | no | the chat model itself declined (legacy `/responses` path only) -- rephrase or use `--model codex-gpt-image-2` |
+| `upstream_overloaded` | no | upstream said `NO_MORE_RETRY`; wait 1-2 minutes |
+| `relay_cpu` | no | the relay box is CPU-bound; wait, or tell the owner to add a core |
+| `token_invalid` | no | the token is wrong/disabled -- the user fixes `config.json` |
+| `no_model_access` | no | the token lacks this model -- add it in the relay's token limits |
+| `token_revoked` | no | upstream OAuth was invalidated -- owner must re-seed credentials |
+| `upstream_error` | yes | unclassified -- retry once verbatim, then report the `RAW` line |
+
+Rules:
+
+- Never retry a `RETRYABLE=no` code. Content-safety and model refusals are decisions, not faults.
+- Retry **at most once**, and never in a loop -- repeated sends deepen the upstream's risk scoring.
+- Report `CODE` and `HINT` to the user in plain language; keep `RAW` for the owner.
+
 ## Token and security
 
 - The token lives in `config.json`. **Never** print it into a conversation, a log, a report, or a
@@ -643,6 +747,7 @@ question such as "Tell me what to adjust and I'll edit it" is fine.
 - `references/codex-network.md` -- network/sandbox notes for this installation
 - `scripts/image_gen.py` -- the CLI itself
 - `scripts/remove_chroma_key.py` -- fallback for transparent cutouts (verbatim from the official skill)
+- `scripts/relay_errors.py` -- failure classifier behind `CODE=`/`HINT=` (mirrors the web app's `lib/errors.mjs`)
 
 ## One-line summary
 

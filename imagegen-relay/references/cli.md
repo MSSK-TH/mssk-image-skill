@@ -211,11 +211,36 @@ Notes:
 | `--preflight` | coverage preflight, **default `off`** (prompt is sent unchanged). `auto` = person prompts only, `always` = every request; it neutralises body/garment vocabulary and appends one clothing/coverage constraint, printing every change (see `SKILL.md`, Relay fact 7) |
 | `--check-model` | verify the model against `/v1/models` before spending a generation |
 | `--strict-size` | restore the official hard failure on gpt-image-2 size constraints |
-| `--report-json PATH` | write a JSON report (prompt, outputs, `actual_size`, pixels, timing) |
+| `--report-json PATH` | write a JSON report (prompt, outputs, `actual_size`, pixels, timing); **on failure** it writes `{ok:false, error:{code,hint,retryable,http_status,raw}}` instead |
+| `--web-mode chat\|work` | web-pipeline surface. `chat` (default) has the higher pass rate; `work` suits cards / site assets / long iterative edits. Native endpoint ignores it |
+| `--effort TIER` | web-pipeline reasoning tier, sent as `thinking_effort`. `none/minimal/low/standard/medium/high/extended/xhigh/max/ultra` -- run `tiers` for the list. Higher is **slower and refused more often** |
+| `--agent-model SLUG` | pick the upstream reasoning model explicitly (default auto). Prefer `--effort` |
+| `--conv-key NAME` | pin the upstream conversation explicitly; needed when several threads run inside one project |
+| `--new-conv` | start a fresh upstream conversation |
 
 While a request is in flight the CLI prints a `[waiting] …s elapsed` heartbeat every 20 s, so a
 long render never looks like a hang. Content-safety refusals are printed as a single clean
 `Error: …` line (never a traceback) and are never retried locally.
+
+## Reasoning tiers (web pipeline)
+
+```bash
+image_gen.py tiers                      # chat surface (default)
+image_gen.py tiers --mode work          # work surface (5 slider steps, no "instant")
+image_gen.py tiers --json               # machine-readable
+```
+
+Tiers are **not** a quality slider for the image model -- they pick how much reasoning the upstream
+chat model spends before it draws. Two naming sets coexist because the upstream uses different
+vocabularies per surface:
+
+| Surface | Values sent as `thinking_effort` |
+| --- | --- |
+| work (slider) | `minimal` / `low` / `standard` / `extended` / `max` |
+| chat (account presets) | whatever the account declares -- `medium` / `high` / `xhigh` / `ultra` observed |
+
+`none` means "send no `thinking_effort`" (instant). An unsupported value returns `bad_request`;
+drop one tier and retry once.
 
 ## Dry run (free)
 

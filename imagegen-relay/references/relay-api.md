@@ -107,6 +107,39 @@ optional `mask` part. `size` is not sent: an edit follows the input image's aspe
 - `data[].revised_prompt` has been observed to echo the request, not to rewrite it. When the CLI
   reports a `revised_prompt` that differs from what it sent, trust the reported one.
 
+## Web-pipeline controls go inside `style`
+
+`new-api` deserialises the image request into a strongly-typed struct, so **unknown top-level JSON
+fields are silently dropped** before the request reaches the shim. The `style` field is
+`json.RawMessage` and passes through untouched, which is why every relay-only knob lives there:
+
+```json
+{
+  "model": "gpt-image-2",
+  "prompt": "...",
+  "n": 1,
+  "style": {
+    "mssk_conv": "project-a:card-1",
+    "mssk_mode": "work",
+    "mssk_effort": "extended",
+    "mssk_model": "",
+    "mssk_gif_speed": "1.5"
+  }
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `mssk_conv` | conversation key; the shim maps it to the upstream `conversation_id` + `parent_message_id` and continues that thread |
+| `mssk_mode` | `chat` / `work` surface |
+| `mssk_effort` | reasoning tier -> `thinking_effort` |
+| `mssk_model` | upstream reasoning model slug (empty = auto) |
+| `mssk_gif_speed` | GIF playback speed multiplier |
+
+On the **multipart** `/v1/images/edits` route the same values travel as plain top-level fields
+(`web_conv_key`, `web_mode`, `web_model`, `web_effort`) because multipart bodies are forwarded as-is.
+The shim accepts both spellings.
+
 ## Measured behaviour (this relay, 2026-10-16)
 
 | Observation | Value |

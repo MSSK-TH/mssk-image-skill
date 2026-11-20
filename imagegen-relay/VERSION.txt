@@ -1,9 +1,27 @@
 imagegen-relay  —— 版本戳
 ==================================================
-version : 1.3.0
-date    : 2026-11-06（GIF 动图 + 多图返回，v1.3.0）
+version : 1.4.0
+date    : 2026-11-19（网页管线三件套 + 失败可编程 + 钥匙按项目隔离，v1.4.0）
 baseline: 官方 imagegen（.system/imagegen）；其中 6 个文件逐字节完全一致：
           prompting.md / sample-prompts.md / remove_chroma_key.py / LICENSE.txt / 两个图标
+
+v1.4.0 新增（2026-11-19）
+------------------------------
+  · 网页管线三件套：--web-mode chat|work、--effort（推理档）、--agent-model（上游 slug），
+    全部走 style.mssk_mode / mssk_effort / mssk_model（顶层字段会被 new-api 丢掉）。
+  · tiers 子命令：打印推理档（与 web 前端同一套中文标签；work 模式只有 5 档滑杆）。
+    注意两套值并存：work = minimal/low/standard/extended/max，
+    chat = 账号 presets 声明的值（实测见过 medium/high/xhigh/ultra）。
+  · 失败可编程：新增 scripts/relay_errors.py（镜像 image-web/lib/errors.mjs），
+    失败时 stderr 打印 CODE= / RETRYABLE= / HINT= / RAW=，
+    --report-json 同时落一份 {ok:false,error:{code,hint,retryable,http_status,raw}}。
+  · 会话钥匙改为按项目隔离：<cwd>/.imagegen/conv-<hash(user+cwd)>（原来是一个全局
+    .conv-key，同机两人或两个项目会互相覆盖）；--conv-key 仍可显式指定。
+  · SKILL.md 新增：参数推断表（从用户话里取，不问）、只在三种情况下才问用户、
+    错误码→行动对照表；references/cli.md 与 relay-api.md 补对应说明。
+  · 未改动：6 个与官方 imagegen 逐字节一致的文件、config.json、bin/、会话续接与 GIF 逻辑。
+
+  共用代码提醒（改这三处会同时影响两条管线）：foldParams / passthrough / relay_errors。
 
 v1.3.0 新增（2026-11-06 实测）
 ------------------------------
