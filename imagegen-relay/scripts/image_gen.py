@@ -941,6 +941,32 @@ def _result_extra(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+_LAST_PIPELINE = {}
+
+
+def _report_pipeline(payload, model):
+    """把「这次到底走的是网页管线还是原生」讲清楚（2026-11-19）。
+
+    shim 的响应约定：
+      · 正常走网页管线 → 响应里**没有** degraded 字段
+      · 网页管线失败、自动降级到原生或 /responses → 带 degraded:true + degraded_reason
+    所以「有没有 degraded」就是判断依据。显式 --model codex-gpt-image-2 时按原生处理。
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    degraded = bool(payload.get("degraded"))
+    reason = str(payload.get("degraded_reason") or "")
+    forced_native = str(model or "").lower().startswith("codex-")
+    if forced_native and not degraded:
+        via, note = "native", "按 --model 指定，走原生端点（不经网页管线）"
+    elif degraded:
+        via, note = "degraded", "网页管线失败 → 自动降级到原生（原因：%s）" % (reason or "未给")
+    else:
+        via, note = "web", "网页管线（Cookie 会话）"
+    _LAST_PIPELINE.clear()
+    _LAST_PIPELINE.update({"pipeline": via, "note": note, "degraded_reason": reason or None})
+    print("[pipeline] " + note)
+    return dict(_LAST_PIPELINE)
+
 def _parse_images(payload: Dict[str, Any], *, creds: RelayCredentials, timeout: float) -> List[ImageResult]:
     data = payload.get("data")
     if not isinstance(data, list) or not data:
@@ -1868,6 +1894,8 @@ def _report_record(
         "pixels": list(first.pixels) if (first and first.pixels) else None,
         "revised_prompt": first.revised_prompt if first else None,
         "image_source": first.source if first else None,
+        "pipeline": (_LAST_PIPELINE.get("pipeline") or None),
+        "pipeline_note": (_LAST_PIPELINE.get("note") or None),
         "coverage_preflight_applied": preflight,
         "timing_seconds": timing,
     }
@@ -2073,6 +2101,7 @@ def _generate(args: argparse.Namespace) -> None:
                 f"[generation] upstream refused (attempt {attempt}/{refusal_attempts}); "
                 "retrying with a neutral variation (the gate is stochastic)"
             )
+    _report_pipeline(decoded, getattr(args, "model", ""))
     results = _parse_images(decoded, creds=creds, timeout=args.timeout)
     local_started = time.time()
     artifacts = _write_results(
@@ -2265,6 +2294,7 @@ def _edit(args: argparse.Namespace) -> None:
             )
 
     _info(f"[edit] contract used: {contract}")
+    _report_pipeline(decoded, getattr(args, "model", ""))
     results = _parse_images(decoded, creds=creds, timeout=args.timeout)
     local_started = time.time()
     artifacts = _write_results(
@@ -2696,6 +2726,7 @@ def _run_generate_batch(args: argparse.Namespace) -> int:
                 label=job_label,
                 deadline=time.monotonic() + args.deadline,
             )
+            _report_pipeline(decoded, getattr(args, "model", ""))
             results = _parse_images(decoded, creds=creds, timeout=args.timeout)
             local_started = time.time()
             artifacts = _write_results(

@@ -129,6 +129,30 @@ took **221 s** instead of the usual 25-30 s. That is the shim's design, not a fa
   drain logic, but that specific claim has **not been measured** -- verify before relying on it.
 - Budget the time: an `n>1` web-pipeline run can take 3-4 minutes, not 30 seconds.
 
+### 5a-2. How to tell which pipeline actually served the image (2026-11-19)
+
+Every run now prints one line:
+
+```
+[pipeline] 网页管线（Cookie 会话）                                    ← 正常，走网页管线
+[pipeline] 网页管线失败 → 自动降级到原生（原因：webpipe 403 Unusual activity）   ← 降级了
+[pipeline] 按 --model 指定，走原生端点（不经网页管线）                  ← 你显式要的原生
+```
+
+The same info lands in `--report-json` as `pipeline` (`web` / `degraded` / `native`) plus
+`pipeline_note`.
+
+How it is decided (shim contract): a normal web-pipeline response carries **no** `degraded` field; any
+automatic fallback carries `degraded: true` + `degraded_reason`. So:
+
+- no `degraded` + `--model gpt-image-2` -> web pipeline
+- `degraded: true` -> the web pipeline failed and the shim fell back (the reason is in the note)
+- `--model codex-gpt-image-2` -> native endpoint, by request
+
+**Never assume which one ran** -- read this line before telling the user "it went through the web
+pipeline". If it says `degraded`, say so and quote the reason: the image is real but it did not come
+from the path the user expected.
+
 ### 5b. Web-pipeline controls: surface, effort, agent model (2026-11-19)
 
 The web pipeline has three knobs the native endpoint does not have. All three travel in the
