@@ -2088,6 +2088,17 @@ def _generate(args: argparse.Namespace) -> None:
     total_s = time.time() - started
     _print_timing("generation", response, local_s, total_s)
 
+    # 【2026-11-19 实测】网页管线在 n>1 时会「盯完整轮对话」：上游会自行多画
+    #   （这次要求 4 张，实际回了 10 个产物：4 张方形 + 4 张其它比例 + 2 个 8 帧 GIF，耗时 221s）。
+    #   shim 侧的 drainPlan 就是这么设计的（愿意多给），所以这里只提示、不丢弃 —— 多出来的图
+    #   往往正好是用户想要的。要严格 N 个：用 --model codex-gpt-image-2，或分开调用 --n 1。
+    if getattr(args, "n", 1) and len(artifacts) > int(args.n):
+        _warn(
+            f"上游返回了 {len(artifacts)} 个产物（请求 {int(args.n)} 个）。"
+            "网页管线在 n>1 时会等整轮对话结束、把上游自发的额外图/动画一起保存；"
+            "要严格 N 个请用 --model codex-gpt-image-2，或分开多次 --n 1。"
+        )
+
     _write_report(
         args.report_json,
         _report_record(

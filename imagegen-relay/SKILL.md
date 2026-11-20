@@ -116,6 +116,18 @@ backdrop/floor/shadow, clean alpha edges with detail preserved in semi-transpare
 preserve the alpha channel when saving. If the subject is complex and the alpha comes back dirty,
 fall back to `scripts/remove_chroma_key.py` on a flat-colour render.
 
+### 5a. `--n` on the web pipeline returns *at least* n (measured 2026-11-19)
+
+Asking for 4 variants produced **10 files** (4 square PNGs, 4 other-ratio PNGs, 2 eight-frame GIFs) and
+took **221 s** instead of the usual 25-30 s. That is the shim's design, not a failure: when `n > 1` it
+**drains the whole upstream turn**, so anything the model renders on its own initiative is saved too.
+
+- Extra files are usually welcome (they are free variations) -- the CLI keeps them all and prints a
+  warning with the count.
+- Need **exactly** n images? Use `--model codex-gpt-image-2` (the native endpoint honours `n`), or call
+  `generate --n 1` several times.
+- Budget the time: an `n>1` web-pipeline run can take 3-4 minutes, not 30 seconds.
+
 ### 5b. Web-pipeline controls: surface, effort, agent model (2026-11-19)
 
 The web pipeline has three knobs the native endpoint does not have. All three travel in the
