@@ -124,8 +124,9 @@ took **221 s** instead of the usual 25-30 s. That is the shim's design, not a fa
 
 - Extra files are usually welcome (they are free variations) -- the CLI keeps them all and prints a
   warning with the count.
-- Need **exactly** n images? Use `--model codex-gpt-image-2` (the native endpoint honours `n`), or call
-  `generate --n 1` several times.
+- Need **exactly** n images? Call `generate --n 1` several times (verified).
+  `--model codex-gpt-image-2` is *expected* to honour `n` because it bypasses the web pipeline's
+  drain logic, but that specific claim has **not been measured** -- verify before relying on it.
 - Budget the time: an `n>1` web-pipeline run can take 3-4 minutes, not 30 seconds.
 
 ### 5b. Web-pipeline controls: surface, effort, agent model (2026-11-19)
