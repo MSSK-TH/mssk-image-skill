@@ -159,33 +159,40 @@ automatic fallback carries `degraded: true` + `degraded_reason`. So:
 pipeline". If it says `degraded`, say so and quote the reason: the image is real but it did not come
 from the path the user expected.
 
-### 5b-0. First web-pipeline image: ask once, then remember (2026-11-19)
+### 5b-0. First web-pipeline image: two questions, then remember (2026-11-19)
 
-Run `image_gen.py tiers` (or `tiers --mode work` for cards/site assets). It prints three numbered
-lists with **plain names only** -- exactly what you should read out:
+**Do not ask all three at once** -- surface changes the model list *and* the effort list, so asking
+them together makes the user pick a model that does not exist in the surface they then choose.
+
+**Question 1** -- run `image_gen.py tiers`, read it out:
 
 ```
-模型：  1) GPT-6   2) GPT-6.1 Sol   3) GPT-5.6 Sol
-档位：  1)即时  2)轻度  3)中  4)高  5)极高
-模式：  1)聊天  2)工作
+模式：  1)聊天   2)工作
 ```
 
-Ask the three choices **in one message** -- e.g. "选一下：模型 1/2/3，档位 1-5，模式 1/2".
-Do not explain what thinking/instant means unless asked; do not mention slugs.
+**Question 2** -- run `image_gen.py tiers --mode <their choice>`, read that out:
 
-Map the answer with `image_gen.py tiers --json` (`name` -> `value`) and persist it:
+```
+（聊天）模型：1) GPT-6  2) GPT-6.1 Sol  3) GPT-5.6 Sol
+（聊天）档位：1)即时  2)轻度  3)中  4)高  5)极高
+
+（工作）模型：1) GPT-6  2) GPT-6.1 Sol  3) GPT-5.6 Sol
+（工作）档位：1)轻度  2)中  3)高  4)极高          ← 工作模式没有「即时」
+```
+
+Then map `name` -> `value` with `image_gen.py tiers --mode <choice> --json` and persist:
 
 ```bash
 image_gen.py setup --agent-model gpt-6-thinking --effort high --web-mode chat
 ```
 
-From then on every command inherits those three; a flag on the command line overrides for one run.
-**Never ask again** for that project.
+Why two steps (measured): `gpt-6-thinking` only exists on the chat surface (work uses the `-wm`
+suffix family), and the work slider has five steps with no instant. A single combined question lets
+someone pick "GPT-6 thinking" and then "工作" -- a combination that cannot run.
 
-If the user says "你随便": take `1) GPT-6` + `4) 高` + `1) 聊天` and tell them which three you used.
+From then on every command inherits those three; a CLI flag overrides for one run. **Never ask again.**
 
-Why not default to `auto`: `auto` lets the shim pick a different upstream model per request without
-telling anyone, so the same prompt can land on a different model tomorrow.
+If the user says "你随便": `聊天` → `GPT-6` → `高`, and tell them which three you used.
 
 ### 5b. Web-pipeline controls: surface, effort, agent model (2026-11-19)
 

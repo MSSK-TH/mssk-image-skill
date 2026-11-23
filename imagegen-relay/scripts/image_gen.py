@@ -527,28 +527,40 @@ def _cmd_setup(args: argparse.Namespace) -> int:
 
 
 def _cmd_tiers(args: argparse.Namespace) -> int:
-    """列出「模型 / 档位 / 模式」三组选项。
+    """两步提问：① 先选模式 ② 再列该模式下的模型与档位。
 
-    默认只输出名字（可直接念给使用者）；--json 才带真实值，供 agent 换算。
+    【2026-11-19】不能一次列完三组 —— 模式和模型/档位是**联动**的：
+      · work 模式根本没有 gpt-6-thinking（那边是 -wm 后缀那批）
+      · work 模式没有「即时」档（滑杆只有五档）
+    所以先问模式，再按模式列。避免用户选了 chat 的模型却要 work 模式。
     """
-    mode = getattr(args, "mode", None) or "chat"
+    mode = getattr(args, "mode", None)
+
+    # 第一步：没给 --mode → 只列模式
+    if not mode:
+        if getattr(args, "json", False):
+            print(json.dumps({"modes": WEB_MODE_CHOICES}, ensure_ascii=False, indent=2))
+            return 0
+        print("模式：")
+        print("  " + "   ".join("%d)%s" % (i, m["name"]) for i, m in enumerate(WEB_MODE_CHOICES, 1)))
+        print()
+        print("选完再列对应的模型和档位：image_gen.py tiers --mode chat|work")
+        return 0
+
+    # 第二步：按模式列模型 + 档位
     efforts = [{"name": e["name"], "value": e[mode]} for e in WEB_EFFORT_CHOICES if e.get(mode)]
     models = [{"name": m["name"], "value": m[mode]} for m in WEB_MODEL_CHOICES if m.get(mode)]
 
     if getattr(args, "json", False):
-        print(json.dumps(
-            {"mode": mode, "models": models, "efforts": efforts, "modes": WEB_MODE_CHOICES},
-            ensure_ascii=False, indent=2,
-        ))
+        print(json.dumps({"mode": mode, "models": models, "efforts": efforts},
+                         ensure_ascii=False, indent=2))
         return 0
 
-    print("模型：")
+    print("模型（%s 模式）：" % ("聊天" if mode == "chat" else "工作"))
     for i, m in enumerate(models, 1):
         print("  %d) %s" % (i, m["name"]))
-    print("档位：")
+    print("档位（%s 模式）：" % ("聊天" if mode == "chat" else "工作"))
     print("  " + "   ".join("%d)%s" % (i, e["name"]) for i, e in enumerate(efforts, 1)))
-    print("模式：")
-    print("  " + "   ".join("%d)%s" % (i, m["name"]) for i, m in enumerate(WEB_MODE_CHOICES, 1)))
     return 0
 
 
@@ -3209,7 +3221,7 @@ def main() -> int:
     tiers_parser = subparsers.add_parser(
         "tiers", help="List web-pipeline reasoning tiers (same names as the web UI)"
     )
-    tiers_parser.add_argument("--mode", choices=("chat", "work"), default="chat")
+    tiers_parser.add_argument("--mode", choices=("chat", "work"), default=None)
     tiers_parser.add_argument("--json", action="store_true")
     tiers_parser.set_defaults(func=_cmd_tiers)
     # [relay] 把「驱动模型 / 推理档 / surface」固化进 config.json（首次提问后调用）
