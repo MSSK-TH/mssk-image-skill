@@ -545,20 +545,23 @@ def _cmd_setup(args: argparse.Namespace) -> int:
 
 
 def _cmd_tiers(args: argparse.Namespace) -> int:
-    """三步提问，一次只问一件事：
+    """两步提问：
 
-      1) tiers                      → 模式：1)聊天 2)工作
-      2) tiers --mode chat          → 模型：1) GPT-6 …
-      3) tiers --mode chat --efforts → 档位：1)即时 2)中 3)高
+      1) tiers                → 模式：1)聊天 2)工作
+      2) tiers --mode chat    → 模型 + 档位（一次列完）
 
-    chat 与 work 的档位数不同（3 vs 4），所以档位必须在模式确定后再列。
+    为什么第二步能合并：同一模式内档位与模型无关
+      · chat：所有模型都是 即时 / 中 / 高
+      · work：所有模型都是 轻度 / 中 / 高 / 极高
+    而模式不同时档位会变，所以必须先把模式定下来。
+
+    --efforts 仅供单独查档位（可选，正常提问用不到）。
     """
     mode = getattr(args, "mode", None)
-    want_efforts = bool(getattr(args, "efforts", False))
 
-    # 第 1 步：什么都没给 → 只列模式
+    # 第 1 步：没给 --mode → 只列模式
     if not mode:
-        if want_efforts:
+        if getattr(args, "efforts", False):
             _die("--efforts 需要配合 --mode 一起用（先选模式）")
         if getattr(args, "json", False):
             print(json.dumps({"modes": WEB_MODE_CHOICES}, ensure_ascii=False, indent=2))
@@ -568,28 +571,24 @@ def _cmd_tiers(args: argparse.Namespace) -> int:
         return 0
 
     slug_key = "chat_slug" if mode == "chat" else "work_slug"
-
-    # 第 3 步：--efforts → 只列档位
-    if want_efforts:
-        tiers = _tiers_for(mode)
-        if getattr(args, "json", False):
-            print(json.dumps(
-                {"mode": mode, "efforts": [{"name": t["name"], "value": t["effort"]} for t in tiers]},
-                ensure_ascii=False, indent=2,
-            ))
-            return 0
-        print("档位（%s）：" % ("聊天" if mode == "chat" else "工作"))
-        print("  " + "   ".join("%d)%s" % (i, t["name"]) for i, t in enumerate(tiers, 1)))
-        return 0
-
-    # 第 2 步：只列模型
+    tiers = _tiers_for(mode)
     models = [{"name": m["name"], "value": m[slug_key]} for m in WEB_MODELS]
+    label = "聊天" if mode == "chat" else "工作"
+
     if getattr(args, "json", False):
-        print(json.dumps({"mode": mode, "models": models}, ensure_ascii=False, indent=2))
+        data = {"mode": mode, "models": models,
+                "efforts": [{"name": t["name"], "value": t["effort"]} for t in tiers]}
+        if getattr(args, "efforts", False):
+            data.pop("models")
+        print(json.dumps(data, ensure_ascii=False, indent=2))
         return 0
-    print("模型（%s）：" % ("聊天" if mode == "chat" else "工作"))
-    for i, m in enumerate(models, 1):
-        print("  %d) %s" % (i, m["name"]))
+
+    if not getattr(args, "efforts", False):
+        print("模型（%s）：" % label)
+        for i, m in enumerate(models, 1):
+            print("  %d) %s" % (i, m["name"]))
+    print("档位（%s）：" % label)
+    print("  " + "   ".join("%d)%s" % (i, t["name"]) for i, t in enumerate(tiers, 1)))
     return 0
 
 
