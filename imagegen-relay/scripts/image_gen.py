@@ -2,7 +2,7 @@
 """Relay CLI for explicit image generation or editing with gpt-image-2.
 
 This is the relay counterpart of the official ``imagegen`` skill's
-``scripts/image_gen.py`` (v1.5.1).
+``scripts/image_gen.py`` (v1.5.2).
 
 Kept aligned with the official implementation:
   * subcommands ``generate`` / ``edit`` / ``generate-batch`` (plus relay ``reference`` /
@@ -117,7 +117,7 @@ DEFAULT_TIMEOUT_SECONDS = DEFAULT_STANDARD_TIMEOUT_SECONDS
 DEFAULT_DEADLINE_SECONDS = DEFAULT_STANDARD_DEADLINE_SECONDS
 HEAVY_EFFORTS = frozenset({"extended", "xhigh", "max"})
 
-USER_AGENT = "imagegen-relay/1.5.1 (stdlib)"
+USER_AGENT = "imagegen-relay/1.5.2 (stdlib)"
 MAX_ERROR_TEXT = 400
 MAX_IMAGE_BYTES = 50 * 1024 * 1024
 MAX_BATCH_JOBS = 500
@@ -218,6 +218,8 @@ WEB_MODE_CHOICES = [
     {"name": "聊天", "value": "chat"},
     {"name": "工作", "value": "work"},
 ]
+WEB_ASK_POLICIES = ("confirm", "remember")
+DEFAULT_WEB_ASK_POLICY = "confirm"
 
 # 合法 --effort 值：覆盖 work 真实 5 档（min/standard/extended/xhigh/max）、
 # chat 3 档（none/standard/extended）以及兼容历史写法/账号扩展预设（minimal/low/medium/high）。
@@ -632,6 +634,8 @@ def _cmd_setup(args: argparse.Namespace) -> int:
         web_mode = cfg.get("web_mode") or None
         web_effort = cfg.get("web_effort") or None
         web_model = cfg.get("web_agent_model") or None
+        raw_policy = str(cfg.get("web_ask_policy") or "").strip().lower()
+        web_ask_policy = raw_policy if raw_policy in WEB_ASK_POLICIES else DEFAULT_WEB_ASK_POLICY
         configured_web = any(v is not None for v in (web_mode, web_effort, web_model))
         status = {
             "config_path": str(path),
@@ -643,6 +647,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
             "web_mode": web_mode,
             "web_effort": web_effort,
             "web_agent_model": web_model,
+            "web_ask_policy": web_ask_policy,
             "edit_contract": cfg.get("edit_contract") or "auto",
         }
         if getattr(args, "json", False):
@@ -654,7 +659,8 @@ def _cmd_setup(args: argparse.Namespace) -> int:
             "网页管线默认："
             f"surface={web_mode or '未设置(默认 chat)'}  ·  "
             f"effort={web_effort or '未设置(即时档)'}  ·  "
-            f"agent_model={web_model or 'auto'}"
+            f"agent_model={web_model or 'auto'}  ·  "
+            f"ask_policy={web_ask_policy}"
         )
         return 0
 
@@ -690,9 +696,12 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     if args.web_mode is not None:
         cfg["web_mode"] = args.web_mode
         changed.append(f"web_mode={args.web_mode}")
+    if getattr(args, "ask_policy", None) is not None:
+        cfg["web_ask_policy"] = args.ask_policy
+        changed.append(f"web_ask_policy={args.ask_policy}")
 
     if not changed:
-        _die("什么都没改：至少给一个 --agent-model / --effort / --web-mode（或用 --show 查看）")
+        _die("什么都没改：至少给一个 --agent-model / --effort / --web-mode / --ask-policy（或用 --show 查看）")
 
     _atomic_write_text(path, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
     try:
@@ -3934,6 +3943,12 @@ def main() -> int:
     setup_parser.add_argument("--agent-model", default=None, help="上游 slug；传 auto 或空串表示清除")
     setup_parser.add_argument("--effort", choices=EFFORT_ORDER, default=None)
     setup_parser.add_argument("--web-mode", choices=("chat", "work"), default=None)
+    setup_parser.add_argument(
+        "--ask-policy",
+        choices=WEB_ASK_POLICIES,
+        default=None,
+        help="新对话首次生图确认策略：confirm（默认，1 句轻确认，换模型只作用于本对话）/ remember（静默沿用全局默认）",
+    )
     setup_parser.add_argument(
         "--show",
         action="store_true",

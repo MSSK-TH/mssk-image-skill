@@ -7,7 +7,7 @@
 > 只有用 `--max-dim` / `--exact-size` / `--output-format` 这几个参数时才需要 Pillow
 > （装了 `uv` 的话 launcher 会自动带上，不用手动装）。
 
-当前版本 **v1.5.1**（2026-11-23）。
+当前版本 **v1.5.2**（2026-11-23）。
 
 ---
 
@@ -64,18 +64,19 @@ $imagegen-relay 生成一张海边日出的照片，要横版
 
 ---
 
-## 首次使用：两个问题，然后记住
+## 首次配置与新对话确认（全局兜底 + 按对话生效）
 
-技能不会替你猜"用哪个模型、要什么推理强度"。第一次出图前它会问两轮（**一次只问一件事**）：
+技能不会盲猜你的模型和推理强度：
 
-**第 1 问 —— 模式**
-
-```
-模式：
-  1)聊天   2)工作
-```
-
-**第 2 问 —— 模型 + 档位**（一次问完，因为同一模式内档位与模型无关）
+- **第一次使用（未配置过）**：严格分两轮问（① 模式：`1)聊天 2)工作` → ② 模型+档位），答完后用 `setup` 存为全局兜底默认。
+- **以后每次新对话（默认 `confirm` 策略）**：第 1 次网页生图只问 **1 句轻确认**（如果在提示词里已经点名模型/模式则直接跳过）：
+  > `本次新对话生图：1) 沿用默认（模式 · 模型 · 档位）  2) 换一个`
+  - 选 `1` 立刻沿用默认画图；
+  - 选 `2` 走两步重新选，且**只在本对话内生效**（不覆盖全局默认，除非你明确说“设为默认”）；同一对话后续轮次不再重复提问。
+- 如果希望新对话完全不确认、直接静默沿用全局默认，可随时切换：
+  ```bash
+  python scripts/image_gen.py setup --ask-policy remember
+  ```
 
 ```
 （聊天）模型：1) GPT-6   2) GPT-5.6 Sol
@@ -85,13 +86,13 @@ $imagegen-relay 生成一张海边日出的照片，要横版
 （工作）档位：1)轻度(min)  2)中(standard)  3)高(extended)  4)极高(xhigh)  5)最高(max)
 ```
 
-答完它会固化下来，**以后不再问**：
+保存/更新全局默认示例：
 
 ```bash
 python scripts/image_gen.py setup --agent-model gpt-6-thinking --effort extended --web-mode chat
 ```
 
-之后每条命令都沿用这三个值；临时换就在命令行加参数覆盖。
+之后不传这三个参数时自动沿用；单次或单对话临时切换由命令行参数覆盖。
 
 | 模式 | 档位 | 什么时候用 |
 |---|---|---|
@@ -170,7 +171,7 @@ imagegen-relay/                  ← 一个标准 skill 目录，整体拷进 sk
 ├── scripts/
 │   ├── image_gen.py            CLI 本体（generate / edit / reference / batch / models / tiers / setup）
 │   ├── relay_errors.py         失败分类（CODE= / HINT= 的唯一来源）
-│   ├── selfcheck.py            65 项零成本自检（不发真实生成请求）
+│   ├── selfcheck.py            66 项零成本自检（不发真实生成请求）
 │   └── remove_chroma_key.py    抠图兜底（与官方 skill 逐字节一致）
 ├── references/
 │   ├── cli.md                  完整命令行参考
@@ -193,7 +194,7 @@ imagegen-relay/                  ← 一个标准 skill 目录，整体拷进 sk
 
 ```bash
 cd imagegen-relay
-python scripts/selfcheck.py        # 65 项，10 秒，零成本
+python scripts/selfcheck.py        # 66 项，10 秒，零成本
 python scripts/selfcheck.py -v     # 带细节
 ```
 
@@ -221,6 +222,12 @@ setup 持久化与清除、`[pipeline]` 上报、11 类错误码、参数校验�
 ---
 
 ## 变更记录
+
+**v1.5.2（2026-11-23）**
+
+- 新对话生图策略升级为「全局兜底 + 按对话生效（方案 A）」：新增 `setup --ask-policy confirm|remember`（默认 `confirm`），新对话首图 1 句轻确认，换模型仅作用于当前对话且不污染 `config.json`（同一对话后续不再复问）
+- `relay_errors.py` 人话化内容安全报错保留 `· 网页管线先降级：...` 线索并修正分号类别边界
+- 自检 65 项 → **66 项**
 
 **v1.5.1（2026-11-23）**
 

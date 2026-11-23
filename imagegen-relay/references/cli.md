@@ -7,7 +7,7 @@ This CLI is the relay sibling of official `imagegen`'s `scripts/image_gen.py`: s
 - `edit`: edit existing image(s) or run ratio-locked reference-driven generation (`POST /v1/images/edits`, primary reference route on this relay)
 - `reference`: chat-model-driven reference generation via `POST /v1/responses` + hosted `image_generation` tool (use when changing aspect ratio from the reference or for free style reinterpretation; ignores `style.mssk_*`, use `--reasoning-effort`)
 - `generate-batch`: run many generation jobs concurrently from a JSONL file (`--out-dir` required)
-- `setup`: persist web-pipeline defaults (`--web-mode`, `--effort`, `--agent-model`) into `config.json`, or inspect safely with `--show [--json]` (never exposes `api_key`)
+- `setup`: persist web-pipeline defaults (`--web-mode`, `--effort`, `--agent-model`, `--ask-policy confirm|remember`) into `config.json`, or inspect safely with `--show [--json]` (never exposes `api_key`)
 - `tiers`: list web-pipeline surface & reasoning tiers (`tiers` → `tiers --mode chat|work [--json]`)
 - `models`: list image-capable models exposed by the relay (`GET /v1/models`)
 

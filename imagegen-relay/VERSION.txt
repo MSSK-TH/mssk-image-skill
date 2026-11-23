@@ -1,9 +1,17 @@
 imagegen-relay  —— 版本戳
 ==================================================
-version : 1.5.1
-date    : 2026-11-23（对照真实上游 chat + work /backend-api/models 全量校准 slug 与 5 档 effort，v1.5.1）
+version : 1.5.2
+date    : 2026-11-23（新对话 1 句轻确认 + 按对话生效模型选择 + 网页先降级线索透传，v1.5.2）
 baseline: 官方 imagegen（.system/imagegen）；以下 6 个文件内容完全一致（文本文件仅行尾符 LF/CRLF 差异）：
           prompting.md / sample-prompts.md / remove_chroma_key.py / LICENSE.txt / 两个图标
+
+v1.5.2 交互策略与错误细节优化（2026-11-23）
+------------------------------
+  · 新对话生图交互升级为「全局兜底 + 按对话生效（方案 A）」：
+      - `setup` 新增 `--ask-policy confirm|remember`（默认 `confirm`），`setup --show [--json]` 暴露 `web_ask_policy` 字段；
+      - `confirm`（默认）：每个新对话第 1 次网页生图仅问 1 句「沿用默认还是换一个」（若提示词里已指定模型/模式则跳过）；选「换」后走两步选择且**仅通过命令行参数作用于当前对话**（不覆盖全局 `config.json`，除非用户明确要求设为默认）；同一对话内后续不再复问；
+      - `remember`：静默沿用全局默认并 1 行报备（适合零打断偏好）。
+  · `relay_errors.py` 的 `humanize_moderation_text` 保留服务端附带的 `· 网页管线先降级：...` 线索，并修正类别正则分号边界。
 
 v1.5.1 实测校准与诊断加固（2026-11-23）
 ------------------------------

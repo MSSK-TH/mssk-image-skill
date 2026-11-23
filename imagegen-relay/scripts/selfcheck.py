@@ -389,7 +389,7 @@ def check_setup() -> None:
         )
         record("setup 内容正确", ok, json.dumps(cfg, ensure_ascii=False))
 
-        # setup --show --json 不泄露 api_key
+        # setup --show --json 不泄露 api_key，且默认 web_ask_policy=confirm
         code, out, _ = run(["setup", "--show", "--json"])
         try:
             st = json.loads(out)
@@ -397,11 +397,22 @@ def check_setup() -> None:
                 code == 0
                 and st["configured_web"] is True
                 and st["has_api_key"] is True
+                and st.get("web_ask_policy") == "confirm"
                 and secret_tok not in out
             )
         except Exception:
             ok = False
-        record("setup --show 安全检查且不泄露 api_key", ok, out[:200])
+        record("setup --show 安全检查且默认 web_ask_policy=confirm（不泄密）", ok, out[:200])
+
+        # setup --ask-policy remember 可单独持久化并回读
+        code, _, _ = run(["setup", "--ask-policy", "remember"])
+        code2, out2, _ = run(["setup", "--show", "--json"])
+        try:
+            st2 = json.loads(out2)
+            ok_pol = code == 0 and code2 == 0 and st2.get("web_ask_policy") == "remember"
+        except Exception:
+            ok_pol = False
+        record("setup --ask-policy remember 持久化与回读", ok_pol, out2[:200])
 
         # setup 后命令自动沿用，且 --agent-model auto 可单次覆盖回 auto
         code, out, _ = run(["generate", "--prompt", "x", "--dry-run"])
