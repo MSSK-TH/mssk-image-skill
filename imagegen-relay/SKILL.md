@@ -159,33 +159,33 @@ automatic fallback carries `degraded: true` + `degraded_reason`. So:
 pipeline". If it says `degraded`, say so and quote the reason: the image is real but it did not come
 from the path the user expected.
 
-### 5b-0. FIRST web-pipeline image: ask the user, do not assume (2026-11-19)
+### 5b-0. First web-pipeline image: ask once, then remember (2026-11-19)
 
-The web pipeline has two knobs that change cost, speed and quality a lot, and **the CLI cannot
-discover your account's model list** (shim's `/web/models` is a top-level route; new-api only proxies
-`/v1/*`). So the rule is: **ask once, persist, never ask again**.
+Run `image_gen.py tiers` (or `tiers --mode work` for cards/site assets). It prints three numbered
+lists with **plain names only** -- exactly what you should read out:
 
-1. Run `image_gen.py tiers` (add `--mode work` if they want cards / site assets / long iterative edits).
-   It prints the allowed effort values *and* a list of common model slugs.
-2. Ask the user, in **one** message (do not drip-feed three questions):
-   - **驱动模型**: which slug does your account have? (`gpt-6-thinking` = slower but steadier,
-     `gpt-6-instant` = fastest, `gpt-5.6-sol` …). If they have no idea: pick `gpt-6-thinking`.
-   - **推理档**: `high` / `extended` for detail and legible text, `minimal`/`low` for quick drafts.
-   - **surface**: `chat` (higher pass rate, default) or `work` (cards / site assets / many revisions).
-3. Persist the answer so nobody is asked twice:
+```
+模型：  1) GPT-6   2) GPT-6.1 Sol   3) GPT-5.6 Sol
+档位：  1)即时  2)轻度  3)中  4)高  5)极高
+模式：  1)聊天  2)工作
+```
 
-   ```bash
-   image_gen.py setup --agent-model gpt-6-thinking --effort extended --web-mode chat
-   ```
+Ask the three choices **in one message** -- e.g. "选一下：模型 1/2/3，档位 1-5，模式 1/2".
+Do not explain what thinking/instant means unless asked; do not mention slugs.
 
-   This writes `web_agent_model` / `web_effort` / `web_mode` into `config.json`. Every later command
-   inherits them; a flag on the command line still overrides for that one run.
-4. If the user says “你决定 / whatever you think”: pick `gpt-6-thinking` + `high` + `chat`, and
-   **say which three you picked** — do not stay silent.
+Map the answer with `image_gen.py tiers --json` (`name` -> `value`) and persist it:
 
-Why not just default to `auto`? Because `auto` lets the shim choose a different upstream model per
-request without telling anyone; the same prompt can then land on a different model tomorrow. Explicit
-selection is the point of this section.
+```bash
+image_gen.py setup --agent-model gpt-6-thinking --effort high --web-mode chat
+```
+
+From then on every command inherits those three; a flag on the command line overrides for one run.
+**Never ask again** for that project.
+
+If the user says "你随便": take `1) GPT-6` + `4) 高` + `1) 聊天` and tell them which three you used.
+
+Why not default to `auto`: `auto` lets the shim pick a different upstream model per request without
+telling anyone, so the same prompt can land on a different model tomorrow.
 
 ### 5b. Web-pipeline controls: surface, effort, agent model (2026-11-19)
 
