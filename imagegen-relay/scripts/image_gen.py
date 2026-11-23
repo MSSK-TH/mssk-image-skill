@@ -173,34 +173,44 @@ TRANSPARENT_PROMPT_LINE = (
 # work surface：4 档 UI 滑杆（轻度/中/高/极高），slug 带 -wm 后缀，只变 thinking_effort。
 # CLI 查不到账号真实模型清单（/web/models 是顶层路由，网关只转发 /v1/*），以下为常见参考值。
 
-# ⚠️ 模型清单的来源与限制（2026-11-23 实测）
-#   shim 源码明确写着「不同账号/不同时间可选的 slug 不一样」，所以客户端拿不到权威列表：
-#   · 真实列表在 shim 的 /web/models，但那是顶层路由，经网关查不到；
-#   · 直连 shim 时，若号池里残留空 Cookie 会返回 401。
-#   下面这份「模型家族」来自网关渠道配置里 owner 手填的可用集（含 6.1 / 6.2），
-#   是当前最可靠的参考。slug 按 mode 规则拼：
-#       chat  → <base>-thinking（思考档）／<base>-instant（即时档）
-#       work  → <base>-wm
-#   选错了会返回 bad_request，换一个即可；完全不确定就传 --agent-model auto。
-WEB_MODEL_BASES = [
-    ("GPT-5.5", "gpt-5.5"),
-    ("GPT-5.6 Sol", "gpt-5.6-sol"),
-    ("GPT-5.6 Terra", "gpt-5.6-terra"),
-    ("GPT-5.6 Luna", "gpt-5.6-luna"),
-    ("GPT-6 Astra", "gpt-6-astra"),
-    ("GPT-6 Sol", "gpt-6-sol"),
-    ("GPT-6 Luna", "gpt-6-luna"),
-    ("GPT-6.1 Sol", "gpt-6.1-sol"),
-    ("GPT-6.1 Terra", "gpt-6.1-terra"),
-    ("GPT-6.2 Astra", "gpt-6.2-astra"),
-    ("GPT-6.2 Sol", "gpt-6.2-sol"),
+# ⚠️ chat 与 work 的模型**范围不同**，必须两份独立清单（不要再拿一份 base 拼后缀）。
+#
+# 来源与限制（2026-11-23 实测）：
+#   · chat：模型来自上游 versions[].display_text + intelligence_presets[]，
+#           本清单取自网关渠道里 owner 手填的可用集（含 5.5 / 6.1 / 6.2 系列）。
+#   · work：模型是上游 models[] 里 slug 带 `-wm` 后缀的那批，
+#           按 shim 源码注释只有 7 个（6 Astra/Sol/Luna、6.1 Sol、5.6 Sol/Terra/Luna），**没有 6.2**。
+#   · 真实完整列表在 shim 的 /web/models，但那是顶层路由，经网关查不到；
+#     直连时若号池残留空 Cookie 会 401。所以两份都只是当前最可靠的参考。
+#   · 选错会返回 bad_request，换一个即可；完全不确定就传 --agent-model auto。
+WEB_CHAT_MODELS = [
+    {"name": "GPT-5.5", "value": "gpt-5.5"},
+    {"name": "GPT-5.6 Sol", "value": "gpt-5.6-sol"},
+    {"name": "GPT-5.6 Terra", "value": "gpt-5.6-terra"},
+    {"name": "GPT-5.6 Luna", "value": "gpt-5.6-luna"},
+    {"name": "GPT-6 Astra", "value": "gpt-6-astra"},
+    {"name": "GPT-6 Sol", "value": "gpt-6-sol"},
+    {"name": "GPT-6 Luna", "value": "gpt-6-luna"},
+    {"name": "GPT-6.1 Sol", "value": "gpt-6.1-sol"},
+    {"name": "GPT-6.1 Terra", "value": "gpt-6.1-terra"},
+    {"name": "GPT-6.2 Astra", "value": "gpt-6.2-astra"},
+    {"name": "GPT-6.2 Sol", "value": "gpt-6.2-sol"},
+]
+# work 只有这 7 个（-wm 后缀），别把 6.2 / 6.1-terra / 5.5 塞进来
+WEB_WORK_MODELS = [
+    {"name": "GPT-6 Astra", "value": "gpt-6-astra-wm"},
+    {"name": "GPT-6 Sol", "value": "gpt-6-sol-wm"},
+    {"name": "GPT-6 Luna", "value": "gpt-6-luna-wm"},
+    {"name": "GPT-6.1 Sol", "value": "gpt-6.1-sol-wm"},
+    {"name": "GPT-5.6 Sol", "value": "gpt-5.6-sol-wm"},
+    {"name": "GPT-5.6 Terra", "value": "gpt-5.6-terra-wm"},
+    {"name": "GPT-5.6 Luna", "value": "gpt-5.6-luna-wm"},
 ]
 
 
 def _models_for(mode: str) -> list:
-    """按 surface 拼出该模式下的模型 slug。"""
-    suffix = "-thinking" if mode == "chat" else "-wm"
-    return [{"name": name, "value": base + suffix} for name, base in WEB_MODEL_BASES]
+    """两种 surface 的模型范围不同，各取各的清单。"""
+    return WEB_CHAT_MODELS if mode == "chat" else WEB_WORK_MODELS
 
 
 WEB_CHAT_TIERS = [
