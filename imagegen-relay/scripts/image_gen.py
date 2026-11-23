@@ -2,92 +2,136 @@
 """Relay CLI for explicit image generation or editing with gpt-image-2.
 
 This is the relay counterpart of the official ``imagegen`` skill's
-``scripts/image_gen.py``.
+``scripts/image_gen.py`` (v1.5.0).
 
-Kept identical on purpose (sibling of the official implementation):
-  * subcommands ``generate`` / ``edit`` / ``generate-batch``
-  * every argparse flag name, including the 11 prompt-augmentation fields
-  * the prompt-augmentation engine and ``--augment`` / ``--no-augment``
-  * ``--dry-run`` payload shape, output-path rules, ``--force``, ``--downscale-*``
+Kept aligned with the official implementation:
+  * subcommands ``generate`` / ``edit`` / ``generate-batch`` (plus relay ``reference`` /
+    ``models`` / ``tiers`` / ``setup``)
+  * argparse flag names, including the 11 prompt-augmentation fields
+  * prompt-augmentation engine and ``--augment`` / ``--no-augment``
+  * ``--dry-run`` zero-side-effect preview, output-path rules, ``--force``, ``--downscale-*``
   * batch JSONL semantics (per-job overrides + nested ``fields``), bounded retries
 
-Replaced on purpose -- every such place is marked ``# [relay]``:
-  * the transport: no ``openai`` SDK (it is not installed here, and it would talk
-    to api.openai.com). This script speaks HTTP directly to the relay:
-        POST {base}/images/generations    JSON
-        POST {base}/images/edits          multipart/form-data
-  * upstream payload: only ``model`` / ``prompt`` / ``n`` / ``size`` are sent.
-    ``quality`` / ``background`` / ``output_format`` / ``moderation`` are folded
-    locally (prompt line or local re-encode) instead of being sent.
-  * model validation: this relay serves exactly one image model.
-  * new-api error mapping, retry policy, per-stage timing, ``models`` subcommand.
-
-Standard library only (Python 3.9+). No third-party packages, no environment
-variables required -- the launcher in ``bin/`` reads ``config.json``.
+Relay architecture facts:
+  * Direct stdlib HTTP client (Python 3.9+, Pillow optional for local resample/re-encode).
+  * Two image model slugs:
+      - ``gpt-image-2`` (default): web session pipeline first, auto-fallback to native
+        subscription endpoint (response includes ``degraded: true`` + ``degraded_reason``).
+      - ``codex-gpt-image-2``: native subscription endpoint only (faster, stricter gate).
+  * Custom JSON parameters travel inside ``style`` (``json.RawMessage`` passes through gateway);
+    multipart ``/v1/images/edits`` uses top-level ``web_*`` / ``gif_speed`` fields.
+  * Error classification, humanization, and secret redaction live in ``relay_errors.py``
+    (single source of truth).
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import getpass
 import hashlib
 import json
 import os
 import re
+import socket
+import struct
 import sys
+import tempfile
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
-try:  # [relay] 与 image-web/lib/errors.mjs 同步维护（以本文件为准）
-    from relay_errors import describe_failure
-except Exception:  # 单文件运行时也不该炸
-    def describe_failure(text: str = "", *, http_status=None, **_kw):  # type: ignore
+try:  # [relay] 错误分类、人话化与脱敏唯一真相源
+    from relay_errors import (
+        classify_error,
+        describe_failure,
+        humanize_moderation_text,
+        is_refusal_code,
+        redact_secrets,
+    )
+except Exception:  # 单文件运行时兜底不炸
+    def redact_secrets(text: str = "", extra_secrets: Iterable[str] = ()) -> str:  # type: ignore
+        out = str(text or "")
+        for s in extra_secrets:
+            if len(str(s or "")) >= 6:
+                out = out.replace(str(s), "[REDACTED]")
+        return re.sub(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{8,}", "[REDACTED]", out)
+
+    def humanize_moderation_text(message: str = "") -> str:  # type: ignore
+        return str(message or "")
+
+    def is_refusal_code(code: str) -> bool:  # type: ignore
+        return code in ("content_safety", "content_refusal")
+
+    def classify_error(text: str = "", *, http_status=None, code=None) -> Dict[str, Any]:  # type: ignore
         return {
-            "code": "upstream_error",
+            "code": code or "upstream_error",
+            "hint": "错误分类模块缺失（relay_errors.py 不在同目录）",
+            "retryable": True,
+        }
+
+    def describe_failure(  # type: ignore
+        text: str = "", *, http_status=None, code=None, secrets=(), **_kw
+    ) -> Dict[str, Any]:
+        return {
+            "code": code or "upstream_error",
             "hint": "错误分类模块缺失（relay_errors.py 不在同目录）",
             "retryable": True,
             "zh": "出图失败",
             "http_status": http_status,
-            "raw": str(text or "")[:600],
+            "raw": redact_secrets(str(text or ""), extra_secrets=secrets)[:600],
         }
+
 
 # --------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------
 
 DEFAULT_MODEL = "gpt-image-2"
+MODEL_CHOICES = ("gpt-image-2", "codex-gpt-image-2")
+DEFAULT_RESPONSES_MODEL = "gpt-6-astra"  # [relay] chat model that drives the image tool
+
 DEFAULT_SIZE = "auto"
 DEFAULT_QUALITY = "medium"
 DEFAULT_OUTPUT_FORMAT = "png"
 DEFAULT_CONCURRENCY = 2  # [relay] official default is 5; calibrated for this relay
 DEFAULT_DOWNSCALE_SUFFIX = "-web"
 DEFAULT_OUTPUT_PATH = "output/imagegen/output.png"
-GPT_IMAGE_MODEL_PREFIX = "gpt-image-"
 
-# [relay] which /images/edits contract the relay speaks (decided on first use)
-_EDIT_CONTRACT: Optional[str] = None
-
-# [relay]
-DEFAULT_RELAY_URL = "https://relay.msskwithth.com:9443/v1"
-RELAY_MODEL = "gpt-image-2"
-# 【2026-10-16】中转站按 slug 分流两条生图管线（实现在 imagegen-shim）：
-#   gpt-image-2        → 网页管线 picture_v2 优先，失败自动回退原生（通过率更高，慢一点）
-#   codex-gpt-image-2  → 只走订阅 OAuth 的原生端点（快，判定更严，不回退）
-MODEL_CHOICES = ("gpt-image-2", "codex-gpt-image-2")
-DEFAULT_RESPONSES_MODEL = "gpt-6-astra"  # [relay] chat model that drives the image tool
+DEFAULT_RELAY_URL = ""  # 由 config.json 的 api_url 或环境变量提供
 DEFAULT_REFERENCE_MAX_DIM = 1400  # [relay] downscale references before upload
-DEFAULT_TIMEOUT_SECONDS = 300.0
-DEFAULT_DEADLINE_SECONDS = 600.0  # [relay] hard cap per job, so nothing grinds for 20+ minutes
-USER_AGENT = "imagegen-relay/1.0 (stdlib)"
+
+# [relay] 分层默认超时：常规单图实测 20-60s，卡死时不必白等 600s；重任务自动放宽。
+DEFAULT_STANDARD_TIMEOUT_SECONDS = 150.0
+DEFAULT_STANDARD_DEADLINE_SECONDS = 240.0
+DEFAULT_HEAVY_TIMEOUT_SECONDS = 300.0
+DEFAULT_HEAVY_DEADLINE_SECONDS = 480.0
+DEFAULT_TIMEOUT_SECONDS = DEFAULT_STANDARD_TIMEOUT_SECONDS
+DEFAULT_DEADLINE_SECONDS = DEFAULT_STANDARD_DEADLINE_SECONDS
+HEAVY_EFFORTS = frozenset({"extended", "xhigh", "max"})
+
+USER_AGENT = "imagegen-relay/1.5 (stdlib)"
 MAX_ERROR_TEXT = 400
+MAX_IMAGE_BYTES = 50 * 1024 * 1024
+MAX_BATCH_JOBS = 500
+
+WEB_PIPELINE_COMMANDS = frozenset({"generate", "edit", "generate-batch"})
+
+# [relay] style.mssk_* ↔ multipart 顶层字段 唯一权威映射表
+_STYLE_TO_MULTIPART: Tuple[Tuple[str, str], ...] = (
+    ("mssk_conv", "web_conv_key"),
+    ("mssk_mode", "web_mode"),
+    ("mssk_model", "web_model"),
+    ("mssk_effort", "web_effort"),
+    ("mssk_gif_speed", "gif_speed"),
+)
 
 ALLOWED_LEGACY_SIZES = {"1024x1024", "1536x1024", "1024x1536", "auto"}
 
@@ -123,13 +167,49 @@ TRANSPARENT_PROMPT_LINE = (
 )
 
 # --------------------------------------------------------------------------
-# [relay] Coverage preflight
-#
-# The upstream safety gate that refuses person edits is an *output-image* classifier: it judges
-# the render, not the text. Adding one explicit clothing/coverage constraint flips it (measured:
-# original request refused; same request + the constraint passed 2/2, control still refused).
-# A browser client gets this for free because its chat model rewrites the prompt first; an API
-# call does not. This preflight does the same job deterministically.
+# [relay] Web-pipeline surface / model / effort definitions (Single Source of Truth)
+# --------------------------------------------------------------------------
+# chat surface：3 档（即时/中/高），每档独立 preset slug；
+# work surface：4 档 UI 滑杆（轻度/中/高/极高），slug 带 -wm 后缀，只变 thinking_effort。
+# CLI 查不到账号真实模型清单（/web/models 是顶层路由，网关只转发 /v1/*），以下为常见参考值。
+
+WEB_MODELS = [
+    {"name": "GPT-6", "chat_slug": "gpt-6-thinking", "work_slug": "gpt-6-astra-wm"},
+    {"name": "GPT-6.1 Sol", "chat_slug": "gpt-6.1-sol-thinking", "work_slug": "gpt-6.1-sol-wm"},
+    {"name": "GPT-5.6 Sol", "chat_slug": "gpt-5.6-sol-thinking", "work_slug": "gpt-5.6-sol-wm"},
+]
+WEB_CHAT_TIERS = [
+    {"name": "即时", "effort": "none"},
+    {"name": "中", "effort": "standard"},
+    {"name": "高", "effort": "extended"},
+]
+WEB_WORK_TIERS = [
+    {"name": "轻度", "effort": "minimal"},
+    {"name": "中", "effort": "low"},
+    {"name": "高", "effort": "standard"},
+    {"name": "极高", "effort": "extended"},
+]
+WEB_MODE_CHOICES = [
+    {"name": "聊天", "value": "chat"},
+    {"name": "工作", "value": "work"},
+]
+
+# 合法 --effort 值：同时兼容 work 滑杆（minimal/low/standard/extended/max）
+# 与 chat 账号预设可能声明的值（medium/high/xhigh），以及 none（即时，不传 thinking_effort）。
+EFFORT_ORDER = (
+    "none",
+    "minimal",
+    "low",
+    "standard",
+    "medium",
+    "high",
+    "extended",
+    "xhigh",
+    "max",
+)
+
+# --------------------------------------------------------------------------
+# [relay] Coverage preflight & Refusal retry
 # --------------------------------------------------------------------------
 
 COVERAGE_LINE_ZH = (
@@ -144,20 +224,14 @@ _PERSON_CJK_RE = re.compile(
     r"(人物|角色|女性|男性|女人|男人|女孩|男孩|少女|少年|女士|男士|女生|男生|人像|肖像|写真|立绘|"
     r"模特|主角|女主角|男主角|美女|演员|歌手|运动员|选手|明星|偶像|人脸|人体)"
 )
-
-# Latin terms need word boundaries: "surface" contains "face", "women" contains "men",
-# "factor" contains "actor". "hero" is deliberately absent -- "hero image" is a layout term.
 _PERSON_LATIN_RE = re.compile(
     r"\b(person|people|woman|women|man|men|girl|boy|female|male|portrait|character|"
     r"selfie|face|lady|guy|heroine|idol|athlete|singer|actress|actor|human)\b",
     re.IGNORECASE,
 )
-
-# "model" means a person in a photographic brief, but a 3D/CAD asset everywhere else.
-_PERSON_MODEL_RE = re.compile(r"(?<!\b3d )(?<!\b3-d )(?<!\bpoly )(?<!\blow-poly )\bmodel\b", re.IGNORECASE)
-
-# A negative constraint ("no people", "without any person", "不含人物", "避免其他人物") mentions a
-# person word but means the opposite. Strip those phrases before looking for a subject.
+_PERSON_MODEL_RE = re.compile(
+    r"(?<!\b3d )(?<!\b3-d )(?<!\bpoly )(?<!\blow-poly )\bmodel\b", re.IGNORECASE
+)
 _NEGATED_PERSON_RE = re.compile(
     r"(?:no|without|avoid|exclude|excluding|other|其他|避免|排除|不含|没有|无人|不要|禁止|杜绝)"
     r"\s*"
@@ -166,32 +240,24 @@ _NEGATED_PERSON_RE = re.compile(
     r"人物|角色|人像|人体|人)",
     re.IGNORECASE,
 )
-
 _COVERAGE_RE = re.compile(
     r"(覆盖完整|不透明|保守得体|衣着保守|不出现暴露|fully cover|opaque|modest|"
     r"no revealing|non-?revealing)",
     re.IGNORECASE,
 )
-
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
-# [relay] A labeled spec (the brief shape this skill asks for) already carries its own structure.
 _LABELED_SPEC_RE = re.compile(
     r"(?im)^\s*(use case|asset type|primary request|input images?|scene/backdrop|subject|"
     r"style/medium|composition/framing|lighting/mood|color palette|materials/textures|"
     r"text \(verbatim\)|constraints|clothing|avoid|quality|background)\s*:"
 )
 
-# When the user explicitly locks the outfit, forcing a "fully covering" render would be changing
-# what they asked for. In that case the preflight leaves their wording alone and does not demand
-# coverage: it appends a neutral, garment-preserving constraint instead (the upstream's own
-# suggestion was to de-emphasise body curves rather than change the clothing).
 _OUTFIT_LOCK_RE = re.compile(
     r"(?:服装|衣着|穿搭|outfit|clothing|attire)[^。；\n]{0,12}?"
     r"(?:保持不变|不变|锁定|不改|unchanged|the same|identical)",
     re.IGNORECASE,
 )
-
 OUTFIT_LOCK_LINE_ZH = (
     "Clothing: 保持参考图中的既有服装与既覆盖度不变；画面自然得体，不强调身体曲线，"
     "不出现暴露或暗示性表达。"
@@ -201,19 +267,6 @@ OUTFIT_LOCK_LINE_EN = (
     "tasteful framing, no emphasis on body curves, no revealing or suggestive elements."
 )
 
-# --------------------------------------------------------------------------
-# [relay] Refusal retry
-#
-# The gate that refuses person edits judges the *rendered image*, and it is stochastic: one
-# brief passed once and was refused twice in a 3-run sample on the same channel. Identical
-# bodies get answered from a cache, so a naive retry is useless -- each retry must vary the
-# request slightly. These suffixes are semantically neutral, so the user's intent is intact.
-# --------------------------------------------------------------------------
-
-_REFUSAL_RE = re.compile(
-    r"(内容安全|被安全系统|safety system|rejected by the safety|safety_violations)", re.IGNORECASE
-)
-
 _REFUSAL_VARIATIONS = (
     "",
     "\nRender: clean composition, natural lighting.",
@@ -221,31 +274,7 @@ _REFUSAL_VARIATIONS = (
     "\nRender: clean framing, natural light, sharp detail.",
 )
 
-
-def _is_refusal_error(exc: BaseException) -> bool:
-    return bool(_REFUSAL_RE.search(str(exc)))
-
-
-def _looks_like_person_prompt(prompt: str) -> bool:
-    text = _NEGATED_PERSON_RE.sub(" ", prompt or "")
-    return bool(
-        _PERSON_CJK_RE.search(text)
-        or _PERSON_LATIN_RE.search(text)
-        or _PERSON_MODEL_RE.search(text)
-    )
-
-
-def _already_has_coverage_clause(prompt: str) -> bool:
-    return bool(_COVERAGE_RE.search(prompt or ""))
-
-
-# Phrases that make the output-side classifier read a brief as sexualised. They are not
-# violations on their own -- they push the render. Each one is replaced, and every replacement
-# is reported, so the caller always sees exactly what changed.
 _NEUTRALIZATIONS: List[Tuple[re.Pattern, str, str]] = [
-    # "keep the outfit unchanged" + a coverage requirement is a contradiction the upstream
-    # refuses outright ("the reference image conflicts with fully-covering clothing"), so the
-    # keep-unchanged phrasing has to be reframed before the coverage line is appended.
     (
         re.compile(
             r"(?:锁定|保持|维持|不改变|不要改变|保留)[^。；\n]{0,12}?"
@@ -264,7 +293,11 @@ _NEUTRALIZATIONS: List[Tuple[re.Pattern, str, str]] = [
         "render the outfit as fully covering, opaque sportswear",
         "keep-outfit-unchanged -> reframed",
     ),
-    (re.compile(r"(黄色|白色|黑色|红色|蓝色|粉色|紫色)?\s*(运动内衣|内衣裤|内衣|胸衣|文胸)"), "上衣", "贴身衣物名 -> 上衣"),
+    (
+        re.compile(r"(黄色|白色|黑色|红色|蓝色|粉色|紫色)?\s*(运动内衣|内衣裤|内衣|胸衣|文胸)"),
+        "上衣",
+        "贴身衣物名 -> 上衣",
+    ),
     (re.compile(r"\b(brassiere|bra|lingerie|underwear)\b", re.IGNORECASE), "top", "underwear -> top"),
     (re.compile(r"(身体比例|身材比例|身材曲线|身体曲线|三围)"), "", "身体度量词 -> 删除"),
     (re.compile(r"\b(body proportions|body shape|body curves)\b", re.IGNORECASE), "", "body metrics -> removed"),
@@ -285,67 +318,33 @@ _SEPARATOR_TIDY = [
     (re.compile(r"\n{3,}"), "\n\n"),
 ]
 
+# --------------------------------------------------------------------------
+# [relay] Aspect-ratio presets (--preset)
+# --------------------------------------------------------------------------
 
-def _neutralize_risky_phrases(prompt: str) -> Tuple[str, List[str]]:
-    changes: List[str] = []
-    result = prompt
-    for pattern, replacement, label in _NEUTRALIZATIONS:
-        if pattern.search(result):
-            result = pattern.sub(replacement, result)
-            changes.append(label)
-    if changes:
-        for pattern, replacement in _SEPARATOR_TIDY:
-            result = pattern.sub(replacement, result)
-    return result, changes
+_PRESETS: Dict[str, Dict[str, Tuple[int, int]]] = {
+    "1:1": {"2k": (2048, 2048), "4k": (2880, 2880)},
+    "3:2": {"2k": (2048, 1360), "4k": (3520, 2352)},
+    "2:3": {"2k": (1360, 2048), "4k": (2352, 3520)},
+    "4:3": {"2k": (2048, 1536), "4k": (3264, 2448)},
+    "3:4": {"2k": (1536, 2048), "4k": (2448, 3264)},
+    "16:9": {"2k": (2048, 1152), "4k": (3840, 2160)},
+    "9:16": {"2k": (1152, 2048), "4k": (2160, 3840)},
+    "2:1": {"2k": (2048, 1024), "4k": (3840, 1920)},
+    "1:2": {"2k": (1024, 2048), "4k": (1920, 3840)},
+    "7:4": {"2k": (2208, 1264), "4k": (3808, 2176)},
+    "4:7": {"2k": (1264, 2208), "4k": (2176, 3808)},
+}
 
-
-def _apply_coverage_preflight(
-    prompt: str,
-    *,
-    mode: str,
-    has_reference: bool,
-    enabled: bool = True,
-) -> Tuple[str, bool, List[str]]:
-    """Prepare a person/character prompt for the upstream output-side safety gate.
-
-    Two changes, both measured to be necessary on this relay:
-
-    1. neutralise phrases that pull the *render* toward a sexualised reading (undergarment nouns,
-       body metrics, "keep the clothing coverage unchanged", "revealing");
-    2. append one explicit clothing/coverage constraint, which is what a browser client's chat
-       model adds for you automatically.
-
-    Returns ``(prompt, applied, changes)``. ``mode`` is ``auto`` (only for person/character
-    prompts), ``always`` (any request) or ``off``. Every change is reported to the caller.
-    """
-    if not enabled or mode == "off":
-        return prompt, False, []
-    if mode == "auto" and not _looks_like_person_prompt(prompt):
-        return prompt, False, []
-
-    # The user locked the outfit: honour that. No wording surgery, no coverage demand -- and if
-    # the neutral line is already there, do nothing at all.
-    if _OUTFIT_LOCK_RE.search(prompt):
-        if "既覆盖度不变" in prompt or "existing coverage exactly as it is" in prompt:
-            return prompt, False, []
-        line = OUTFIT_LOCK_LINE_ZH if _CJK_RE.search(prompt) else OUTFIT_LOCK_LINE_EN
-        return prompt + "\n" + line, True, ["服装已锁定 -> 追加中性约束（不改服装、不要求覆盖）"]
-
-    result, changes = _neutralize_risky_phrases(prompt)
-    if not _already_has_coverage_clause(result):
-        line = COVERAGE_LINE_ZH if _CJK_RE.search(result) else COVERAGE_LINE_EN
-        result = result + "\n" + line
-        changes.append("追加服装覆盖约束")
-    if not changes:
-        return prompt, False, []
-    return result, True, changes
-
-MAX_IMAGE_BYTES = 50 * 1024 * 1024
-MAX_BATCH_JOBS = 500
+_CANONICAL_RENDER: Dict[str, Tuple[int, int]] = {
+    "1:1": (1254, 1254),
+    "16:9": (1672, 941),
+    "9:16": (941, 1672),
+}
 
 
 # --------------------------------------------------------------------------
-# Console plumbing
+# Console & Error Plumbing
 # --------------------------------------------------------------------------
 
 
@@ -358,52 +357,113 @@ def _force_utf8_stdio() -> None:
             pass
 
 
-def _emit_failure(exc: "RelayError", args: argparse.Namespace) -> None:
-    """失败统一出口（对齐 image-web：HTTP 状态 + 结构化 code/hint/retryable）。
+def _die(message: str, code: int = 1) -> None:
+    print(f"Error: {message}", file=sys.stderr)
+    raise SystemExit(code)
 
-    输出三行到 stderr，机器可读：
-        一句中文摘要
-        CODE=<错误码>   RETRYABLE=yes|no
-        HINT=<下一步该做什么>
-    --report-json 时同时落一份失败记录，字段与成功记录同构。
+
+def _warn(message: str) -> None:
+    print(f"Warning: {message}", file=sys.stderr)
+
+
+def _info(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+def _skill_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+class RelayError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: Optional[int] = None,
+        retryable: bool = False,
+        raw: Optional[str] = None,
+        code: Optional[str] = None,
+        retry_after: Optional[float] = None,
+        is_timeout: bool = False,
+        elapsed_s: float = 0.0,
+    ):
+        super().__init__(message)
+        self.status = status
+        self.retryable = retryable
+        self.raw = raw
+        self.code = code
+        self.retry_after = retry_after
+        self.is_timeout = is_timeout
+        self.elapsed_s = elapsed_s
+
+
+def _is_refusal_error(exc: BaseException) -> bool:
+    """判定是否属于“可换措辞重试的输出层内容安全拒绝”。
+
+    使用 relay_errors 唯一分类源（同时检查 raw 与人话后的 str(exc)），
+    避免人话化后匹配不到；同时跳过确定性的输入层拒绝（判定阶段=input）。
     """
-    desc = describe_failure(
-        (exc.raw or "") + " " + str(exc),
-        http_status=getattr(exc, "status", None),
-    )
-    code = getattr(exc, "code", None) or desc["code"]
-    retryable = bool(getattr(exc, "retryable", False)) or desc["retryable"]
+    raw = str(getattr(exc, "raw", "") or "")
+    msg = str(exc)
+    combined = f"{raw} {msg}".strip()
+    if "判定阶段=input" in combined or "提示词/参考图阶段" in combined:
+        return False
+    code = getattr(exc, "code", None)
+    if code and is_refusal_code(code):
+        return True
+    cls = classify_error(combined, http_status=getattr(exc, "status", None))
+    return is_refusal_code(cls["code"])
 
+
+def _failure_dict(
+    exc: RelayError,
+    *,
+    secrets: Iterable[str] = (),
+) -> Dict[str, Any]:
+    """生成统一的脱敏失败描述（以 relay_errors 为唯一分类与重试信号源）。"""
+    combined = ((exc.raw or "") + " " + str(exc)).strip()
+    return describe_failure(
+        combined,
+        http_status=exc.status,
+        code=exc.code,
+        secrets=secrets,
+    )
+
+
+def _print_failure_lines(desc: Dict[str, Any], raw_msg: str, *, secrets: Iterable[str] = ()) -> None:
+    safe_msg = redact_secrets(raw_msg, extra_secrets=secrets)
     print(f"Error: {desc['zh']}", file=sys.stderr)
-    print(f"CODE={code}   RETRYABLE={'yes' if retryable else 'no'}", file=sys.stderr)
+    print(f"CODE={desc['code']}   RETRYABLE={'yes' if desc['retryable'] else 'no'}", file=sys.stderr)
     print(f"HINT={desc['hint']}", file=sys.stderr)
-    if str(exc) and str(exc) not in desc["zh"]:
-        print(f"RAW={str(exc)[:600]}", file=sys.stderr)
+    if safe_msg and safe_msg not in desc["zh"]:
+        print(f"RAW={safe_msg[:600]}", file=sys.stderr)
+
+
+def _emit_failure(
+    exc: RelayError,
+    args: argparse.Namespace,
+    *,
+    secrets: Iterable[str] = (),
+) -> None:
+    """失败统一出口：打印脱敏机器可读三行，并按需落 --report-json。"""
+    desc = _failure_dict(exc, secrets=secrets)
+    _print_failure_lines(desc, str(exc), secrets=secrets)
 
     report_path = getattr(args, "report_json", None)
     if report_path:
         try:
-            target = Path(report_path)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(
+            _atomic_write_text(
+                Path(report_path),
                 json.dumps(
                     {
                         "ok": False,
                         "command": getattr(args, "command", None),
                         "model": getattr(args, "model", None),
-                        "error": {
-                            "code": code,
-                            "hint": desc["hint"],
-                            "retryable": retryable,
-                            "zh": desc["zh"],
-                            "http_status": desc["http_status"],
-                            "raw": desc["raw"],
-                        },
+                        "error": desc,
                     },
                     indent=2,
                     ensure_ascii=False,
                 ),
-                encoding="utf-8",
             )
         except Exception:
             pass
@@ -411,45 +471,25 @@ def _emit_failure(exc: "RelayError", args: argparse.Namespace) -> None:
     raise SystemExit(1)
 
 
-# ---------------------------------------------------------------- 网页模型与档位
-# 【2026-11-19】按 webpipe.mjs 的真实结构分两套（不再混成一套）：
-#
-#   chat 模式：模型有 3 个推理档 Instant / Medium / High，
-#             **每档是独立的 preset slug**（gpt-6-instant / gpt-6-thinking …）
-#   work 模式：模型是 slug 带 -wm 后缀那批，档位是固定 5 档滑杆
-#             （轻度 minimal / 中 low / 高 standard / 极高 extended / max max）
-#
-# 为什么 skill 查不到真实列表：shim 的 /web/models 是顶层路由，中转站只转发 /v1/*。
-# 下面是常见值，不保证你的账号都有；报 bad_request 就换一档（错误分类会提示）。
-WEB_MODELS = [
-    {"name": "GPT-6", "chat_slug": "gpt-6-thinking", "work_slug": "gpt-6-astra-wm"},
-    {"name": "GPT-6.1 Sol", "chat_slug": "gpt-6.1-sol-thinking", "work_slug": "gpt-6.1-sol-wm"},
-    {"name": "GPT-5.6 Sol", "chat_slug": "gpt-5.6-sol-thinking", "work_slug": "gpt-5.6-sol-wm"},
-]
-# chat：3 档（对齐网页版的 Instant / Medium / High）
-WEB_CHAT_TIERS = [
-    {"name": "即时", "effort": "none"},
-    {"name": "中", "effort": "standard"},
-    {"name": "高", "effort": "extended"},
-]
-# work：4 档 —— **对齐网页版 UI 的滑杆**（轻度/中/高/极高）。
-# 注意 webpipe 的 WORK_PRESETS 里还有第 5 项 {title:'max', effort:'max'}，
-# 但那是「服务端实测接受、额外提供」的一档，网页界面并不给用户选。
-# 这里按网页版对齐，不放 max（要更久就选「极高」）。
-WEB_WORK_TIERS = [
-    {"name": "轻度", "effort": "minimal"},
-    {"name": "中", "effort": "low"},
-    {"name": "高", "effort": "standard"},
-    {"name": "极高", "effort": "extended"},
-]
-WEB_MODE_CHOICES = [
-    {"name": "聊天", "value": "chat"},
-    {"name": "工作", "value": "work"},
-]
+# --------------------------------------------------------------------------
+# Config, Tiers & Setup  [relay]
+# --------------------------------------------------------------------------
 
 
-def _tiers_for(mode: str):
+def _tiers_for(mode: str) -> List[Dict[str, str]]:
     return WEB_CHAT_TIERS if mode == "chat" else WEB_WORK_TIERS
+
+
+def _load_config_json() -> Dict[str, Any]:
+    cfg_path = _skill_root() / "config.json"
+    if not cfg_path.exists():
+        return {}
+    try:
+        data = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        _die(f"config.json is not valid JSON: {cfg_path} ({exc})")
+    return {}
 
 
 def _config_defaults() -> Dict[str, str]:
@@ -462,104 +502,30 @@ def _config_defaults() -> Dict[str, str]:
     }
 
 
-# ---------------------------------------------------------------- 网页管线档位
-# 【2026-11-19】与 image-web/public/app.js 的 EFFORT_LABEL 保持一致：
-#   web 前端用 presetMap[模型][档位] -> {slug, effort}，这里用「档位 -> effort」一维表。
-# 为什么不在运行时去查 /web/models：
-#   那个接口是 shim 的**顶层路由**，而中转站（new-api）只转发 /v1/*，
-#   所以经中转站永远查不到；直连 shim 才查得到（--shim-url）。
-#   因此这里给一份保守的内置表，真实可用值以出图报错为准（bad_request 会提示降档）。
-# 注意这里有**两套名字**，别混（2026-11-19 实测校正）：
-#   ① web 前端 EFFORT_LABEL 的 key（none/minimal/low/medium/high/xhigh/max/ultra）
-#      只是界面选项标识，**不是**发给上游的值；
-#   ② 真正塞进 thinking_effort 的是上游自己声明的值：
-#      work 模式滑杆 = minimal/low/standard/extended/max（webpipe 第 472-476 行）
-#      chat 模式 = 上游 intelligence_presets[].thinking_effort（可能是 medium/high/xhigh/ultra）
-# 所以这里**两套都收**，标签用 web 那套中文，避免用户背两套词。
-EFFORT_LABEL: Dict[str, str] = {
-    "none": "无（最快，不传推理档）",
-    "minimal": "最低",
-    "low": "低",
-    "standard": "中",
-    "medium": "中",
-    "high": "高",
-    "extended": "极高",
-    "xhigh": "极高",
-    "max": "最高",
-    "ultra": "Ultra",
-}
-# work 模式滑杆的官方五档（webpipe WORK_PRESETS），chat 模式用它那套动态值
-EFFORT_ORDER = [
-    "none", "minimal", "low", "standard", "medium",
-    "high", "extended", "xhigh", "max",
-]
-# 注：web 前端的 EFFORT_LABEL 里有个 "ultra"，但注释写明「ultra 不存在」（实测），
-#     所以这里不作为合法取值；传了会被 argparse 拒绝。
-WORK_EFFORTS = ("minimal", "low", "standard", "extended", "max")
-
-
-def _cmd_setup(args: argparse.Namespace) -> int:
-    """把「驱动模型 / 推理档 / surface」写进 config.json，之后各命令自动沿用。
-
-    【2026-11-19】网页管线的模型与档位不再静默默认：由 agent 首次问使用者，
-    问完用本命令固化。已存在的键会保留（只覆盖这三项）。
-    """
-    path = _skill_root() / "config.json"
-    cfg: Dict[str, Any] = {}
-    if path.exists():
-        try:
-            cfg = json.loads(path.read_text(encoding="utf-8-sig"))
-        except Exception as exc:
-            _die(f"config.json 不是合法 JSON，先修好它：{path} ({exc})")
-    changed = []
-    if args.agent_model is not None:
-        if args.agent_model in ("", "auto"):
-            cfg.pop("web_agent_model", None)
-            changed.append("web_agent_model=<清除，回到 auto>")
-        else:
-            cfg["web_agent_model"] = args.agent_model
-            changed.append(f"web_agent_model={args.agent_model}")
-    if args.effort is not None:
-        if args.effort in ("", "none"):
-            cfg.pop("web_effort", None)
-            changed.append("web_effort=<清除，即时档>")
-        else:
-            cfg["web_effort"] = args.effort
-            changed.append(f"web_effort={args.effort}")
-    if args.web_mode is not None:
-        cfg["web_mode"] = args.web_mode
-        changed.append(f"web_mode={args.web_mode}")
-    if not changed:
-        _die("什么都没改：至少给一个 --agent-model / --effort / --web-mode")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    try:
-        path.chmod(0o600)
-    except Exception:
-        pass
-    print(f"已写入 {path}")
-    for c in changed:
-        print("  ·", c)
-    print("之后各命令不传这三个参数时自动沿用；要临时覆盖就在命令行加。")
-    return 0
+def _validate_web_controls(
+    web_mode: Optional[str],
+    effort: Optional[str],
+    agent_model: Optional[str] = None,
+    *,
+    warn_slug_mismatch: bool = False,
+) -> None:
+    eff = str(effort or "").strip().lower()
+    if web_mode == "work" and eff == "none":
+        _die("work 模式没有即时档（--effort none）；请选 minimal/low/standard/extended，或改用 --web-mode chat。")
+    if warn_slug_mismatch and agent_model and agent_model not in ("", "auto"):
+        if web_mode == "work" and not agent_model.endswith("-wm"):
+            _warn(f"work 模式通常使用 -wm 后缀模型（如 gpt-6-astra-wm），当前指定为 {agent_model}")
+        elif web_mode == "chat" and agent_model.endswith("-wm"):
+            _warn(f"chat 模式通常不使用 -wm 后缀模型，当前指定为 {agent_model}")
 
 
 def _cmd_tiers(args: argparse.Namespace) -> int:
     """两步提问：
-
       1) tiers                → 模式：1)聊天 2)工作
       2) tiers --mode chat    → 模型 + 档位（一次列完）
-
-    为什么第二步能合并：同一模式内档位与模型无关
-      · chat：所有模型都是 即时 / 中 / 高
-      · work：所有模型都是 轻度 / 中 / 高 / 极高
-    而模式不同时档位会变，所以必须先把模式定下来。
-
-    --efforts 仅供单独查档位（可选，正常提问用不到）。
     """
     mode = getattr(args, "mode", None)
 
-    # 第 1 步：没给 --mode → 只列模式
     if not mode:
         if getattr(args, "efforts", False):
             _die("--efforts 需要配合 --mode 一起用（先选模式）")
@@ -576,8 +542,11 @@ def _cmd_tiers(args: argparse.Namespace) -> int:
     label = "聊天" if mode == "chat" else "工作"
 
     if getattr(args, "json", False):
-        data = {"mode": mode, "models": models,
-                "efforts": [{"name": t["name"], "value": t["effort"]} for t in tiers]}
+        data: Dict[str, Any] = {
+            "mode": mode,
+            "models": models,
+            "efforts": [{"name": t["name"], "value": t["effort"]} for t in tiers],
+        }
         if getattr(args, "efforts", False):
             data.pop("models")
         print(json.dumps(data, ensure_ascii=False, indent=2))
@@ -593,19 +562,56 @@ def _cmd_tiers(args: argparse.Namespace) -> int:
 
 
 def _cmd_setup(args: argparse.Namespace) -> int:
-    """把「驱动模型 / 推理档 / surface」写进 config.json，之后各命令自动沿用。
+    """查看或固化「驱动模型 / 推理档 / surface」到 config.json。
 
-    【2026-11-19】网页管线的模型与档位不再静默默认：由 agent 首次问使用者，
-    问完用本命令固化。已存在的键会保留（只覆盖这三项）。
+    --show [--json]：安全只读检查配置状态（绝不打印 api_key，避免 agent 读 config.json 泄露令牌）。
     """
     path = _skill_root() / "config.json"
-    cfg: Dict[str, Any] = {}
-    if path.exists():
-        try:
-            cfg = json.loads(path.read_text(encoding="utf-8-sig"))
-        except Exception as exc:
-            _die(f"config.json 不是合法 JSON，先修好它：{path} ({exc})")
-    changed = []
+    cfg = _load_config_json() if path.exists() else {}
+
+    if getattr(args, "show", False):
+        creds = _resolve_credentials(args)
+        has_key = bool(creds.api_key and not creds.api_key.startswith("PUT-YOUR"))
+        web_mode = cfg.get("web_mode") or None
+        web_effort = cfg.get("web_effort") or None
+        web_model = cfg.get("web_agent_model") or None
+        configured_web = any(v is not None for v in (web_mode, web_effort, web_model))
+        status = {
+            "config_path": str(path),
+            "config_exists": path.exists(),
+            "has_api_key": has_key,
+            "api_url": creds.base_url or None,
+            "credentials_source": creds.source,
+            "configured_web": configured_web,
+            "web_mode": web_mode,
+            "web_effort": web_effort,
+            "web_agent_model": web_model,
+            "edit_contract": cfg.get("edit_contract") or "auto",
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(status, ensure_ascii=False, indent=2))
+            return 0
+        print(f"配置文件：{path}（{'存在' if path.exists() else '未创建'}）")
+        print(f"中转地址：{status['api_url'] or '未配置'}  ·  令牌：{'已配置' if has_key else '未配置'}")
+        print(
+            "网页管线默认："
+            f"surface={web_mode or '未设置(默认 chat)'}  ·  "
+            f"effort={web_effort or '未设置(即时档)'}  ·  "
+            f"agent_model={web_model or 'auto'}"
+        )
+        return 0
+
+    changed: List[str] = []
+    effective_mode = args.web_mode if args.web_mode is not None else cfg.get("web_mode")
+    effective_effort = args.effort if args.effort is not None else cfg.get("web_effort")
+    effective_model = args.agent_model if args.agent_model is not None else cfg.get("web_agent_model")
+    _validate_web_controls(
+        effective_mode,
+        effective_effort,
+        effective_model,
+        warn_slug_mismatch=True,
+    )
+
     if args.agent_model is not None:
         if args.agent_model in ("", "auto"):
             cfg.pop("web_agent_model", None)
@@ -623,10 +629,11 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     if args.web_mode is not None:
         cfg["web_mode"] = args.web_mode
         changed.append(f"web_mode={args.web_mode}")
+
     if not changed:
-        _die("什么都没改：至少给一个 --agent-model / --effort / --web-mode")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        _die("什么都没改：至少给一个 --agent-model / --effort / --web-mode（或用 --show 查看）")
+
+    _atomic_write_text(path, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
     try:
         path.chmod(0o600)
     except Exception:
@@ -638,49 +645,13 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     return 0
 
 
-def _die(message: str, code: int = 1) -> None:
-    print(f"Error: {message}", file=sys.stderr)
-    raise SystemExit(code)
-
-
-_WARNED: set = set()
-
-
-def _warn(message: str) -> None:
-    # [relay] validation runs twice on some paths (main + payload check); say it once.
-    if message in _WARNED:
-        return
-    _WARNED.add(message)
-    print(f"Warning: {message}", file=sys.stderr)
-
-
-def _info(message: str) -> None:
-    print(message, file=sys.stderr)
-
-
 # --------------------------------------------------------------------------
-# Credentials / endpoint resolution  [relay]
+# Conversation Key & Unified WireStyle  [relay]
 # --------------------------------------------------------------------------
 
 
-def _skill_root() -> Path:
-    return Path(__file__).resolve().parent.parent
-
-
-# ---------------------------------------------------------------- 上游对话钥匙
-# 【2026-11-06】网页版能"在同一对话里改图"，是因为它每次请求都带 style.mssk_conv；
-# 本 CLI 以前不带 → 每次都是新对话（改几次就多出几个对话）。
-# 现在把钥匙存在 config.json 旁边，连续调用自动续接；--new-conv 换一把，--conv-key 指定。
-def _conv_key_path() -> Path:
-    """会话钥匙按「用户 + 当前项目目录」隔离（对齐 image-web 的 sha256(user)+conv.id）。
-
-    【2026-11-19】原来存在 skill 安装目录下一个 .conv-key：
-      同一台机器上两个人用、或一个人同时做两个项目时，后一次会覆盖前一次，
-      表现为「改图改到了别人的会话上」。改成跟 git 一样跟着项目走。
-    --conv-key 仍可显式覆盖（多任务并行时必须用）。
-    """
-    import getpass
-
+def _conv_key_path(*, create_dir: bool = True) -> Path:
+    """会话钥匙按「用户 + 当前项目目录」隔离（对齐 image-web 的 sha256(user)+conv.id）。"""
     try:
         user = getpass.getuser()
     except Exception:
@@ -688,78 +659,150 @@ def _conv_key_path() -> Path:
     scope = f"{user}:{Path.cwd()}"
     tag = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:12]
     d = Path.cwd() / ".imagegen"
-    try:
-        d.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        return _skill_root() / f".conv-{tag}"
+    if create_dir:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return _skill_root() / f".conv-{tag}"
     return d / f"conv-{tag}"
 
 
 def _new_conv_key() -> str:
-    import uuid
     return "skill-" + uuid.uuid4().hex[:12]
 
 
-def _resolve_conv_key(args: argparse.Namespace) -> str:
+def _resolve_conv_key_plan(
+    args: argparse.Namespace,
+    *,
+    persist: bool,
+) -> Tuple[str, Optional[Path]]:
+    """计算本次请求的会话钥匙，返回 ``(key, path_to_persist_or_None)``。
+
+    ``persist=False``（如 ``--dry-run``）时保证零磁盘副作用；
+    非 dry-run 时也可把返回的路径交给 ``WireStyle.commit_conv()`` 在请求成功后落盘，
+    避免参数校验/401 失败就覆盖原有活跃会话钥匙。
+    """
     explicit = getattr(args, "conv_key", None)
     if explicit:
-        return str(explicit)
-    path = _conv_key_path()
-    if getattr(args, "new_conv", False) or not path.exists():
-        key = _new_conv_key()
+        return str(explicit), None
+
+    want_new = bool(getattr(args, "new_conv", False))
+    path = _conv_key_path(create_dir=False)
+    if not want_new and path.exists():
         try:
-            path.write_text(key, encoding="utf-8")
+            existing = path.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing, None
         except Exception:
             pass
-        return key
+
+    key = _new_conv_key()
+    if persist:
+        _persist_conv_key(key)
+        return key, None
+    return key, path
+
+
+def _persist_conv_key(key: str) -> None:
+    target = _conv_key_path(create_dir=True)
     try:
-        key = path.read_text(encoding="utf-8").strip()
+        _atomic_write_text(target, key)
     except Exception:
-        key = ""
-    if not key:
-        key = _new_conv_key()
-        try:
-            path.write_text(key, encoding="utf-8")
-        except Exception:
-            pass
+        pass
+
+
+def _resolve_conv_key(args: argparse.Namespace) -> str:
+    key, _pending = _resolve_conv_key_plan(args, persist=not getattr(args, "dry_run", False))
     return key
 
 
-def _style_payload(args: argparse.Namespace) -> Dict[str, Any]:
-    """new-api 会丢顶层自定义字段 → 自定义参数一律走 style（json.RawMessage 能透传）。"""
-    style: Dict[str, Any] = {}
-    key = _resolve_conv_key(args)
-    if key:
-        style["mssk_conv"] = key
+@dataclass
+class WireStyle:
+    """统一的自定义透传参数容器（同时导出 JSON ``style`` 与 multipart 顶层字段）。"""
+
+    mssk_conv: Optional[str] = None
+    mssk_mode: Optional[str] = None
+    mssk_model: Optional[str] = None
+    mssk_effort: Optional[str] = None
+    mssk_gif_speed: Optional[str] = None
+    _pending_conv_persist: bool = False
+
+    def as_json_style(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        if self.mssk_conv:
+            out["mssk_conv"] = self.mssk_conv
+        if self.mssk_gif_speed:
+            out["mssk_gif_speed"] = self.mssk_gif_speed
+        if self.mssk_mode:
+            out["mssk_mode"] = self.mssk_mode
+        if self.mssk_model:
+            out["mssk_model"] = self.mssk_model
+        if self.mssk_effort:
+            out["mssk_effort"] = self.mssk_effort
+        return out
+
+    def as_multipart_fields(self) -> Dict[str, str]:
+        style = self.as_json_style()
+        return {
+            mp_key: str(style[json_key])
+            for json_key, mp_key in _STYLE_TO_MULTIPART
+            if json_key in style and style[json_key]
+        }
+
+    def commit_conv(self) -> None:
+        if self._pending_conv_persist and self.mssk_conv:
+            _persist_conv_key(self.mssk_conv)
+            self._pending_conv_persist = False
+
+
+def _build_wire_style(
+    args: argparse.Namespace,
+    *,
+    include_conv: bool = True,
+    defer_conv_persist: bool = True,
+) -> WireStyle:
+    conv_key: Optional[str] = None
+    pending_persist = False
+    if include_conv:
+        is_dry = bool(getattr(args, "dry_run", False))
+        conv_key, pending_path = _resolve_conv_key_plan(
+            args,
+            persist=(not is_dry and not defer_conv_persist),
+        )
+        pending_persist = (not is_dry) and (pending_path is not None)
+
     gif_speed = getattr(args, "gif_speed", None)
-    if gif_speed:
-        style["mssk_gif_speed"] = str(gif_speed)
-    # 【2026-11-19】网页管线的三件套：surface / 上游推理模型 / 推理档。
-    #   原生管线不认这三个字段（会忽略），所以无脑带上不会伤到原生路。
     web_mode = getattr(args, "web_mode", None)
-    if web_mode:
-        style["mssk_mode"] = str(web_mode)
-    agent_model = getattr(args, "agent_model", None)
-    if agent_model:
-        style["mssk_model"] = str(agent_model)
-    effort = getattr(args, "effort", None)
-    # ⚠️ none 表示「即时」= **不传** thinking_effort。
-    #    webpipe 会把任意非空字符串原样塞进 body.thinking_effort，
-    #    传字符串 "none" 会被上游判成非法字段（实测 400）。这是 2026-11-19 修掉的 bug。
-    if effort and str(effort).strip().lower() not in ("", "none", "undefined", "null", "auto"):
-        style["mssk_effort"] = str(effort)
-    return style
+
+    raw_model = getattr(args, "agent_model", None)
+    agent_model: Optional[str] = None
+    if raw_model and str(raw_model).strip().lower() not in ("", "auto"):
+        agent_model = str(raw_model).strip()
+
+    raw_effort = getattr(args, "effort", None)
+    effort: Optional[str] = None
+    # none 表示「即时」= 不传 thinking_effort（上游收到字符串 "none" 会报 400）。
+    if raw_effort and str(raw_effort).strip().lower() not in ("", "none", "undefined", "null", "auto"):
+        effort = str(raw_effort).strip()
+
+    return WireStyle(
+        mssk_conv=conv_key,
+        mssk_mode=str(web_mode) if web_mode else None,
+        mssk_model=agent_model,
+        mssk_effort=effort,
+        mssk_gif_speed=str(gif_speed) if gif_speed else None,
+        _pending_conv_persist=pending_persist,
+    )
 
 
-def _load_config_json() -> Dict[str, Any]:
-    cfg_path = _skill_root() / "config.json"
-    if not cfg_path.exists():
-        return {}
-    try:
-        return json.loads(cfg_path.read_text(encoding="utf-8-sig"))
-    except Exception as exc:
-        _die(f"config.json is not valid JSON: {cfg_path} ({exc})")
-    return {}
+def _style_payload(args: argparse.Namespace) -> Dict[str, Any]:
+    """兼容入口：返回 JSON ``style`` 透传 dict（dry-run 下零磁盘副作用）。"""
+    return _build_wire_style(args, include_conv=True, defer_conv_persist=True).as_json_style()
+
+
+# --------------------------------------------------------------------------
+# Credentials & Endpoint Resolution  [relay]
+# --------------------------------------------------------------------------
 
 
 def _normalize_base_url(url: str) -> str:
@@ -804,46 +847,58 @@ def _resolve_credentials(args: argparse.Namespace) -> RelayCredentials:
     )
 
 
-_CREDENTIALS_ANNOUNCED = False
+def _ensure_credentials(creds: RelayCredentials, dry_run: bool, *, announce: bool = True) -> None:
+    has_key = bool(creds.api_key and not creds.api_key.startswith("PUT-YOUR"))
+    has_url = bool(creds.base_url and re.match(r"^https?://", creds.base_url, re.I))
 
-
-def _ensure_credentials(creds: RelayCredentials, dry_run: bool) -> None:
-    global _CREDENTIALS_ANNOUNCED
-    if creds.api_key and not creds.api_key.startswith("PUT-YOUR"):
-        if not _CREDENTIALS_ANNOUNCED:
+    if has_key and has_url:
+        if announce:
             _info(f"Relay endpoint: {creds.base_url} (credentials: {creds.source}).")
-            _CREDENTIALS_ANNOUNCED = True
         return
+
     if dry_run:
-        _warn("Relay token is not configured; dry-run only.")
+        if not has_key:
+            _warn("Relay token is not configured; dry-run only.")
+        if not has_url:
+            _warn("Relay api_url is not configured; dry-run only.")
         return
+
+    if not has_key:
+        _die(
+            "Relay token is not configured. Open "
+            f"{_skill_root() / 'config.json'} and put the relay token into the \"api_key\" "
+            "field, save, then retry."
+        )
     _die(
-        "Relay token is not configured. Open "
-        f"{_skill_root() / 'config.json'} and put the relay token into the \"api_key\" "
-        "field, save, then retry."
+        "Relay api_url is not configured (or missing http:// / https://). Open "
+        f"{_skill_root() / 'config.json'} and set \"api_url\" (e.g. https://relay.example.com:9443/v1), "
+        "or pass --base-url."
     )
 
 
 # --------------------------------------------------------------------------
-# HTTP transport  [relay]
+# Edit Contract Resolution  [relay]
 # --------------------------------------------------------------------------
 
+_EDIT_CONTRACT_BY_URL: Dict[str, str] = {}
 
-class RelayError(RuntimeError):
-    def __init__(
-        self,
-        message: str,
-        *,
-        status: Optional[int] = None,
-        retryable: bool = False,
-        raw: Optional[str] = None,
-        code: Optional[str] = None,
-    ):
-        super().__init__(message)
-        self.status = status
-        self.retryable = retryable
-        self.raw = raw
-        self.code = code
+
+def _load_edit_contract(base_url: str) -> Optional[str]:
+    cfg = _load_config_json()
+    pinned = str(cfg.get("edit_contract") or "").strip().lower()
+    if pinned in ("codex-json", "openai-multipart"):
+        return pinned
+    return _EDIT_CONTRACT_BY_URL.get(base_url)
+
+
+def _save_edit_contract(base_url: str, contract: str) -> None:
+    if base_url and contract in ("codex-json", "openai-multipart"):
+        _EDIT_CONTRACT_BY_URL[base_url] = contract
+
+
+# --------------------------------------------------------------------------
+# HTTP Transport, Heartbeat & Retries  [relay]
+# --------------------------------------------------------------------------
 
 
 @dataclass
@@ -883,99 +938,91 @@ def _extract_error_text(text: str) -> str:
     return json.dumps(payload)[:MAX_ERROR_TEXT]
 
 
-_STAGE_ZH = {
-    "input": "提示词/参考图阶段就被拦下",
-    "output": "图已经画好，只是被判掉",
-}
-_CATEGORY_ZH = {
-    "sexual": "性化/暴露",
-    "violence": "暴力",
-    "self-harm": "自残",
-    "harassment": "骚扰",
-    "hate": "仇恨",
-    "minors": "未成年人相关",
-    "sexual/minors": "未成年人性化",
-}
+def _parse_retry_after_header(headers: Any) -> Optional[float]:
+    if not headers:
+        return None
+    try:
+        raw = headers.get("Retry-After")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        val = float(str(raw).strip())
+        return max(0.0, min(val, 120.0))
+    except Exception:
+        return None
 
 
-def _humanize_moderation(message: str) -> str:
-    """[relay] Turn the upstream's codenames into plain Chinese, keep the request id.
-
-    Upstream reports `判定阶段=output，类别=sexual`; non-technical teammates read that as
-    noise. Same wording as the image site's lib/errors.mjs so both ends speak alike.
-    """
-    if "判定阶段" not in message and "类别" not in message:
-        return message
-    stage = re.search(r"判定阶段[=:：]\s*([A-Za-z_-]+)", message)
-    cats = re.search(r"类别[=:：]\s*([A-Za-z/，,\s]+?)(?:，|,|请求|$)", message)
-    rid = re.search(r"请求\s*ID[=:：]\s*([0-9a-fA-F-]{8,})", message)
-    labels = [
-        _CATEGORY_ZH.get(part.strip().lower(), part.strip())
-        for part in re.split(r"[,，/\s]+", cats.group(1)) if part.strip()
-    ] if cats else []
-    parts = [
-        f"图片被上游安全系统判定为「{'、'.join(labels)}」内容，没有出图" if labels
-        else "图片被上游安全系统拒绝，没有出图",
-    ]
-    if stage:
-        parts.append(f"（{_STAGE_ZH.get(stage.group(1).lower(), stage.group(1))}）")
-    if rid:
-        parts.append(f" · 请求 ID：{rid.group(1)}")
-    return "".join(parts)
+_NON_RETRYABLE_TRANSPORT_CODES = frozenset({
+    "token_invalid",
+    "token_revoked",
+    "no_model_access",
+    "no_channel",
+    "deadline_exceeded",
+    "content_safety",
+    "content_refusal",
+    "model_refusal",
+    "upstream_overloaded",
+    "relay_cpu",
+    "bad_request",
+})
 
 
-def _relay_error_from_http(status: int, raw: bytes) -> RelayError:
+def _relay_error_from_http(
+    status: int,
+    raw: bytes,
+    *,
+    headers: Any = None,
+) -> RelayError:
+    """将 HTTP 响应转为 RelayError，分类与重试信号以 relay_errors 为唯一真相源。"""
     text = _decode_body(raw)
     message = _extract_error_text(text)
-    lowered = message.lower()
+    retry_after = _parse_retry_after_header(headers)
 
-    if status == 401 or "invalid token" in lowered:
-        return RelayError(
+    cls = classify_error(f"{message} {text}", http_status=status)
+    code = cls["code"]
+
+    # 识别出的不可重试码直接覆盖 HTTP 5xx/429，绝不盲目猛撞（如 503 system cpu overloaded）
+    if code in _NON_RETRYABLE_TRANSPORT_CODES:
+        transport_retryable = False
+    else:
+        transport_retryable = status in (408, 429) or status >= 500
+
+    if code == "token_invalid":
+        pretty = (
             f"relay rejected the token (HTTP {status}): {message}. "
-            "Update \"api_key\" in config.json with a fresh relay token.",
-            status=status,
-            retryable=False,
-            raw=text,
+            "Update \"api_key\" in config.json with a fresh relay token."
         )
-    if "no available channel" in lowered or "model_not_found" in lowered:
-        return RelayError(
+    elif code == "no_channel":
+        pretty = (
             f"relay has no channel for this model (HTTP {status}): {message}. "
-            f"This relay serves exactly one image model: {RELAY_MODEL}.",
-            status=status,
-            retryable=False,
-            raw=text,
+            f"Valid image models: {', '.join(MODEL_CHOICES)}."
         )
-    if "内容安全" in message or "content policy" in lowered or "safety" in lowered:
-        # [relay] upstream content-safety decision: relay it, never auto-rewrite the request.
-        # The upstream states the reason with English codenames -> humanize for the reader.
-        return RelayError(_humanize_moderation(message), status=status, retryable=False, raw=text)
-    if "invalid json" in lowered:
-        return RelayError(
-            f"relay rejected the request body (HTTP {status}): {message}",
-            status=status,
-            retryable=False,
-            raw=text,
-        )
+    elif is_refusal_code(code):
+        pretty = humanize_moderation_text(message)
+    elif "invalid json" in message.lower():
+        pretty = f"relay rejected the request body (HTTP {status}): {message}"
+    else:
+        pretty = f"relay error (HTTP {status}): {message}"
 
-    retryable = status == 429 or status == 408 or status >= 500
     return RelayError(
-        f"relay error (HTTP {status}): {message}",
+        pretty,
         status=status,
-        retryable=retryable,
+        retryable=transport_retryable,
         raw=text,
+        code=code,
+        retry_after=retry_after,
     )
 
 
 class _Heartbeat:
-    """[relay] Prints an 'still working' line while a long render is in flight.
+    """[relay] Prints a progress line while a long render is in flight; escalates to [slow] if stalled."""
 
-    A 20-60 s render looks identical to a hang from the outside; this makes the
-    difference visible and discourages a wasteful re-run.
-    """
-
-    def __init__(self, label: str, interval: float = 20.0):
+    def __init__(self, label: str, interval: float = 20.0, slow_after: float = 90.0):
         self.label = label
         self.interval = interval
+        self.slow_after = slow_after
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -984,10 +1031,17 @@ class _Heartbeat:
 
         def loop() -> None:
             while not self._stop.wait(self.interval):
-                _info(
-                    f"[waiting] {self.label} {time.monotonic() - started:.0f}s elapsed -- "
-                    "the relay is still rendering; do not start another run."
-                )
+                elapsed = time.monotonic() - started
+                if elapsed >= self.slow_after:
+                    _info(
+                        f"[slow] {self.label} {elapsed:.0f}s elapsed -- "
+                        "taking longer than usual (possible queue/session stall); waiting up to timeout."
+                    )
+                else:
+                    _info(
+                        f"[waiting] {self.label} {elapsed:.0f}s elapsed -- "
+                        "the relay is still rendering; do not start another run."
+                    )
 
         self._thread = threading.Thread(target=loop, daemon=True)
         self._thread.start()
@@ -1000,6 +1054,15 @@ class _Heartbeat:
         return False
 
 
+def _is_timeout_exception(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return True
+    return "timed out" in str(exc).lower()
+
+
 def _http_request(
     url: str,
     *,
@@ -1009,6 +1072,7 @@ def _http_request(
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     method: str = "POST",
     label: str = "request",
+    slow_after: float = 90.0,
 ) -> HttpResponse:
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -1020,8 +1084,9 @@ def _http_request(
     request = urlrequest.Request(url, data=data, headers=headers, method=method)
 
     started = time.time()
+    mono_start = time.monotonic()
     try:
-        with _Heartbeat(label):
+        with _Heartbeat(label, slow_after=slow_after):
             with urlrequest.urlopen(request, timeout=timeout) as response:
                 headers_at = time.time()
                 body = response.read()
@@ -1034,10 +1099,24 @@ def _http_request(
                 )
     except urlerror.HTTPError as exc:
         raw = exc.read()
-        raise _relay_error_from_http(exc.code, raw)
-    except (urlerror.URLError, TimeoutError, OSError) as exc:
+        raise _relay_error_from_http(exc.code, raw, headers=exc.headers)
+    except (urlerror.URLError, TimeoutError, socket.timeout, OSError) as exc:
+        elapsed = time.monotonic() - mono_start
         reason = getattr(exc, "reason", exc)
-        raise RelayError(f"network error talking to {url}: {reason}", retryable=True)
+        if _is_timeout_exception(exc):
+            raise RelayError(
+                f"request timed out after {elapsed:.0f}s talking to {url}: {reason}",
+                retryable=True,
+                code="timeout",
+                is_timeout=True,
+                elapsed_s=elapsed,
+            )
+        raise RelayError(
+            f"network error talking to {url}: {reason}",
+            retryable=True,
+            code="network_error",
+            elapsed_s=elapsed,
+        )
 
 
 def _encode_multipart(
@@ -1072,177 +1151,57 @@ def _guess_content_type(path: Path) -> str:
         return "image/jpeg"
     if suffix == ".webp":
         return "image/webp"
+    if suffix == ".gif":
+        return "image/gif"
     return "image/png"
 
 
-@dataclass
-class ImageResult:
-    raw: bytes
-    actual_size: Optional[str]
-    revised_prompt: Optional[str]
-    source: str
-    # 【2026-11-06】GIF 支持：relay 会回 mime_type / sprite_sheet / animation
-    mime: Optional[str] = None
-    sprite: Optional[bytes] = None
-    animation: Optional[Dict[str, Any]] = None
-
-
-def _looks_like_gif(raw: bytes) -> bool:
-    return raw[:6] in (b"GIF87a", b"GIF89a")
-
-
-def _result_extra(item: Dict[str, Any]) -> Dict[str, Any]:
-    """[relay GIF] 取出 mime / sprite sheet / animation 三个附加字段。"""
-    mime = item.get("mime_type")
-    sprite_b64 = item.get("sprite_sheet")
-    sprite: Optional[bytes] = None
-    if isinstance(sprite_b64, str) and sprite_b64:
-        try:
-            sprite = base64.b64decode(sprite_b64)
-        except Exception:
-            sprite = None
-    anim = item.get("animation")
-    return {
-        "mime": str(mime) if mime else None,
-        "sprite": sprite,
-        "animation": anim if isinstance(anim, dict) else None,
-    }
-
-
-_LAST_PIPELINE = {}
-
-
-def _report_pipeline(payload, model, web_mode=None, effort=None, agent_model=None):
-    """把「这次到底走的是网页管线还是原生」讲清楚（2026-11-19）。
-
-    shim 的响应约定：
-      · 正常走网页管线 → 响应里**没有** degraded 字段
-      · 网页管线失败、自动降级到原生或 /responses → 带 degraded:true + degraded_reason
-    所以「有没有 degraded」就是判断依据。显式 --model codex-gpt-image-2 时按原生处理。
-    """
-    payload = payload if isinstance(payload, dict) else {}
-    degraded = bool(payload.get("degraded"))
-    reason = str(payload.get("degraded_reason") or "")
-    forced_native = str(model or "").lower().startswith("codex-")
-    if forced_native and not degraded:
-        via, note = "native", "按 --model 指定，走原生端点（不经网页管线）"
-    elif degraded:
-        via, note = "degraded", "网页管线失败 → 自动降级到原生（原因：%s）" % (reason or "未给")
-    else:
-        via, note = "web", "网页管线（Cookie 会话）"
-    # 【2026-11-19】surface / effort 只对网页管线有意义；原生端点没有这两个概念。
-    #   没显式传 --web-mode 时，实际生效的是 shim 的默认值 chat —— 这里如实标「默认」，
-    #   不要写成"你选了 chat"，因为调用方并没有选。
-    surface = None
-    effort_shown = None
-    if via == "web":
-        surface = str(web_mode or "chat")
-        surface_note = "默认" if not web_mode else "指定"
-        effort_shown = str(effort) if effort else "默认（即时档）"
-    _LAST_PIPELINE.clear()
-    _LAST_PIPELINE.update({
-        "pipeline": via,
-        "note": note,
-        "degraded_reason": reason or None,
-        "surface": surface,
-        "surface_source": ("default" if (via == "web" and not web_mode) else ("flag" if via == "web" else None)),
-        "effort": (str(effort) if (via == "web" and effort) else None),
-        "agent_model": (str(agent_model) if (via == "web" and agent_model) else None),
-    })
-    detail = ""
-    if via == "web":
-        detail = " · surface=%s（%s） · effort=%s" % (surface, surface_note, effort_shown)
-        if agent_model:
-            detail += " · agent_model=%s" % agent_model
-    elif via == "degraded":
-        detail = " · surface/effort 已失效（没走网页管线）"
-    # 与 web 端一致：降级要像「备用通道」标签那样醒目，不能混在普通输出里
-    if degraded:
-        _warn(f"本次图片来自备用通道（{note}）—— 不是网页管线出的图{detail}")
-    else:
-        _info(f"[pipeline] {note}{detail}")
-    return dict(_LAST_PIPELINE)
-
-def _parse_images(payload: Dict[str, Any], *, creds: RelayCredentials, timeout: float) -> List[ImageResult]:
-    data = payload.get("data")
-    if not isinstance(data, list) or not data:
+def _effective_timeout(timeout: float, deadline: Optional[float]) -> float:
+    if deadline is None:
+        return timeout
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
         raise RelayError(
-                f"relay returned no images: {json.dumps(payload)[:MAX_ERROR_TEXT]}",
-                code="no_image_data",
-            )
-
-    results: List[ImageResult] = []
-    for index, item in enumerate(data):
-        if not isinstance(item, dict):
-            raise RelayError(f"unexpected image entry at data[{index}]: {item!r}")
-        b64 = item.get("b64_json")
-        if b64:
-            try:
-                raw = base64.b64decode(b64)
-            except Exception as exc:
-                raise RelayError(f"could not decode data[{index}].b64_json: {exc}")
-            results.append(
-                ImageResult(
-                    raw=raw,
-                    actual_size=item.get("size"),
-                    revised_prompt=item.get("revised_prompt"),
-                    source="b64_json",
-                    **_result_extra(item),
-                )
-            )
-            continue
-        url = item.get("url")
-        if url:
-            response = _http_request(
-                str(url), api_key=creds.api_key, timeout=timeout, method="GET"
-            )
-            results.append(
-                ImageResult(
-                    raw=response.body,
-                    actual_size=item.get("size"),
-                    revised_prompt=item.get("revised_prompt"),
-                    source="url",
-                    **_result_extra(item),
-                )
-            )
-            continue
-        raise RelayError("API image entry contains neither b64_json nor url")
-    return results
+            "aborted: the overall --deadline budget was used up. Nothing was written.",
+            retryable=False,
+            code="deadline_exceeded",
+        )
+    return max(1.0, min(timeout, remaining))
 
 
-def _with_retries(
-    attempt_fn,
+def _resolve_timeouts(
+    args: argparse.Namespace,
     *,
-    attempts: int,
-    label: str,
-    deadline: Optional[float] = None,
-) -> Tuple[HttpResponse, Any]:
-    last_exc: Optional[RelayError] = None
-    for attempt in range(1, attempts + 1):
-        if deadline is not None and deadline - time.monotonic() <= 0:
-            raise RelayError(
-                f"{label} aborted after {attempt - 1} attempt(s): the overall --deadline "
-                "budget was used up. Nothing was written."
-            )
-        try:
-            return attempt_fn()
-        except RelayError as exc:
-            last_exc = exc
-            if not exc.retryable or attempt >= attempts:
-                raise
-            delay = _extract_retry_after_seconds(exc) or min(60.0, 2.0**attempt)
-            if deadline is not None:
-                delay = min(delay, max(0.0, deadline - time.monotonic()))
-            _info(
-                f"{label} attempt {attempt}/{attempts} failed "
-                f"({exc.__class__.__name__}); retrying in {delay:.1f}s"
-            )
-            if delay > 0:
-                time.sleep(delay)
-    raise last_exc or RelayError("unknown relay failure")
+    command: str,
+    n: int,
+    web_mode: Optional[str],
+    effort: Optional[str],
+) -> Tuple[float, float, float]:
+    """分层默认超时：常规单图 (150s/240s)，重任务 (300s/480s)；显式参数始终优先。"""
+    heavy = (
+        n > 1
+        or web_mode == "work"
+        or str(effort or "").lower() in HEAVY_EFFORTS
+        or command == "reference"
+    )
+    user_timeout = getattr(args, "timeout", None)
+    user_deadline = getattr(args, "deadline", None)
+
+    timeout_s = float(user_timeout) if user_timeout is not None else (
+        DEFAULT_HEAVY_TIMEOUT_SECONDS if heavy else DEFAULT_STANDARD_TIMEOUT_SECONDS
+    )
+    if user_deadline is not None:
+        deadline_s = float(user_deadline)
+    else:
+        default_dl = DEFAULT_HEAVY_DEADLINE_SECONDS if heavy else DEFAULT_STANDARD_DEADLINE_SECONDS
+        deadline_s = max(default_dl, timeout_s)
+    slow_after = 180.0 if heavy else 90.0
+    return timeout_s, deadline_s, slow_after
 
 
 def _extract_retry_after_seconds(exc: RelayError) -> Optional[float]:
+    if exc.retry_after is not None:
+        return exc.retry_after
     message = str(exc)
     match = re.search(r"retry[- ]after[:= ]+([0-9]+(?:\.[0-9]+)?)", message, re.IGNORECASE)
     if match:
@@ -1251,6 +1210,88 @@ def _extract_retry_after_seconds(exc: RelayError) -> Optional[float]:
         except Exception:
             return None
     return None
+
+
+def _with_retries(
+    attempt_fn: Callable[[], Any],
+    *,
+    attempts: int,
+    label: str,
+    deadline: Optional[float] = None,
+) -> Any:
+    last_exc: Optional[RelayError] = None
+    for attempt in range(1, attempts + 1):
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            raise RelayError(
+                f"{label} aborted after {attempt - 1} attempt(s): the overall --deadline "
+                "budget was used up. Nothing was written.",
+                retryable=False,
+                code="deadline_exceeded",
+            )
+        try:
+            return attempt_fn()
+        except RelayError as exc:
+            last_exc = exc
+            if not exc.retryable or attempt >= attempts:
+                raise
+            # 长耗时渲染超时（>=60s）大概率是后端排队或会话卡死，最多自动重试 1 次
+            if exc.is_timeout and exc.elapsed_s >= 60.0:
+                if attempt >= 2 or (deadline is not None and deadline - time.monotonic() < 60.0):
+                    raise
+            delay = _extract_retry_after_seconds(exc) or min(60.0, 2.0**attempt)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 1.0:
+                    raise RelayError(
+                        f"{label} aborted after {attempt} attempt(s): the overall --deadline "
+                        "budget was used up. Nothing was written.",
+                        retryable=False,
+                        code="deadline_exceeded",
+                    )
+                delay = min(delay, max(0.0, remaining - 1.0))
+            _info(
+                f"{label} attempt {attempt}/{attempts} failed "
+                f"({exc.code or exc.__class__.__name__}); retrying in {delay:.1f}s"
+            )
+            if delay > 0:
+                time.sleep(delay)
+    raise last_exc or RelayError("unknown relay failure")
+
+
+def _post_with_retries(
+    creds: RelayCredentials,
+    endpoint: str,
+    *,
+    body: bytes,
+    content_type: str,
+    attempts: int,
+    timeout: float,
+    label: str,
+    deadline: Optional[float] = None,
+    slow_after: float = 90.0,
+) -> Tuple[HttpResponse, Dict[str, Any]]:
+    url = f"{creds.base_url}/{endpoint.lstrip('/')}"
+
+    def once() -> Tuple[HttpResponse, Dict[str, Any]]:
+        response = _http_request(
+            url,
+            api_key=creds.api_key,
+            data=body,
+            content_type=content_type,
+            timeout=_effective_timeout(timeout, deadline),
+            method="POST",
+            label=label,
+            slow_after=slow_after,
+        )
+        try:
+            decoded = json.loads(_decode_body(response.body))
+        except Exception as exc:
+            raise RelayError(f"relay returned invalid JSON: {exc}")
+        if isinstance(decoded, dict) and "error" in decoded and "data" not in decoded:
+            raise _relay_error_from_http(response.status, response.body)
+        return response, decoded
+
+    return _with_retries(once, attempts=attempts, label=label, deadline=deadline)
 
 
 def _post_json_with_retries(
@@ -1262,29 +1303,20 @@ def _post_json_with_retries(
     timeout: float,
     label: str,
     deadline: Optional[float] = None,
+    slow_after: float = 90.0,
 ) -> Tuple[HttpResponse, Dict[str, Any]]:
-    url = f"{creds.base_url}/{endpoint.lstrip('/')}"
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-
-    def once() -> Tuple[HttpResponse, Dict[str, Any]]:
-        response = _http_request(
-            url,
-            api_key=creds.api_key,
-            data=body,
-            content_type="application/json",
-            timeout=_effective_timeout(timeout, deadline),
-            method="POST",
-            label=label,
-        )
-        try:
-            decoded = json.loads(_decode_body(response.body))
-        except Exception as exc:
-            raise RelayError(f"relay returned invalid JSON: {exc}")
-        if isinstance(decoded, dict) and "error" in decoded and "data" not in decoded:
-            raise _relay_error_from_http(response.status, response.body)
-        return response, decoded
-
-    return _with_retries(once, attempts=attempts, label=label, deadline=deadline)
+    return _post_with_retries(
+        creds,
+        endpoint,
+        body=body,
+        content_type="application/json",
+        attempts=attempts,
+        timeout=timeout,
+        label=label,
+        deadline=deadline,
+        slow_after=slow_after,
+    )
 
 
 def _post_multipart_with_retries(
@@ -1297,29 +1329,20 @@ def _post_multipart_with_retries(
     timeout: float,
     label: str,
     deadline: Optional[float] = None,
+    slow_after: float = 90.0,
 ) -> Tuple[HttpResponse, Dict[str, Any]]:
-    url = f"{creds.base_url}/{endpoint.lstrip('/')}"
     body, content_type = _encode_multipart(fields, files)
-
-    def once() -> Tuple[HttpResponse, Dict[str, Any]]:
-        response = _http_request(
-            url,
-            api_key=creds.api_key,
-            data=body,
-            content_type=content_type,
-            timeout=_effective_timeout(timeout, deadline),
-            method="POST",
-            label=label,
-        )
-        try:
-            decoded = json.loads(_decode_body(response.body))
-        except Exception as exc:
-            raise RelayError(f"relay returned invalid JSON: {exc}")
-        if isinstance(decoded, dict) and "error" in decoded and "data" not in decoded:
-            raise _relay_error_from_http(response.status, response.body)
-        return response, decoded
-
-    return _with_retries(once, attempts=attempts, label=label, deadline=deadline)
+    return _post_with_retries(
+        creds,
+        endpoint,
+        body=body,
+        content_type=content_type,
+        attempts=attempts,
+        timeout=timeout,
+        label=label,
+        deadline=deadline,
+        slow_after=slow_after,
+    )
 
 
 def _post_edit_with_retries(
@@ -1332,21 +1355,13 @@ def _post_edit_with_retries(
     timeout: float,
     label: str,
     deadline: Optional[float] = None,
+    slow_after: float = 90.0,
+    cached_contract: Optional[str] = None,
 ) -> Tuple[Tuple[HttpResponse, Dict[str, Any]], str]:
-    """[relay] Speak whichever edits contract the relay implements.
+    """[relay] Speak whichever edits contract the relay implements (configurable via config.json edit_contract)."""
+    contract = cached_contract or _load_edit_contract(creds.base_url)
 
-    * **Codex contract** -- what the official Codex client posts to
-      ``{base}/images/edits``: a JSON body with ``images: [{"image_url": ...} |
-      {"file_id": ...}]`` (see ``codex-rs/codex-api/src/endpoint/images.rs``).
-    * **OpenAI Images contract** -- ``multipart/form-data`` with one ``image`` part
-      per input file, which is what new-api and most OpenAI-compatible relays accept.
-
-    The Codex contract is tried first (it is the isomorphic path), and the choice is
-    cached for the rest of the process once a relay answers 400 "image is required".
-    """
-    global _EDIT_CONTRACT
-
-    if _EDIT_CONTRACT != "openai-multipart":
+    if contract != "openai-multipart":
         try:
             result = _post_json_with_retries(
                 creds,
@@ -1356,17 +1371,18 @@ def _post_edit_with_retries(
                 timeout=timeout,
                 label=label,
                 deadline=deadline,
+                slow_after=slow_after,
             )
-            _EDIT_CONTRACT = "codex-json"
-            return result, _EDIT_CONTRACT
+            _save_edit_contract(creds.base_url, "codex-json")
+            return result, "codex-json"
         except RelayError as exc:
             message = str(exc).lower()
             if "image is required" not in message and "images is required" not in message:
                 raise
-            _EDIT_CONTRACT = "openai-multipart"
+            _save_edit_contract(creds.base_url, "openai-multipart")
             _info(
-                "Relay does not implement the Codex images contract (JSON images[]); "
-                "falling back to the OpenAI Images contract (multipart image)."
+                "Relay uses the OpenAI Images contract (multipart image); falling back now "
+                '(set "edit_contract": "openai-multipart" in config.json to skip this probe).'
             )
 
     result = _post_multipart_with_retries(
@@ -1378,19 +1394,70 @@ def _post_edit_with_retries(
         timeout=timeout,
         label=label,
         deadline=deadline,
+        slow_after=slow_after,
     )
     return result, "openai-multipart"
 
 
-def _effective_timeout(timeout: float, deadline: Optional[float]) -> float:
-    if deadline is None:
-        return timeout
-    return max(1.0, min(timeout, deadline - time.monotonic()))
+# --------------------------------------------------------------------------
+# Prompt Preflight, Validation & Unified Prompt Pipeline
+# --------------------------------------------------------------------------
 
 
-# --------------------------------------------------------------------------
-# Validation (official logic; relay mode demotes hard failures to warnings)
-# --------------------------------------------------------------------------
+def _looks_like_person_prompt(prompt: str) -> bool:
+    text = _NEGATED_PERSON_RE.sub(" ", prompt or "")
+    return bool(
+        _PERSON_CJK_RE.search(text)
+        or _PERSON_LATIN_RE.search(text)
+        or _PERSON_MODEL_RE.search(text)
+    )
+
+
+def _already_has_coverage_clause(prompt: str) -> bool:
+    return bool(_COVERAGE_RE.search(prompt or ""))
+
+
+def _neutralize_risky_phrases(prompt: str) -> Tuple[str, List[str]]:
+    changes: List[str] = []
+    result = prompt
+    for pattern, replacement, label in _NEUTRALIZATIONS:
+        if pattern.search(result):
+            result = pattern.sub(replacement, result)
+            changes.append(label)
+    if changes:
+        for pattern, replacement in _SEPARATOR_TIDY:
+            result = pattern.sub(replacement, result)
+    return result, changes
+
+
+def _apply_coverage_preflight(
+    prompt: str,
+    *,
+    mode: str,
+    has_reference: bool,
+    enabled: bool = True,
+) -> Tuple[str, bool, List[str]]:
+    """Prepare a person/character prompt for the upstream output-side safety gate."""
+    del has_reference
+    if not enabled or mode == "off":
+        return prompt, False, []
+    if mode == "auto" and not _looks_like_person_prompt(prompt):
+        return prompt, False, []
+
+    if _OUTFIT_LOCK_RE.search(prompt):
+        if "既覆盖度不变" in prompt or "existing coverage exactly as it is" in prompt:
+            return prompt, False, []
+        line = OUTFIT_LOCK_LINE_ZH if _CJK_RE.search(prompt) else OUTFIT_LOCK_LINE_EN
+        return prompt + "\n" + line, True, ["服装已锁定 -> 追加中性约束（不改服装、不要求覆盖）"]
+
+    result, changes = _neutralize_risky_phrases(prompt)
+    if not _already_has_coverage_clause(result):
+        line = COVERAGE_LINE_ZH if _CJK_RE.search(result) else COVERAGE_LINE_EN
+        result = result + "\n" + line
+        changes.append("追加服装覆盖约束")
+    if not changes:
+        return prompt, False, []
+    return result, True, changes
 
 
 def _dependency_hint(package: str, *, upgrade: bool = False) -> str:
@@ -1409,8 +1476,6 @@ def _read_prompt(prompt: Optional[str], prompt_file: Optional[str]) -> str:
         path = Path(prompt_file)
         if not path.exists():
             _die(f"Prompt file not found: {path}")
-        # 【2026-11-23】用 utf-8-sig 读：Windows 记事本保存的 UTF-8 带 BOM（EF BB BF），
-        # 普通 utf-8 解码会在提示词开头留下 \ufeff，strip() 去不掉，会污染发给上游的文本。
         return path.read_text(encoding="utf-8-sig").strip()
     if prompt:
         return prompt.strip()
@@ -1449,10 +1514,9 @@ def _parse_size(size: str) -> Optional[Tuple[int, int]]:
 def _gpt_image_2_size_problem(size: str) -> Optional[str]:
     if size == "auto":
         return None
-
     parsed = _parse_size(size)
     if parsed is None:
-        return None  # [relay] non WxH tokens (for example 1K/2K/4K) are passed through
+        return None  # [relay] non WxH tokens (e.g. 1K/2K/4K) pass through
 
     width, height = parsed
     max_edge = max(width, height)
@@ -1474,8 +1538,8 @@ def _gpt_image_2_size_problem(size: str) -> Optional[str]:
 
 def _validate_size(size: str, model: str, *, strict: bool) -> None:
     if not strict and size in RELAY_NATIVE_SIZES:
-        return  # [relay] measured-good ratio pairs for this relay
-    if model == GPT_IMAGE_2_MODEL:
+        return
+    if model in MODEL_CHOICES:
         problem = _gpt_image_2_size_problem(size)
     elif size not in ALLOWED_LEGACY_SIZES:
         problem = (
@@ -1516,16 +1580,13 @@ def _validate_moderation(moderation: Optional[str]) -> None:
 
 
 def _validate_model(model: str) -> None:
-    # 【2026-10-16】中转站现在对两个 slug 分流（shim 侧实现）：
-    #   gpt-image-2        → 网页管线（picture_v2）优先，失败自动回退原生端点
-    #   codex-gpt-image-2  → 只走订阅 OAuth 的原生端点 /codex/images/*
     if model in MODEL_CHOICES:
         return
     _die(
         "model must be one of: "
         + ", ".join(MODEL_CHOICES)
         + " (gpt-image-2 = web pipeline first with native fallback; "
-          "codex-gpt-image-2 = native subscription endpoint only)."
+        "codex-gpt-image-2 = native subscription endpoint only)."
     )
 
 
@@ -1540,11 +1601,11 @@ def _validate_model_specific_options(
     background: Optional[str],
     input_fidelity: Optional[str] = None,
 ) -> None:
-    if model != GPT_IMAGE_2_MODEL:
+    if model not in MODEL_CHOICES:
         return
     if background == "transparent":
         _warn(
-            "gpt-image-2 does not accept background=transparent; this relay emulates it with a "
+            f"{model} does not accept background=transparent; this relay emulates it with a "
             "prompt requirement plus a local PNG alpha channel (measured ~46-52% transparent "
             "pixels). Use scripts/remove_chroma_key.py if the subject is complex."
         )
@@ -1554,62 +1615,52 @@ def _validate_model_specific_options(
         )
 
 
-def _validate_generate_payload(payload: Dict[str, Any], *, strict_size: bool) -> None:
-    model = str(payload.get("model", DEFAULT_MODEL))
-    _validate_model(model)
-    n = int(payload.get("n", 1))
+def _validate_image_job_options(
+    *,
+    model: str,
+    n: int,
+    size: str,
+    quality: str,
+    background: Optional[str],
+    output_format: str,
+    output_compression: Optional[int],
+    moderation: Optional[str],
+    input_fidelity: Optional[str] = None,
+    strict_size: bool = False,
+    is_responses_route: bool = False,
+) -> None:
+    """单次统一参数校验入口（彻底消除 main + command 双重校验）。"""
     if n < 1 or n > 10:
         _die("n must be between 1 and 10")
-    size = str(payload.get("size", DEFAULT_SIZE))
-    quality = str(payload.get("quality", DEFAULT_QUALITY))
-    background = payload.get("background")
-    _validate_size(size, model, strict=strict_size)
-    _validate_quality(quality)
-    _validate_background(background)
-    _validate_moderation(payload.get("moderation"))
-    _validate_model_specific_options(model=model, background=background)
-    output_compression = payload.get("output_compression")
     if output_compression is not None and not (0 <= int(output_compression) <= 100):
         _die("output_compression must be between 0 and 100")
-
-
-# --------------------------------------------------------------------------
-# Output paths and prompt augmentation (verbatim from the official script)
-# --------------------------------------------------------------------------
-
-
-def _build_output_paths(
-    out: str,
-    output_format: str,
-    count: int,
-    out_dir: Optional[str],
-) -> List[Path]:
-    ext = "." + output_format
-
-    if out_dir:
-        out_base = Path(out_dir)
-        out_base.mkdir(parents=True, exist_ok=True)
-        return [out_base / f"image_{i}{ext}" for i in range(1, count + 1)]
-
-    out_path = Path(out)
-    if out_path.exists() and out_path.is_dir():
-        out_path.mkdir(parents=True, exist_ok=True)
-        return [out_path / f"image_{i}{ext}" for i in range(1, count + 1)]
-
-    if out_path.suffix == "":
-        out_path = out_path.with_suffix(ext)
-    elif output_format and out_path.suffix.lstrip(".").lower() != output_format:
-        _warn(
-            f"Output extension {out_path.suffix} does not match output-format {output_format}."
+    _validate_quality(quality)
+    _validate_background(background)
+    _validate_transparency(background, output_format)
+    if not is_responses_route:
+        _validate_model(model)
+        _validate_size(size, model, strict=strict_size)
+        _validate_moderation(moderation)
+        _validate_input_fidelity(input_fidelity)
+        _validate_model_specific_options(
+            model=model, background=background, input_fidelity=input_fidelity
         )
 
-    if count == 1:
-        return [out_path]
 
-    return [
-        out_path.with_name(f"{out_path.stem}-{i}{out_path.suffix}")
-        for i in range(1, count + 1)
-    ]
+def _fields_from_args(args: argparse.Namespace) -> Dict[str, Optional[str]]:
+    return {
+        "use_case": getattr(args, "use_case", None),
+        "scene": getattr(args, "scene", None),
+        "subject": getattr(args, "subject", None),
+        "style": getattr(args, "style", None),
+        "composition": getattr(args, "composition", None),
+        "lighting": getattr(args, "lighting", None),
+        "palette": getattr(args, "palette", None),
+        "materials": getattr(args, "materials", None),
+        "text": getattr(args, "text", None),
+        "constraints": getattr(args, "constraints", None),
+        "negative": getattr(args, "negative", None),
+    }
 
 
 def _augment_prompt(args: argparse.Namespace, prompt: str) -> str:
@@ -1622,9 +1673,6 @@ def _augment_prompt_fields(
 ) -> str:
     if not augment:
         return prompt
-
-    # [relay] A prompt that is already a labeled spec (the shape this skill asks for) must not be
-    # wrapped again -- doing so produced "Primary request: Use case: ... Constraint..." nesting.
     if _LABELED_SPEC_RE.search(prompt) and not any(fields.values()):
         _info("[prompt] input already looks like a labeled spec -- augmentation wrapper skipped")
         return prompt
@@ -1653,30 +1701,12 @@ def _augment_prompt_fields(
         sections.append(f"Constraints: {fields['constraints']}")
     if fields.get("negative"):
         sections.append(f"Avoid: {fields['negative']}")
-
     return "\n".join(sections)
-
-
-def _fields_from_args(args: argparse.Namespace) -> Dict[str, Optional[str]]:
-    return {
-        "use_case": getattr(args, "use_case", None),
-        "scene": getattr(args, "scene", None),
-        "subject": getattr(args, "subject", None),
-        "style": getattr(args, "style", None),
-        "composition": getattr(args, "composition", None),
-        "lighting": getattr(args, "lighting", None),
-        "palette": getattr(args, "palette", None),
-        "materials": getattr(args, "materials", None),
-        "text": getattr(args, "text", None),
-        "constraints": getattr(args, "constraints", None),
-        "negative": getattr(args, "negative", None),
-    }
 
 
 def _apply_relay_prompt_extras(
     prompt: str, *, quality: Optional[str], background: Optional[str]
 ) -> str:
-    """[relay] Emulate the controls this relay does not expose as API parameters."""
     extras: List[str] = []
     hint = QUALITY_HINTS.get((quality or "").lower())
     if hint:
@@ -1688,8 +1718,30 @@ def _apply_relay_prompt_extras(
     return prompt + "\n" + "\n".join(extras)
 
 
+def _prepare_prompt(
+    raw_prompt: str,
+    *,
+    augment: bool,
+    fields: Dict[str, Optional[str]],
+    quality: Optional[str],
+    background: Optional[str],
+    preflight_mode: str,
+    has_reference: bool,
+    log_preflight: bool = True,
+    log_prefix: str = "[preflight]",
+) -> Tuple[str, bool, List[str]]:
+    """五条路由共享的唯一提示词组装管线（augment → relay extras → coverage preflight）。"""
+    prompt = _augment_prompt_fields(augment, raw_prompt, fields)
+    prompt = _apply_relay_prompt_extras(prompt, quality=quality, background=background)
+    prompt, applied, changes = _apply_coverage_preflight(
+        prompt, mode=preflight_mode, has_reference=has_reference
+    )
+    if applied and log_preflight:
+        _info(f"{log_prefix} " + "; ".join(changes) + "  (--no-preflight disables)")
+    return prompt, applied, changes
+
+
 def _wire_payload(model: str, prompt: str, n: int, size: Optional[str]) -> Dict[str, Any]:
-    """[relay] Only these four fields are accepted by the relay's image routes."""
     payload: Dict[str, Any] = {"model": model, "prompt": prompt, "n": n}
     if size and size != "auto":
         payload["size"] = size
@@ -1697,12 +1749,297 @@ def _wire_payload(model: str, prompt: str, n: int, size: Optional[str]) -> Dict[
 
 
 def _print_request(payload: dict) -> None:
-    print(json.dumps(payload, indent=2, sort_keys=True))
+    print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
 
 
 # --------------------------------------------------------------------------
-# Local image handling  [relay]
+# Image Parsing, Atomic Disk I/O & Post-Processing
 # --------------------------------------------------------------------------
+
+
+@dataclass
+class ImageResult:
+    raw: bytes
+    actual_size: Optional[str]
+    revised_prompt: Optional[str]
+    source: str
+    mime: Optional[str] = None
+    sprite: Optional[bytes] = None
+    animation: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class WrittenArtifact:
+    path: str
+    downscaled: Optional[str] = None
+    sprite_path: Optional[str] = None
+    actual_size: Optional[str] = None
+    pixels: Optional[Tuple[int, int]] = None
+    revised_prompt: Optional[str] = None
+    source: str = "b64_json"
+    mime: Optional[str] = None
+
+
+def _looks_like_gif(raw: bytes) -> bool:
+    return raw[:6] in (b"GIF87a", b"GIF89a")
+
+
+def _atomic_write_bytes(target: Path, data: bytes) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp_path, target)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
+def _atomic_write_text(target: Path, text: str) -> None:
+    _atomic_write_bytes(target, text.encode("utf-8"))
+
+
+def _image_size_of(raw: bytes) -> Optional[Tuple[int, int]]:
+    """纯 stdlib 解析 PNG / GIF / JPEG / WebP 真实像素尺寸。"""
+    # PNG
+    if len(raw) >= 24 and raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")
+    # GIF
+    if len(raw) >= 10 and raw[:6] in (b"GIF87a", b"GIF89a"):
+        w, h = struct.unpack("<HH", raw[6:10])
+        return w, h
+    # WebP
+    if len(raw) >= 30 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        chunk = raw[12:16]
+        if chunk == b"VP8X" and len(raw) >= 30:
+            w = 1 + int.from_bytes(raw[24:27], "little")
+            h = 1 + int.from_bytes(raw[27:30], "little")
+            return w, h
+        if chunk == b"VP8L" and len(raw) >= 25 and raw[20] == 0x2F:
+            bits = int.from_bytes(raw[21:25], "little")
+            return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        if chunk == b"VP8 " and len(raw) >= 30 and raw[23:26] == b"\x9d\x01\x2a":
+            w, h = struct.unpack("<HH", raw[26:30])
+            return w & 0x3FFF, h & 0x3FFF
+    # JPEG
+    if len(raw) >= 4 and raw[:2] == b"\xff\xd8":
+        i = 2
+        n = len(raw)
+        while i + 4 <= n:
+            while i < n and raw[i] == 0xFF:
+                i += 1
+            if i >= n:
+                break
+            marker = raw[i]
+            i += 1
+            if marker in (0xD8, 0xD9, 0x01) or (0xD0 <= marker <= 0xD7):
+                continue
+            if i + 2 > n:
+                break
+            seg_len = int.from_bytes(raw[i : i + 2], "big")
+            if seg_len < 2 or i + seg_len > n:
+                break
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                if seg_len >= 7:
+                    h, w = struct.unpack(">HH", raw[i + 3 : i + 7])
+                    return w, h
+                break
+            i += seg_len
+    return None
+
+
+def _result_extra(item: Dict[str, Any]) -> Dict[str, Any]:
+    mime = item.get("mime_type")
+    sprite_b64 = item.get("sprite_sheet")
+    sprite: Optional[bytes] = None
+    if isinstance(sprite_b64, str) and sprite_b64:
+        try:
+            sprite = base64.b64decode(sprite_b64)
+        except Exception:
+            sprite = None
+    anim = item.get("animation")
+    return {
+        "mime": str(mime) if mime else None,
+        "sprite": sprite,
+        "animation": anim if isinstance(anim, dict) else None,
+    }
+
+
+def _report_pipeline(
+    payload: Any,
+    model: str,
+    web_mode: Optional[str] = None,
+    effort: Optional[str] = None,
+    agent_model: Optional[str] = None,
+    *,
+    web_sources: Optional[Dict[str, str]] = None,
+    route: str = "images",
+) -> Dict[str, Any]:
+    """打印并返回本次实际生效的管线信息（纯返回值，无全局可变状态，线程安全）。"""
+    if route == "responses":
+        note = f"Responses 图像工具路由（model={model}）"
+        info = {
+            "pipeline": "responses",
+            "note": note,
+            "degraded_reason": None,
+            "surface": None,
+            "surface_source": None,
+            "effort": None,
+            "agent_model": None,
+        }
+        _info(f"[pipeline] {note}")
+        return info
+
+    payload_dict = payload if isinstance(payload, dict) else {}
+    degraded = bool(payload_dict.get("degraded"))
+    reason = str(payload_dict.get("degraded_reason") or "")
+    forced_native = str(model or "").lower().startswith("codex-")
+
+    if forced_native and not degraded:
+        via, note = "native", "按 --model 指定，走原生端点（不经网页管线）"
+    elif degraded:
+        via, note = "degraded", "网页管线失败 → 自动降级到原生（原因：%s）" % (reason or "未给")
+    else:
+        via, note = "web", "网页管线（Cookie 会话）"
+
+    src_labels = {"flag": "指定", "config": "配置", "default": "默认"}
+    sources = web_sources or {}
+
+    surface: Optional[str] = None
+    surface_src: Optional[str] = None
+    effort_effective: Optional[str] = None
+    agent_effective: Optional[str] = None
+    detail = ""
+
+    if via == "web":
+        surface = str(web_mode or "chat")
+        surface_src = sources.get("web_mode") or ("flag" if web_mode else "default")
+        surface_note = src_labels.get(surface_src, "默认")
+
+        eff_raw = str(effort or "").strip()
+        eff_src = sources.get("effort") or ("flag" if eff_raw else "default")
+        if not eff_raw or eff_raw.lower() in ("none", "auto"):
+            effort_effective = None
+            effort_shown = "即时档（指定）" if (eff_raw.lower() == "none" and eff_src == "flag") else "默认（即时档）"
+        else:
+            effort_effective = eff_raw
+            effort_shown = f"{eff_raw}（{src_labels.get(eff_src, '指定')}）" if sources else eff_raw
+
+        raw_agent = str(agent_model or "").strip()
+        if raw_agent and raw_agent.lower() != "auto":
+            agent_effective = raw_agent
+
+        detail = f" · surface={surface}（{surface_note}） · effort={effort_shown}"
+        if agent_effective:
+            detail += f" · agent_model={agent_effective}"
+    elif via == "degraded":
+        detail = " · surface/effort 已失效（没走网页管线）"
+
+    info = {
+        "pipeline": via,
+        "note": note,
+        "degraded_reason": reason or None,
+        "surface": surface,
+        "surface_source": surface_src,
+        "effort": effort_effective,
+        "agent_model": agent_effective,
+    }
+    if degraded:
+        _warn(f"本次图片来自备用通道（{note}）—— 不是网页管线出的图{detail}")
+    else:
+        _info(f"[pipeline] {note}{detail}")
+    return info
+
+
+def _parse_images(
+    payload: Dict[str, Any],
+    *,
+    creds: RelayCredentials,
+    timeout: float,
+    deadline: Optional[float] = None,
+) -> List[ImageResult]:
+    data = payload.get("data")
+    if not isinstance(data, list) or not data:
+        raise RelayError(
+            f"relay returned no images: {json.dumps(payload)[:MAX_ERROR_TEXT]}",
+            code="no_image_data",
+        )
+
+    results: List[ImageResult] = []
+    for index, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise RelayError(f"unexpected image entry at data[{index}]: {item!r}")
+        b64 = item.get("b64_json")
+        if b64:
+            try:
+                raw = base64.b64decode(b64)
+            except Exception as exc:
+                raise RelayError(f"could not decode data[{index}].b64_json: {exc}")
+            results.append(
+                ImageResult(
+                    raw=raw,
+                    actual_size=item.get("size"),
+                    revised_prompt=item.get("revised_prompt"),
+                    source="b64_json",
+                    **_result_extra(item),
+                )
+            )
+            continue
+        url = item.get("url")
+        if url:
+            response = _http_request(
+                str(url),
+                api_key=creds.api_key,
+                timeout=_effective_timeout(timeout, deadline),
+                method="GET",
+                label="[download]",
+            )
+            results.append(
+                ImageResult(
+                    raw=response.body,
+                    actual_size=item.get("size"),
+                    revised_prompt=item.get("revised_prompt"),
+                    source="url",
+                    **_result_extra(item),
+                )
+            )
+            continue
+        raise RelayError("API image entry contains neither b64_json nor url")
+    return results
+
+
+def _build_output_paths(
+    out: str,
+    output_format: str,
+    count: int,
+    out_dir: Optional[str],
+) -> List[Path]:
+    ext = "." + output_format
+
+    if out_dir:
+        out_base = Path(out_dir)
+        return [out_base / f"image_{i}{ext}" for i in range(1, count + 1)]
+
+    out_path = Path(out)
+    if out_path.exists() and out_path.is_dir():
+        return [out_path / f"image_{i}{ext}" for i in range(1, count + 1)]
+
+    if out_path.suffix == "":
+        out_path = out_path.with_suffix(ext)
+    elif output_format and out_path.suffix.lstrip(".").lower() != output_format:
+        _warn(f"Output extension {out_path.suffix} does not match output-format {output_format}.")
+
+    if count == 1:
+        return [out_path]
+    return [
+        out_path.with_name(f"{out_path.stem}-{i}{out_path.suffix}")
+        for i in range(1, count + 1)
+    ]
 
 
 def _derive_downscale_path(path: Path, suffix: str) -> Path:
@@ -1711,13 +2048,72 @@ def _derive_downscale_path(path: Path, suffix: str) -> Path:
     return path.with_name(f"{path.stem}{suffix}{path.suffix}")
 
 
-def _convert_image_bytes(raw: bytes, *, output_format: str, output_compression: Optional[int]) -> bytes:
+def _precheck_outputs(
+    output_paths: List[Path],
+    *,
+    force: bool,
+    downscale_max_dim: Optional[int],
+    downscale_suffix: str,
+) -> None:
+    """付费调用前先做 Fail-Fast 预检：检查目标文件冲突与目录可写性。"""
+    checked_dirs: Set[Path] = set()
+    to_check = list(output_paths)
+    if downscale_max_dim is not None:
+        to_check.extend(_derive_downscale_path(p, downscale_suffix) for p in output_paths)
+
+    for p in to_check:
+        if p.exists() and not force:
+            _die(f"Output already exists: {p} (use --force to overwrite)")
+        parent = p.parent
+        if parent not in checked_dirs:
+            try:
+                parent.mkdir(parents=True, exist_ok=True)
+                probe_fd, probe_name = tempfile.mkstemp(prefix=".imagegen-writecheck-", dir=str(parent))
+                os.close(probe_fd)
+                Path(probe_name).unlink(missing_ok=True)
+            except Exception as exc:
+                _die(f"Output directory is not writable: {parent} ({exc})")
+            checked_dirs.add(parent)
+
+
+def _flatten_for_jpeg(image: Any) -> Any:
+    from PIL import Image
+
+    if image.mode in ("RGBA", "LA", "P") or ("transparency" in getattr(image, "info", {})):
+        rgba = image.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.split()[-1])
+        return bg
+    return image.convert("RGB")
+
+
+def _encode_pil_image(image: Any, *, output_format: str, output_compression: Optional[int]) -> bytes:
+    fmt = (output_format or "png").lower()
+    if fmt == "jpg":
+        fmt = "jpeg"
+    if fmt not in ("png", "jpeg", "webp"):
+        fmt = "png"
+
+    working = _flatten_for_jpeg(image) if fmt == "jpeg" else image
+    save_kwargs: Dict[str, Any] = {}
+    if fmt in ("jpeg", "webp") and output_compression is not None:
+        save_kwargs["quality"] = int(output_compression)
+    elif fmt == "png" and output_compression is not None:
+        save_kwargs["compress_level"] = max(0, min(9, int(output_compression)))
+
+    out = BytesIO()
+    working.save(out, format=fmt.upper(), **save_kwargs)
+    return out.getvalue()
+
+
+def _convert_image_bytes(
+    raw: bytes, *, output_format: str, output_compression: Optional[int]
+) -> bytes:
     fmt = (output_format or "png").lower()
     if fmt == "jpg":
         fmt = "jpeg"
     if fmt == "png" and output_compression is None:
         return raw
-
     try:
         from PIL import Image
     except Exception:
@@ -1725,26 +2121,9 @@ def _convert_image_bytes(raw: bytes, *, output_format: str, output_compression: 
             "Local re-encoding is required for this request (output-format or "
             f"output-compression). {_dependency_hint('pillow')}"
         )
-
     with Image.open(BytesIO(raw)) as image:
         image.load()
-        working = image
-        if fmt == "jpeg":
-            if working.mode in ("RGBA", "LA", "P") or (
-                "transparency" in getattr(working, "info", {})
-            ):
-                rgba = working.convert("RGBA")
-                background = Image.new("RGB", rgba.size, (255, 255, 255))
-                background.paste(rgba, mask=rgba.split()[-1])
-                working = background
-            else:
-                working = working.convert("RGB")
-        out = BytesIO()
-        save_kwargs: Dict[str, Any] = {}
-        if fmt in ("jpeg", "webp") and output_compression is not None:
-            save_kwargs["quality"] = int(output_compression)
-        working.save(out, format=fmt.upper(), **save_kwargs)
-        return out.getvalue()
+        return _encode_pil_image(image, output_format=fmt, output_compression=output_compression)
 
 
 def _downscale_image_bytes(image_bytes: bytes, *, max_dim: int, output_format: str) -> bytes:
@@ -1752,55 +2131,15 @@ def _downscale_image_bytes(image_bytes: bytes, *, max_dim: int, output_format: s
         from PIL import Image
     except Exception:
         _die(f"Downscaling requires Pillow. {_dependency_hint('pillow')}")
-
     if max_dim < 1:
         _die("--downscale-max-dim must be >= 1")
-
     with Image.open(BytesIO(image_bytes)) as img:
         img.load()
         w, h = img.size
         scale = min(1.0, float(max_dim) / float(max(w, h)))
         target = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
-
         resized = img if target == (w, h) else img.resize(target, Image.Resampling.LANCZOS)
-
-        fmt = output_format.lower()
-        if fmt == "jpg":
-            fmt = "jpeg"
-
-        if fmt == "jpeg":
-            if resized.mode in ("RGBA", "LA") or (
-                "transparency" in getattr(resized, "info", {})
-            ):
-                bg = Image.new("RGB", resized.size, (255, 255, 255))
-                bg.paste(resized.convert("RGBA"), mask=resized.convert("RGBA").split()[-1])
-                resized = bg
-            else:
-                resized = resized.convert("RGB")
-
-        out = BytesIO()
-        resized.save(out, format=fmt.upper())
-        return out.getvalue()
-
-
-def _image_size_of(raw: bytes) -> Optional[Tuple[int, int]]:
-    """[relay] Cheap IHDR/PNG size probe, so reports can state real pixels."""
-    if len(raw) > 24 and raw[:8] == b"\x89PNG\r\n\x1a\n":
-        width = int.from_bytes(raw[16:20], "big")
-        height = int.from_bytes(raw[20:24], "big")
-        return width, height
-    return None
-
-
-@dataclass
-class WrittenArtifact:
-    path: str
-    downscaled: Optional[str] = None
-    actual_size: Optional[str] = None
-    pixels: Optional[Tuple[int, int]] = None
-    revised_prompt: Optional[str] = None
-    source: str = "b64_json"
-    mime: Optional[str] = None
+        return _encode_pil_image(resized, output_format=output_format, output_compression=None)
 
 
 def _exact_size_image_bytes(
@@ -1811,16 +2150,6 @@ def _exact_size_image_bytes(
     output_format: str,
     output_compression: Optional[int] = None,
 ) -> bytes:
-    """[relay] Force the delivered file to an exact pixel size.
-
-    Why this exists: the relay's upstream ignores the `size` request parameter -- it renders
-    each aspect ratio at one fixed pixel size (measured: 1:1 -> 1254x1254, 16:9 -> 1672x941).
-    The ratio is controlled through the prompt, but the pixel count cannot be requested.
-    So when a caller needs exact pixels, generate at the right ratio and resample locally.
-
-    fit="cover"   crop to fill the target (no borders; loses a little at the edges)
-    fit="contain" letterbox onto a transparent (or white) canvas
-    """
     try:
         from PIL import Image
     except Exception:
@@ -1853,26 +2182,9 @@ def _exact_size_image_bytes(
             )
             working.paste(resized, ((width - resized.width) // 2, (height - resized.height) // 2))
 
-        fmt = (output_format or "png").lower()
-        if fmt not in ("png", "jpeg", "webp"):
-            fmt = "png"
-        out = BytesIO()
-        save_kwargs: Dict[str, Any] = {}
-        if fmt == "jpeg":
-            if working.mode == "RGBA":
-                flat = Image.new("RGB", working.size, (255, 255, 255))
-                flat.paste(working, mask=working.split()[-1])
-                working = flat
-            if output_compression is not None:
-                save_kwargs["quality"] = output_compression
-        elif fmt == "webp":
-            if output_compression is not None:
-                save_kwargs["quality"] = output_compression
-        else:
-            if output_compression is not None:
-                save_kwargs["compress_level"] = max(0, min(9, output_compression))
-        working.save(out, format=fmt.upper(), **save_kwargs)
-        return out.getvalue()
+        return _encode_pil_image(
+            working, output_format=output_format, output_compression=output_compression
+        )
 
 
 def _parse_exact_size(value: str) -> Tuple[int, int]:
@@ -1882,42 +2194,8 @@ def _parse_exact_size(value: str) -> Tuple[int, int]:
     return int(match.group(1)), int(match.group(2))
 
 
-# [relay] Set once in main() from the parsed flags; _write_results falls back to these so the
-# exact-size request reaches every command without threading two more parameters everywhere.
-_EXACT_SIZE_REQUEST: Optional[Tuple[int, int]] = None
-_EXACT_FIT_REQUEST: str = "cover"
-
-# ---------------------------------------------------------------- 比例预设（--preset）
-# 上游**忽略 size 参数**，但它按提示词里的比例渲染到固定像素（实测：16:9 -> 1672x941，
-# 1:1 -> 1254x1254）。所以预设表做的事是：
-#   ① 把比例写进提示词（保证渲染比例正确）；
-#   ② 把交付像素交给 --exact-size 本地重采样（保证文件尺寸精确）。
-# 像素取值沿用业界常见的 2K/4K 档位，且**全部满足 16 像素对齐**。
-_PRESETS: Dict[str, Dict[str, Tuple[int, int]]] = {
-    "1:1": {"2k": (2048, 2048), "4k": (2880, 2880)},
-    "3:2": {"2k": (2048, 1360), "4k": (3520, 2352)},
-    "2:3": {"2k": (1360, 2048), "4k": (2352, 3520)},
-    "4:3": {"2k": (2048, 1536), "4k": (3264, 2448)},
-    "3:4": {"2k": (1536, 2048), "4k": (2448, 3264)},
-    "16:9": {"2k": (2048, 1152), "4k": (3840, 2160)},
-    "9:16": {"2k": (1152, 2048), "4k": (2160, 3840)},
-    "2:1": {"2k": (2048, 1024), "4k": (3840, 1920)},
-    "1:2": {"2k": (1024, 2048), "4k": (1920, 3840)},
-    "7:4": {"2k": (2208, 1264), "4k": (3808, 2176)},
-    "4:7": {"2k": (1264, 2208), "4k": (2176, 3808)},
-}
-
-# 实测的上游"固定渲染尺寸"（按比例）。用来提前告诉用户重采样倍率——
-# 放大超过 1.5 倍画质会变软，值得提前提醒。
-_CANONICAL_RENDER: Dict[str, Tuple[int, int]] = {
-    "1:1": (1254, 1254),
-    "16:9": (1672, 941),
-    "9:16": (941, 1672),
-}
-
-
 def _apply_preset(args: Any) -> None:
-    """[relay] --preset 16:9@2k  ->  比例提示 + 精确交付像素。调用前完成全部校验。"""
+    """[relay] --preset 16:9@2k|4k -> 比例提示 + 精确交付像素（调用前完成全部硬校验）。"""
     raw = getattr(args, "preset", None)
     if not raw:
         return
@@ -1935,14 +2213,12 @@ def _apply_preset(args: Any) -> None:
 
     width, height = _PRESETS[ratio][tier]
 
-    # 调用前的硬校验（避免白花钱、白等）
     if width % 16 or height % 16:
         _die(f"--preset {raw} is not 16-pixel aligned ({width}x{height})")
-    longest = max(width, height)
-    if longest > 4096:
+    if max(width, height) > 4096:
         _die(f"--preset {raw} exceeds the 4096 max edge ({width}x{height})")
     total = width * height
-    if total < 262144 or total > 4194304:
+    if total < 262_144 or total > GPT_IMAGE_2_MAX_PIXELS:
         _die(f"--preset {raw} total pixels {total} outside the supported range")
 
     if getattr(args, "exact_size", None) and tuple(args.exact_size) != (width, height):
@@ -1952,8 +2228,6 @@ def _apply_preset(args: Any) -> None:
         )
     args.exact_size = (width, height)
 
-    # 比例提示：走 --size（shim 会把它翻成提示词里的 Aspect ratio 要求）
-    # ⚠️ 官方 CLI 的 --size 默认值是字符串 "auto"，它是真值 —— 必须把 "auto" 也算作"未设置"。
     if hasattr(args, "size"):
         current = getattr(args, "size", None)
         if not current or str(current).strip().lower() == "auto":
@@ -1968,7 +2242,36 @@ def _apply_preset(args: Any) -> None:
             notes.append("⚠️ 放大超过 1.5 倍，画面会偏软（要更锐利就选低一档或缩小比例）")
     else:
         notes.append("上游会按提示词里的比例渲染，随后本地重采样到目标像素")
-    print("  ".join(notes))
+    _info("  ".join(notes))
+
+
+def _expand_output_paths(outputs: List[Path], target_count: int) -> List[Path]:
+    """当上游返回多于预期数量的产物时，按自然编号顺延路径（避免 foo-1-1.png）。"""
+    if len(outputs) >= target_count or not outputs:
+        return list(outputs)
+    expanded = list(outputs)
+    first = outputs[0]
+    last = outputs[-1]
+
+    # 检测是否已是 -1..-N 或 _1.._N 序列
+    m_first = re.fullmatch(r"(.+)([-_])1", first.stem)
+    m_last = re.fullmatch(r"(.+)([-_])(\d+)", last.stem)
+    if (
+        len(outputs) >= 2
+        and m_first
+        and m_last
+        and m_first.group(1) == m_last.group(1)
+        and m_first.group(2) == m_last.group(2)
+    ):
+        prefix, sep, start_idx = m_first.group(1), m_first.group(2), int(m_last.group(3)) + 1
+        for i in range(start_idx, start_idx + (target_count - len(outputs))):
+            expanded.append(first.with_name(f"{prefix}{sep}{i}{first.suffix}"))
+        return expanded
+
+    # 单图基准 foo.png -> foo.png, foo-1.png, foo-2.png...
+    for i in range(1, target_count - len(outputs) + 1):
+        expanded.append(first.with_name(f"{first.stem}-{i}{first.suffix}"))
+    return expanded
 
 
 def _write_results(
@@ -1984,50 +2287,39 @@ def _write_results(
     exact_fit: str = "cover",
 ) -> List[WrittenArtifact]:
     artifacts: List[WrittenArtifact] = []
-    # 【2026-11-06】多图：上游一次可能给多张（data.length > n）。按结果数补足输出路径，
-    # 否则第二张起会被 index >= len(outputs) 直接丢掉。
-    if len(results) > len(outputs) and outputs:
-        base = outputs[0]
-        extra = [base.with_name(f"{base.stem}-{i}{base.suffix}") for i in range(1, len(results))]
-        outputs = list(outputs) + extra
+    expanded_outputs = _expand_output_paths(outputs, len(results))
+
     for index, result in enumerate(results):
-        if index >= len(outputs):
+        if index >= len(expanded_outputs):
             break
-        out_path = outputs[index]
+        out_path = expanded_outputs[index]
         is_gif = _looks_like_gif(result.raw) or (result.mime or "").lower() == "image/gif"
         if is_gif and out_path.suffix.lower() != ".gif":
-            # 上游给的是动图 GIF，扩展名必须跟着改，否则下载/预览端会按 PNG 解
             out_path = out_path.with_name(out_path.stem + ".gif")
         if out_path.exists() and not force:
             _die(f"Output already exists: {out_path} (use --force to overwrite)")
-        out_path.parent.mkdir(parents=True, exist_ok=True)
 
         if is_gif:
-            # 【2026-11-06】GIF 绝不能重编码：PIL 只会保留第一帧 → 动画直接没了。
-            # 原样写字节，同时跳过 --exact-size / --downscale 这类会解码重采样的一步。
             if output_format not in ("png", None) or output_compression:
                 _warn("[gif] 动图按原字节保存，--output-format/--output-compression 已忽略")
             if exact_size is not None or downscale_max_dim is not None:
                 _warn("[gif] 动图跳过 --exact-size/--downscale（重采样会丢动画）")
             payload = result.raw
+        elif exact_size is not None:
+            # 直接从原图做一次重采样 + 格式编码，避免 JPEG 双重有损压缩
+            payload = _exact_size_image_bytes(
+                result.raw,
+                target=exact_size,
+                fit=exact_fit,
+                output_format=output_format,
+                output_compression=output_compression,
+            )
         else:
             payload = _convert_image_bytes(
                 result.raw, output_format=output_format, output_compression=output_compression
             )
-        if not is_gif:
-            if exact_size is None and _EXACT_SIZE_REQUEST is not None:
-                exact_size = _EXACT_SIZE_REQUEST
-                exact_fit = _EXACT_FIT_REQUEST
-            if exact_size is not None:
-                # [relay] upstream ignores `size`; deliver the requested pixels locally instead.
-                payload = _exact_size_image_bytes(
-                    payload,
-                    target=exact_size,
-                    fit=exact_fit,
-                    output_format=output_format,
-                    output_compression=output_compression,
-                )
-        out_path.write_bytes(payload)
+
+        _atomic_write_bytes(out_path, payload)
         print(f"Wrote {out_path}")
 
         artifact = WrittenArtifact(
@@ -2039,30 +2331,33 @@ def _write_results(
             mime=result.mime or ("image/gif" if is_gif else None),
         )
 
-        # sprite sheet（九宫格）+ animation 元数据：前端 canvas 播放/调速靠它
         if result.sprite:
             sprite_path = out_path.with_name(out_path.stem + "-sprite.png")
-            try:
-                sprite_path.write_bytes(result.sprite)
-                anim = result.animation or {}
-                extra = (
-                    f"{anim.get('rows')}x{anim.get('columns')} 帧数={anim.get('frame_count')} "
-                    f"每帧={anim.get('frame_duration_ms')}ms"
-                    if anim else "无 animation 元数据"
-                )
-                print(f"Wrote {sprite_path}  (sprite sheet {extra})")
-            except Exception as exc:
-                _warn(f"[gif] sprite sheet 写入失败：{exc}")
+            if sprite_path.exists() and not force:
+                _warn(f"[gif] sprite sheet 已存在且未传 --force，已跳过：{sprite_path}")
+            else:
+                try:
+                    _atomic_write_bytes(sprite_path, result.sprite)
+                    anim = result.animation or {}
+                    extra = (
+                        f"{anim.get('rows')}x{anim.get('columns')} 帧数={anim.get('frame_count')} "
+                        f"每帧={anim.get('frame_duration_ms')}ms"
+                        if anim
+                        else "无 animation 元数据"
+                    )
+                    print(f"Wrote {sprite_path}  (sprite sheet {extra})")
+                    artifact.sprite_path = str(sprite_path)
+                except Exception as exc:
+                    _warn(f"[gif] sprite sheet 写入失败：{exc}")
 
         if downscale_max_dim is not None and not is_gif:
             derived = _derive_downscale_path(out_path, downscale_suffix)
             if derived.exists() and not force:
                 _die(f"Output already exists: {derived} (use --force to overwrite)")
-            derived.parent.mkdir(parents=True, exist_ok=True)
             resized = _downscale_image_bytes(
                 result.raw, max_dim=downscale_max_dim, output_format=output_format
             )
-            derived.write_bytes(resized)
+            _atomic_write_bytes(derived, resized)
             print(f"Wrote {derived}")
             artifact.downscaled = str(derived)
 
@@ -2075,40 +2370,53 @@ def _report_record(
     command: str,
     model: str,
     prompt: str,
-    outputs: List[str],
     artifacts: List[WrittenArtifact],
     timing: Dict[str, float],
     base_url: str,
+    pipeline_info: Optional[Dict[str, Any]] = None,
     preflight: bool = False,
+    job: Optional[int] = None,
 ) -> Dict[str, Any]:
     first = artifacts[0] if artifacts else None
-    return {
+    pinfo = pipeline_info or {}
+    rec: Dict[str, Any] = {
+        "ok": True,
         "command": command,
         "model": model,
         "endpoint": base_url,
         "prompt": prompt,
-        "outputs": outputs,
+        # 始终使用实际落盘后的路径（含 GIF 改后缀、网页管线多图等）
+        "outputs": [a.path for a in artifacts],
+        "sprites": [a.sprite_path for a in artifacts if a.sprite_path],
+        "downscaled": [a.downscaled for a in artifacts if a.downscaled],
         "actual_size": first.actual_size if first else None,
         "pixels": list(first.pixels) if (first and first.pixels) else None,
         "revised_prompt": first.revised_prompt if first else None,
         "image_source": first.source if first else None,
-        "pipeline": (_LAST_PIPELINE.get("pipeline") or None),
-        "pipeline_note": (_LAST_PIPELINE.get("note") or None),
+        "pipeline": pinfo.get("pipeline"),
+        "pipeline_note": pinfo.get("note"),
+        "surface": pinfo.get("surface"),
+        "effort": pinfo.get("effort"),
+        "agent_model": pinfo.get("agent_model"),
         "coverage_preflight_applied": preflight,
         "timing_seconds": timing,
     }
+    if job is not None:
+        rec["job"] = job
+    return rec
 
 
-def _write_report(path: Optional[str], record: Dict[str, Any]) -> None:
+def _write_report(path: Optional[str], record: Any) -> None:
     if not path:
         return
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+    _atomic_write_text(target, json.dumps(record, indent=2, ensure_ascii=False))
     _info(f"Wrote report {target}")
 
 
-def _print_timing(label: str, response: Optional[HttpResponse], local_s: float, total_s: float) -> None:
+def _print_timing(
+    label: str, response: Optional[HttpResponse], local_s: float, total_s: float
+) -> None:
     if response is None:
         _info(f"[timing] {label} local={local_s:.2f}s total={total_s:.1f}s")
         return
@@ -2118,8 +2426,48 @@ def _print_timing(label: str, response: Optional[HttpResponse], local_s: float, 
     )
 
 
+def _warn_if_extra_artifacts(requested_n: int, artifacts: List[WrittenArtifact]) -> None:
+    if requested_n and len(artifacts) > int(requested_n):
+        _warn(
+            f"上游返回了 {len(artifacts)} 个产物（请求 {int(requested_n)} 个）。"
+            "网页管线在 n>1 时会等整轮对话结束、把上游自发的额外图/动画一起保存；"
+            "要严格 N 个请加 --strict-n、切 --model codex-gpt-image-2，或分开多次 --n 1。"
+        )
+
+
+def _run_with_refusal_retry(
+    base_prompt: str,
+    *,
+    retry_refusal: int,
+    label: str,
+    deadline: float,
+    call_fn: Callable[[str, float], Any],
+) -> Tuple[Any, str]:
+    """统一的输出层内容安全随机拒绝重试器（共享唯一 deadline，绝不在循环内重置）。"""
+    refusal_attempts = max(1, int(retry_refusal or 0) + 1)
+    for attempt in range(1, refusal_attempts + 1):
+        if deadline - time.monotonic() <= 0:
+            raise RelayError(
+                f"{label} aborted: the overall --deadline budget was used up. Nothing was written.",
+                retryable=False,
+                code="deadline_exceeded",
+            )
+        attempt_prompt = base_prompt + _REFUSAL_VARIATIONS[(attempt - 1) % len(_REFUSAL_VARIATIONS)]
+        try:
+            res = call_fn(attempt_prompt, deadline)
+            return res, attempt_prompt
+        except RelayError as exc:
+            if not _is_refusal_error(exc) or attempt >= refusal_attempts:
+                raise
+            _warn(
+                f"{label} upstream refused (attempt {attempt}/{refusal_attempts}); "
+                "retrying with a neutral variation (the output gate is stochastic)"
+            )
+    raise RelayError(f"{label} exhausted refusal retries")
+
+
 # --------------------------------------------------------------------------
-# Batch helpers (verbatim from the official script)
+# Batch Helpers
 # --------------------------------------------------------------------------
 
 
@@ -2141,7 +2489,7 @@ def _normalize_job(job: Any, idx: int) -> Dict[str, Any]:
             _die(f"Missing prompt for job {idx}")
         return job
     _die(f"Invalid job at index {idx}: expected string or object.")
-    return {}  # unreachable
+    return {}
 
 
 def _read_jobs_jsonl(path: str) -> List[Dict[str, Any]]:
@@ -2149,16 +2497,14 @@ def _read_jobs_jsonl(path: str) -> List[Dict[str, Any]]:
     if not p.exists():
         _die(f"Input file not found: {p}")
     jobs: List[Dict[str, Any]] = []
-    for line_no, raw in enumerate(p.read_text(encoding="utf-8").splitlines(), start=1):
+    # 使用 utf-8-sig：Windows PowerShell Set-Content -Encoding UTF8 会写 BOM，
+    # 否则第 1 行的 \ufeff{"prompt":...} 会让 line.startswith("{") 为 False 并静默当成纯文本！
+    for line_no, raw in enumerate(p.read_text(encoding="utf-8-sig").splitlines(), start=1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         try:
-            item: Any
-            if line.startswith("{"):
-                item = json.loads(line)
-            else:
-                item = line
+            item: Any = json.loads(line) if line.startswith("{") else line
             jobs.append(_normalize_job(item, idx=line_no))
         except json.JSONDecodeError as exc:
             _die(f"Invalid JSON on line {line_no}: {exc}")
@@ -2186,9 +2532,7 @@ def _job_output_paths(
     n: int,
     explicit_out: Optional[str],
 ) -> List[Path]:
-    out_dir.mkdir(parents=True, exist_ok=True)
     ext = "." + output_format
-
     if explicit_out:
         base = Path(explicit_out)
         if base.suffix == "":
@@ -2212,51 +2556,78 @@ def _job_output_paths(
 # --------------------------------------------------------------------------
 
 
-def _generate(args: argparse.Namespace) -> None:
-    creds = _resolve_credentials(args)
-    prompt = _read_prompt(args.prompt, args.prompt_file)
-    prompt = _augment_prompt(args, prompt)
-    prompt = _apply_relay_prompt_extras(
-        prompt, quality=args.quality, background=args.background
+def _log_conv_info(style_dict: Dict[str, Any], *, is_dry_run: bool = False) -> None:
+    if not style_dict or is_dry_run:
+        return
+    if "mssk_conv" in style_dict or "mssk_gif_speed" in style_dict:
+        _info(
+            f"[会话] 续接钥匙 mssk_conv={style_dict.get('mssk_conv', '-')}"
+            + (f"；速度档 {style_dict['mssk_gif_speed']}x" if "mssk_gif_speed" in style_dict else "")
+        )
+
+
+def _generate(args: argparse.Namespace, creds: RelayCredentials) -> None:
+    raw_prompt = _read_prompt(args.prompt, args.prompt_file)
+    output_format = _normalize_output_format(args.output_format)
+    _validate_image_job_options(
+        model=args.model,
+        n=args.n,
+        size=args.size,
+        quality=args.quality,
+        background=args.background,
+        output_format=output_format,
+        output_compression=args.output_compression,
+        moderation=args.moderation,
+        strict_size=args.strict_size,
     )
-    prompt, preflight_applied, preflight_changes = _apply_coverage_preflight(
-        prompt, mode=args.preflight, has_reference=False
+
+    prompt, preflight_applied, _preflight_changes = _prepare_prompt(
+        raw_prompt,
+        augment=args.augment,
+        fields=_fields_from_args(args),
+        quality=args.quality,
+        background=args.background,
+        preflight_mode=args.preflight,
+        has_reference=False,
     )
-    if preflight_applied:
-        _info("[preflight] " + "; ".join(preflight_changes) + "  (--no-preflight disables)")
 
     payload = {
-        "model": args.model,
-        "prompt": prompt,
-        "n": args.n,
-        "size": args.size,
-        "quality": args.quality,
-        "background": args.background,
-        "output_format": args.output_format,
-        "output_compression": args.output_compression,
-        "moderation": args.moderation,
+        k: v
+        for k, v in {
+            "model": args.model,
+            "prompt": prompt,
+            "n": args.n,
+            "size": args.size,
+            "quality": args.quality,
+            "background": args.background,
+            "output_format": output_format,
+            "output_compression": args.output_compression,
+            "moderation": args.moderation,
+        }.items()
+        if v is not None
     }
-    payload = {k: v for k, v in payload.items() if v is not None}
-
-    output_format = _normalize_output_format(args.output_format)
-    _validate_transparency(args.background, output_format)
-    payload["output_format"] = output_format
-
-    _validate_generate_payload(payload, strict_size=args.strict_size)
 
     output_paths = _build_output_paths(args.out, output_format, args.n, args.out_dir)
-    downscaled = None
-    if args.downscale_max_dim is not None:
-        downscaled = [
-            str(_derive_downscale_path(p, args.downscale_suffix)) for p in output_paths
-        ]
+    downscaled = (
+        [str(_derive_downscale_path(p, args.downscale_suffix)) for p in output_paths]
+        if args.downscale_max_dim is not None
+        else None
+    )
 
-    wire = _wire_payload(args.model, prompt, args.n, args.size)
-    _style = _style_payload(args)
-    if _style:
-        wire["style"] = _style
-        _info(f"[会话] 续接钥匙 mssk_conv={_style.get('mssk_conv', '-')}"
-              + (f"；速度档 {_style['mssk_gif_speed']}x" if 'mssk_gif_speed' in _style else ""))
+    strict_n = bool(getattr(args, "strict_n", False)) and args.n > 1 and args.model == DEFAULT_MODEL
+    wire_style = _build_wire_style(args, include_conv=True, defer_conv_persist=True)
+    style_dict = wire_style.as_json_style()
+    wire = _wire_payload(args.model, prompt, 1 if strict_n else args.n, args.size)
+    if style_dict:
+        wire["style"] = style_dict
+
+    timeout_s, deadline_s, slow_after = _resolve_timeouts(
+        args,
+        command="generate",
+        n=args.n,
+        web_mode=getattr(args, "web_mode", None),
+        effort=getattr(args, "effort", None),
+    )
 
     if args.dry_run:
         preview = dict(payload)
@@ -2265,105 +2636,154 @@ def _generate(args: argparse.Namespace) -> None:
         preview["outputs"] = [str(p) for p in output_paths]
         preview["outputs_downscaled"] = downscaled
         preview["base_url"] = creds.base_url
+        preview["timeouts"] = {"timeout_s": timeout_s, "deadline_s": deadline_s}
+        if strict_n:
+            preview["strict_n_calls"] = args.n
         _print_request(preview)
         return
 
-    _ensure_credentials(creds, dry_run=False)
+    _precheck_outputs(
+        output_paths,
+        force=args.force,
+        downscale_max_dim=args.downscale_max_dim,
+        downscale_suffix=args.downscale_suffix,
+    )
     if args.check_model:
-        _check_model(creds, args.model, args.timeout)
+        _check_model(creds, args.model, timeout_s)
 
-    _info("Calling the relay image route (generation). This can take up to a couple of minutes.")
+    _log_conv_info(style_dict)
+    _info(
+        f"Calling the relay image route (generation"
+        f"{f', strict-n: {args.n}×1' if strict_n else ''})."
+    )
     started = time.time()
-    refusal_attempts = max(1, int(getattr(args, "retry_refusal", 0)) + 1)
-    response = decoded = None
-    for attempt in range(1, refusal_attempts + 1):
-        attempt_wire = dict(wire)
-        attempt_prompt = prompt + _REFUSAL_VARIATIONS[(attempt - 1) % len(_REFUSAL_VARIATIONS)]
-        attempt_wire["prompt"] = attempt_prompt
-        try:
-            response, decoded = _post_json_with_retries(
+    deadline = time.monotonic() + deadline_s
+
+    all_results: List[ImageResult] = []
+    total_queue_s = 0.0
+    total_download_s = 0.0
+    pipeline_info: Optional[Dict[str, Any]] = None
+    final_prompt = prompt
+    calls = args.n if strict_n else 1
+
+    for call_idx in range(1, calls + 1):
+        call_label = f"[generation {call_idx}/{calls}]" if strict_n else "[generation]"
+
+        def do_call(attempt_prompt: str, dl: float) -> Tuple[HttpResponse, Dict[str, Any]]:
+            attempt_wire = dict(wire)
+            attempt_wire["prompt"] = attempt_prompt
+            return _post_json_with_retries(
                 creds,
                 "images/generations",
                 attempt_wire,
                 attempts=args.max_attempts,
-                timeout=args.timeout,
-                label="[generation]",
-                deadline=time.monotonic() + args.deadline,
+                timeout=timeout_s,
+                label=call_label,
+                deadline=dl,
+                slow_after=slow_after,
             )
-            prompt = attempt_prompt
-            break
-        except RelayError as exc:
-            if not _is_refusal_error(exc) or attempt >= refusal_attempts:
-                raise
-            _warn(
-                f"[generation] upstream refused (attempt {attempt}/{refusal_attempts}); "
-                "retrying with a neutral variation (the gate is stochastic)"
-            )
-    _report_pipeline(
-        decoded,
-        getattr(args, "model", ""),
-        getattr(args, "web_mode", None),
-        getattr(args, "effort", None),
-        getattr(args, "agent_model", None),
-    )
-    results = _parse_images(decoded, creds=creds, timeout=args.timeout)
+
+        (response, decoded), final_prompt = _run_with_refusal_retry(
+            prompt,
+            retry_refusal=args.retry_refusal,
+            label=call_label,
+            deadline=deadline,
+            call_fn=do_call,
+        )
+        wire_style.commit_conv()
+        total_queue_s += response.queue_wait_s
+        total_download_s += response.download_s
+        pipeline_info = _report_pipeline(
+            decoded,
+            args.model,
+            getattr(args, "web_mode", None),
+            getattr(args, "effort", None),
+            getattr(args, "agent_model", None),
+            web_sources=getattr(args, "_web_sources", None),
+        )
+        parsed = _parse_images(decoded, creds=creds, timeout=timeout_s, deadline=deadline)
+        if strict_n:
+            all_results.append(parsed[0])
+        else:
+            all_results.extend(parsed)
+
     local_started = time.time()
     artifacts = _write_results(
-        results,
+        all_results,
         output_paths,
         force=args.force,
         output_format=output_format,
         output_compression=args.output_compression,
         downscale_max_dim=args.downscale_max_dim,
         downscale_suffix=args.downscale_suffix,
+        exact_size=getattr(args, "exact_size", None),
+        exact_fit=getattr(args, "exact_fit", "cover"),
     )
     local_s = time.time() - local_started
     total_s = time.time() - started
-    _print_timing("generation", response, local_s, total_s)
-
-    # 【2026-11-19 实测】网页管线在 n>1 时会「盯完整轮对话」：上游会自行多画
-    #   （这次要求 4 张，实际回了 10 个产物：4 张方形 + 4 张其它比例 + 2 个 8 帧 GIF，耗时 221s）。
-    #   shim 侧的 drainPlan 就是这么设计的（愿意多给），所以这里只提示、不丢弃 —— 多出来的图
-    #   往往正好是用户想要的。要严格 N 个：用 --model codex-gpt-image-2，或分开调用 --n 1。
-    if getattr(args, "n", 1) and len(artifacts) > int(args.n):
-        _warn(
-            f"上游返回了 {len(artifacts)} 个产物（请求 {int(args.n)} 个）。"
-            "网页管线在 n>1 时会等整轮对话结束、把上游自发的额外图/动画一起保存；"
-            "要严格 N 个请用 --model codex-gpt-image-2，或分开多次 --n 1。"
-        )
+    agg_resp = HttpResponse(status=200, body=b"", queue_wait_s=total_queue_s, download_s=total_download_s)
+    _print_timing("generation", agg_resp, local_s, total_s)
+    if not strict_n:
+        _warn_if_extra_artifacts(args.n, artifacts)
 
     _write_report(
         args.report_json,
         _report_record(
             command="generate",
             model=args.model,
-            prompt=prompt,
-            outputs=[str(p) for p in output_paths],
+            prompt=final_prompt,
             artifacts=artifacts,
             timing={
-                "relay_and_render": round(response.queue_wait_s, 2),
-                "download": round(response.download_s, 2),
+                "relay_and_render": round(total_queue_s, 2),
+                "download": round(total_download_s, 2),
                 "local": round(local_s, 2),
                 "total": round(total_s, 2),
             },
             base_url=creds.base_url,
+            pipeline_info=pipeline_info,
             preflight=preflight_applied,
         ),
     )
 
 
-def _edit(args: argparse.Namespace) -> None:
-    creds = _resolve_credentials(args)
-    prompt = _read_prompt(args.prompt, args.prompt_file)
-    prompt = _augment_prompt(args, prompt)
-    prompt = _apply_relay_prompt_extras(
-        prompt, quality=args.quality, background=args.background
+def _data_uri_for(path: Path, max_dim: int) -> str:
+    raw = path.read_bytes()
+    mime = _guess_content_type(path)
+    if max_dim > 0:
+        try:
+            from PIL import Image
+        except Exception:
+            return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
+        with Image.open(BytesIO(raw)) as image:
+            scale = min(1.0, float(max_dim) / float(max(image.size)))
+            if scale < 1.0:
+                image = image.convert("RGBA").resize(
+                    (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+                out = BytesIO()
+                image.save(out, format="PNG")
+                raw = out.getvalue()
+                mime = "image/png"
+            # scale >= 1.0：不强转 RGBA PNG，保留原始紧凑字节（如 JPEG）
+    return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
+
+
+def _edit(args: argparse.Namespace, creds: RelayCredentials) -> None:
+    raw_prompt = _read_prompt(args.prompt, args.prompt_file)
+    output_format = _normalize_output_format(args.output_format)
+    _validate_image_job_options(
+        model=args.model,
+        n=args.n,
+        size=args.size,
+        quality=args.quality,
+        background=args.background,
+        output_format=output_format,
+        output_compression=args.output_compression,
+        moderation=args.moderation,
+        input_fidelity=getattr(args, "input_fidelity", None),
+        strict_size=args.strict_size,
     )
-    prompt, preflight_applied, preflight_changes = _apply_coverage_preflight(
-        prompt, mode=args.preflight, has_reference=True
-    )
-    if preflight_applied:
-        _info("[preflight] " + "; ".join(preflight_changes) + "  (--no-preflight disables)")
 
     image_paths = _check_image_paths(args.image)
     mask_path = Path(args.mask) if args.mask else None
@@ -2375,77 +2795,109 @@ def _edit(args: argparse.Namespace) -> None:
         if mask_path.stat().st_size > MAX_IMAGE_BYTES:
             _warn(f"Mask exceeds 50MB limit: {mask_path}")
 
-    payload = {
-        "model": args.model,
-        "prompt": prompt,
-        "n": args.n,
-        "size": args.size,
-        "quality": args.quality,
-        "background": args.background,
-        "output_format": args.output_format,
-        "output_compression": args.output_compression,
-        "input_fidelity": args.input_fidelity,
-        "moderation": args.moderation,
-    }
-    payload = {k: v for k, v in payload.items() if v is not None}
+    prompt, preflight_applied, _preflight_changes = _prepare_prompt(
+        raw_prompt,
+        augment=args.augment,
+        fields=_fields_from_args(args),
+        quality=args.quality,
+        background=args.background,
+        preflight_mode=args.preflight,
+        has_reference=True,
+    )
 
-    output_format = _normalize_output_format(args.output_format)
-    _validate_transparency(args.background, output_format)
-    payload["output_format"] = output_format
-    _validate_input_fidelity(args.input_fidelity)
-    _validate_model(args.model)
+    payload = {
+        k: v
+        for k, v in {
+            "model": args.model,
+            "prompt": prompt,
+            "n": args.n,
+            "size": args.size,
+            "quality": args.quality,
+            "background": args.background,
+            "output_format": output_format,
+            "output_compression": args.output_compression,
+            "input_fidelity": getattr(args, "input_fidelity", None),
+            "moderation": args.moderation,
+        }.items()
+        if v is not None
+    }
+
     output_paths = _build_output_paths(args.out, output_format, args.n, args.out_dir)
-    downscaled = None
-    if args.downscale_max_dim is not None:
-        downscaled = [
-            str(_derive_downscale_path(p, args.downscale_suffix)) for p in output_paths
-        ]
+    downscaled = (
+        [str(_derive_downscale_path(p, args.downscale_suffix)) for p in output_paths]
+        if args.downscale_max_dim is not None
+        else None
+    )
+
+    wire_style = _build_wire_style(args, include_conv=True, defer_conv_persist=True)
+    style_dict = wire_style.as_json_style()
+    mp_style_fields = wire_style.as_multipart_fields()
+
+    timeout_s, deadline_s, slow_after = _resolve_timeouts(
+        args,
+        command="edit",
+        n=args.n,
+        web_mode=getattr(args, "web_mode", None),
+        effort=getattr(args, "effort", None),
+    )
 
     if args.dry_run:
         preview = dict(payload)
         preview["image"] = [str(p) for p in image_paths]
         if mask_path:
             preview["mask"] = str(mask_path)
-        preview["wire_payload"] = {
+        wire_preview: Dict[str, Any] = {
             "model": args.model,
             "prompt": prompt,
             "n": args.n,
             "image": [str(p) for p in image_paths],
         }
+        if style_dict:
+            wire_preview["style"] = style_dict
+        if mp_style_fields:
+            wire_preview["multipart_fields"] = mp_style_fields
+        preview["wire_payload"] = wire_preview
         preview["endpoint"] = "/v1/images/edits"
         preview["outputs"] = [str(p) for p in output_paths]
         preview["outputs_downscaled"] = downscaled
         preview["base_url"] = creds.base_url
+        preview["timeouts"] = {"timeout_s": timeout_s, "deadline_s": deadline_s}
         _print_request(preview)
         return
 
-    _ensure_credentials(creds, dry_run=False)
+    _precheck_outputs(
+        output_paths,
+        force=args.force,
+        downscale_max_dim=args.downscale_max_dim,
+        downscale_suffix=args.downscale_suffix,
+    )
     if args.check_model:
-        _check_model(creds, args.model, args.timeout)
+        _check_model(creds, args.model, timeout_s)
 
+    _log_conv_info(style_dict)
     _info(f"Calling the relay image route (edit) with {len(image_paths)} image(s).")
     started = time.time()
+    deadline = time.monotonic() + deadline_s
 
     base_fields: Dict[str, str] = {"model": args.model, "n": str(args.n)}
+    base_fields.update(mp_style_fields)
+
     files: List[Tuple[str, str, bytes, str]] = [
         ("image", path.name, path.read_bytes(), _guess_content_type(path))
         for path in image_paths
     ]
     if mask_path:
-        files.append(
-            ("mask", mask_path.name, mask_path.read_bytes(), _guess_content_type(mask_path))
-        )
+        files.append(("mask", mask_path.name, mask_path.read_bytes(), _guess_content_type(mask_path)))
 
-    # [relay] the Codex contract posts images as data URIs inside a JSON body
-    image_refs = [
-        {"image_url": _data_uri_for(path, args.max_dim)} for path in image_paths
-    ]
+    cached_contract = _load_edit_contract(creds.base_url)
+    # 若已缓存该中转站走 openai-multipart，则跳过昂贵的 base64/PNG 重编码
+    image_refs = (
+        []
+        if cached_contract == "openai-multipart"
+        else [{"image_url": _data_uri_for(path, args.max_dim)} for path in image_paths]
+    )
 
-    refusal_attempts = max(1, int(getattr(args, "retry_refusal", 0)) + 1)
-    response = decoded = None
-    contract = "unknown"
-    for attempt in range(1, refusal_attempts + 1):
-        attempt_prompt = prompt + _REFUSAL_VARIATIONS[(attempt - 1) % len(_REFUSAL_VARIATIONS)]
+    def do_call(attempt_prompt: str, dl: float) -> Tuple[Tuple[HttpResponse, Dict[str, Any]], str]:
         fields = dict(base_fields, prompt=attempt_prompt)
         json_payload: Dict[str, Any] = {
             "model": args.model,
@@ -2460,52 +2912,40 @@ def _edit(args: argparse.Namespace) -> None:
             json_payload["quality"] = args.quality
         if args.background:
             json_payload["background"] = args.background
-        _style = _style_payload(args)
-        if _style:
-            json_payload["style"] = _style
-            # 【2026-11-19 修复】multipart 契约（new-api / OpenAI 兼容走这条）不看 style，
-            #   shim 在 multipart 分支只读顶层 web_* 字段。之前这里没映射，
-            #   导致「带参考图改图时 --web-mode/--effort/--conv-key 全部失效」。
-            if _style.get("mssk_conv"):
-                fields["web_conv_key"] = _style["mssk_conv"]
-            if _style.get("mssk_mode"):
-                fields["web_mode"] = _style["mssk_mode"]
-            if _style.get("mssk_model"):
-                fields["web_model"] = _style["mssk_model"]
-            if _style.get("mssk_effort"):
-                fields["web_effort"] = _style["mssk_effort"]
-            if _style.get("mssk_gif_speed"):
-                fields["gif_speed"] = _style["mssk_gif_speed"]
-        try:
-            (response, decoded), contract = _post_edit_with_retries(
-                creds,
-                json_payload=json_payload,
-                fields=fields,
-                files=files,
-                attempts=args.max_attempts,
-                timeout=args.timeout,
-                label="[edit]",
-                deadline=time.monotonic() + args.deadline,
-            )
-            prompt = attempt_prompt
-            break
-        except RelayError as exc:
-            if not _is_refusal_error(exc) or attempt >= refusal_attempts:
-                raise
-            _warn(
-                f"[edit] upstream refused (attempt {attempt}/{refusal_attempts}); "
-                "retrying with a neutral variation (the gate is stochastic)"
-            )
+        if style_dict:
+            json_payload["style"] = style_dict
+        return _post_edit_with_retries(
+            creds,
+            json_payload=json_payload,
+            fields=fields,
+            files=files,
+            attempts=args.max_attempts,
+            timeout=timeout_s,
+            label="[edit]",
+            deadline=dl,
+            slow_after=slow_after,
+            cached_contract=cached_contract,
+        )
+
+    ((response, decoded), contract), final_prompt = _run_with_refusal_retry(
+        prompt,
+        retry_refusal=args.retry_refusal,
+        label="[edit]",
+        deadline=deadline,
+        call_fn=do_call,
+    )
+    wire_style.commit_conv()
 
     _info(f"[edit] contract used: {contract}")
-    _report_pipeline(
+    pipeline_info = _report_pipeline(
         decoded,
-        getattr(args, "model", ""),
+        args.model,
         getattr(args, "web_mode", None),
         getattr(args, "effort", None),
         getattr(args, "agent_model", None),
+        web_sources=getattr(args, "_web_sources", None),
     )
-    results = _parse_images(decoded, creds=creds, timeout=args.timeout)
+    results = _parse_images(decoded, creds=creds, timeout=timeout_s, deadline=deadline)
     local_started = time.time()
     artifacts = _write_results(
         results,
@@ -2515,18 +2955,20 @@ def _edit(args: argparse.Namespace) -> None:
         output_compression=args.output_compression,
         downscale_max_dim=args.downscale_max_dim,
         downscale_suffix=args.downscale_suffix,
+        exact_size=getattr(args, "exact_size", None),
+        exact_fit=getattr(args, "exact_fit", "cover"),
     )
     local_s = time.time() - local_started
     total_s = time.time() - started
     _print_timing("edit", response, local_s, total_s)
+    _warn_if_extra_artifacts(args.n, artifacts)
 
     _write_report(
         args.report_json,
         _report_record(
             command="edit",
             model=args.model,
-            prompt=prompt,
-            outputs=[str(p) for p in output_paths],
+            prompt=final_prompt,
             artifacts=artifacts,
             timing={
                 "relay_and_render": round(response.queue_wait_s, 2),
@@ -2535,6 +2977,7 @@ def _edit(args: argparse.Namespace) -> None:
                 "total": round(total_s, 2),
             },
             base_url=creds.base_url,
+            pipeline_info=pipeline_info,
             preflight=preflight_applied,
         ),
     )
@@ -2547,12 +2990,10 @@ def _iter_sse_events(
     payload: Dict[str, Any],
     timeout: float,
     label: str,
+    deadline: Optional[float] = None,
+    slow_after: float = 180.0,
 ):
-    """[relay] Stream a Responses-API call and yield decoded SSE events.
-
-    The relay requires ``stream: true`` on /v1/responses (it answers 400
-    "Stream must be set to true" otherwise).
-    """
+    """[relay] Stream a Responses-API call and enforce overall --deadline even across keepalives."""
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urlrequest.Request(
         url,
@@ -2565,10 +3006,27 @@ def _iter_sse_events(
         },
         method="POST",
     )
+    mono_start = time.monotonic()
     try:
-        with _Heartbeat(label, interval=15.0):
-            with urlrequest.urlopen(request, timeout=timeout) as response:
+        with _Heartbeat(label, interval=15.0, slow_after=slow_after):
+            with urlrequest.urlopen(request, timeout=_effective_timeout(timeout, deadline)) as response:
+                raw_sock = getattr(getattr(response, "fp", None), "raw", None)
+                sock = getattr(raw_sock, "_sock", None)
                 for raw_line in response:
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise RelayError(
+                                f"{label} aborted: the overall --deadline budget was used up "
+                                "(stream stayed open with keepalives). Nothing was written.",
+                                retryable=False,
+                                code="deadline_exceeded",
+                            )
+                        if sock is not None:
+                            try:
+                                sock.settimeout(max(1.0, min(timeout, remaining)))
+                            except Exception:
+                                pass
                     line = raw_line.decode("utf-8", "replace").strip()
                     if not line.startswith("data:"):
                         continue
@@ -2580,10 +3038,24 @@ def _iter_sse_events(
                     except Exception:
                         continue
     except urlerror.HTTPError as exc:
-        raise _relay_error_from_http(exc.code, exc.read())
-    except (urlerror.URLError, TimeoutError, OSError) as exc:
+        raise _relay_error_from_http(exc.code, exc.read(), headers=exc.headers)
+    except (urlerror.URLError, TimeoutError, socket.timeout, OSError) as exc:
+        elapsed = time.monotonic() - mono_start
         reason = getattr(exc, "reason", exc)
-        raise RelayError(f"network error talking to {url}: {reason}", retryable=True)
+        if _is_timeout_exception(exc):
+            raise RelayError(
+                f"request timed out after {elapsed:.0f}s talking to {url}: {reason}",
+                retryable=True,
+                code="timeout",
+                is_timeout=True,
+                elapsed_s=elapsed,
+            )
+        raise RelayError(
+            f"network error talking to {url}: {reason}",
+            retryable=True,
+            code="network_error",
+            elapsed_s=elapsed,
+        )
 
 
 def _sse_items(event: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -2596,63 +3068,67 @@ def _sse_items(event: Dict[str, Any]) -> List[Dict[str, Any]]:
     return items
 
 
-def _data_uri_for(path: Path, max_dim: int) -> str:
-    raw = path.read_bytes()
-    mime = _guess_content_type(path)
-    if max_dim > 0:
-        try:
-            from PIL import Image
-        except Exception:
-            return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
-        with Image.open(BytesIO(raw)) as image:
-            image = image.convert("RGBA")
-            scale = min(1.0, float(max_dim) / float(max(image.size)))
-            if scale < 1.0:
-                image = image.resize(
-                    (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
-                    Image.Resampling.LANCZOS,
-                )
-            out = BytesIO()
-            image.save(out, format="PNG")
-            raw = out.getvalue()
-            mime = "image/png"
-    return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
+def _redact_payload_for_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """dry-run 预览时把 data:image/...;base64,... 缩略，避免往上下文倾倒几百 KB 垃圾。"""
+    clone = json.loads(json.dumps(payload))
+    for msg in clone.get("input", []):
+        for part in msg.get("content", []):
+            url = part.get("image_url")
+            if isinstance(url, str) and url.startswith("data:"):
+                header = url.split(",", 1)[0]
+                part["image_url"] = f"<{header}, {len(url)} chars redacted>"
+    return clone
 
 
-def _reference(args: argparse.Namespace) -> None:
-    # 【2026-11-19】这条路走 /v1/responses（由对话模型驱动图像工具），
-    #   shim 在该路由是原样透传，不读 style.mssk_*，所以下面这些参数无效。
-    #   宁可明确说一句，也不要静默忽略 —— 否则用户以为续接/档位生效了。
-    _ignored = [
-        ("conv_key", "--conv-key"), ("web_mode", "--web-mode"),
-        ("effort", "--effort"), ("agent_model", "--agent-model"),
+def _reference(args: argparse.Namespace, creds: RelayCredentials) -> None:
+    """[relay] Reference-to-image through /v1/responses + the hosted image_generation tool."""
+    # 只对 CLI 显式传入的无效参数发出警告，绝不对 config.json 里的网页管线默认值误报！
+    cli_explicit: Set[str] = getattr(args, "_cli_explicit", set())
+    unsupported_flags = [
+        ("conv_key", "--conv-key"),
+        ("new_conv", "--new-conv"),
+        ("web_mode", "--web-mode"),
+        ("effort", "--effort"),
+        ("agent_model", "--agent-model"),
+        ("gif_speed", "--gif-speed"),
     ]
-    _for_this_route = [flag for attr, flag in _ignored if getattr(args, attr, None)]
-    if _for_this_route:
+    explicit_unsupported = [
+        flag for attr, flag in unsupported_flags
+        if attr in cli_explicit and getattr(args, attr, None)
+    ]
+    if explicit_unsupported:
         _warn(
             "[reference] 以下参数在这条路由上无效（走 /v1/responses，不经 style 透传）："
-            + " ".join(_for_this_route)
+            + " ".join(explicit_unsupported)
             + "；请改用 --reasoning-effort 控制推理强度"
         )
-    """[relay] Reference-to-image through Responses + the hosted image tool.
 
-    This is the relay counterpart of the official skill's *built-in* path: the chat
-    model decides how to draw from the reference image(s), and the relay returns the
-    rendered image inside the response. Unlike /images/edits this path keeps the
-    model in the loop, which is what "reference-image generation" means.
-    """
-    creds = _resolve_credentials(args)
-    prompt = _read_prompt(args.prompt, args.prompt_file)
-    prompt = _augment_prompt(args, prompt)
-    prompt = _apply_relay_prompt_extras(prompt, quality=args.quality, background=args.background)
-    prompt, preflight_applied, preflight_changes = _apply_coverage_preflight(
-        prompt, mode=args.preflight, has_reference=True
+    raw_prompt = _read_prompt(args.prompt, args.prompt_file)
+    output_format = _normalize_output_format(args.output_format or "png")
+    _validate_image_job_options(
+        model=args.model,
+        n=1,
+        size=args.size,
+        quality=args.quality,
+        background=args.background,
+        output_format=output_format,
+        output_compression=args.output_compression,
+        moderation=None,
+        strict_size=args.strict_size,
+        is_responses_route=True,
     )
-    if preflight_applied:
-        _info("[preflight] " + "; ".join(preflight_changes) + "  (--no-preflight disables)")
+
+    prompt, preflight_applied, _preflight_changes = _prepare_prompt(
+        raw_prompt,
+        augment=args.augment,
+        fields=_fields_from_args(args),
+        quality=args.quality,
+        background=args.background,
+        preflight_mode=args.preflight,
+        has_reference=True,
+    )
 
     image_paths = _check_image_paths(args.image)
-    output_format = _normalize_output_format(args.output_format or "png")
     output_paths = _build_output_paths(args.out, output_format, 1, args.out_dir)
 
     tool: Dict[str, Any] = {"type": "image_generation"}
@@ -2664,8 +3140,17 @@ def _reference(args: argparse.Namespace) -> None:
         tool["background"] = args.background
 
     content: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
-    for path in image_paths:
-        content.append({"type": "input_image", "image_url": _data_uri_for(path, args.max_dim)})
+    if not args.dry_run:
+        for path in image_paths:
+            content.append({"type": "input_image", "image_url": _data_uri_for(path, args.max_dim)})
+    else:
+        for path in image_paths:
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": f"<data:{_guess_content_type(path)};base64, {path.stat().st_size}B file={path.name}>",
+                }
+            )
 
     payload: Dict[str, Any] = {
         "model": args.model,
@@ -2674,16 +3159,10 @@ def _reference(args: argparse.Namespace) -> None:
         "store": False,
         "stream": True,
     }
-    # [relay] effort travels as a request field, not as a model-name suffix: the relay answers
-    # 500 do_request_failed for ids like `gpt-6-astra-high` on /v1/responses.
-    effort = getattr(args, "reasoning_effort", None)
-    if effort:
-        payload["reasoning"] = {"effort": effort}
+    reasoning_effort = getattr(args, "reasoning_effort", None)
+    if reasoning_effort:
+        payload["reasoning"] = {"effort": reasoning_effort}
 
-    # [relay] Brief guard. Measured: when the chat model writes the image prompt itself, it
-    # enumerates garments and jewellery item by item ("白色露肩荷叶边上衣、银色百褶短裙、银链…")
-    # even when the user never mentioned clothing. That vocabulary is what the output-side
-    # classifier reacts to, so the guard asks it to describe the task and composition instead.
     if getattr(args, "brief_guard", "on") == "on":
         content[0] = {
             "type": "input_text",
@@ -2694,12 +3173,21 @@ def _reference(args: argparse.Namespace) -> None:
         }
         _info("[reference] brief guard: ON (no garment enumeration in the generated brief)")
 
+    timeout_s, deadline_s, slow_after = _resolve_timeouts(
+        args,
+        command="reference",
+        n=1,
+        web_mode=None,
+        effort=reasoning_effort,
+    )
+
     if args.dry_run:
-        preview = dict(payload)
+        preview = _redact_payload_for_preview(payload)
         preview["endpoint"] = "/v1/responses"
         preview["outputs"] = [str(p) for p in output_paths]
         preview["base_url"] = creds.base_url
         preview["input_images"] = [str(p) for p in image_paths]
+        preview["timeouts"] = {"timeout_s": timeout_s, "deadline_s": deadline_s}
         preview["wire_payload"] = {
             "model": args.model,
             "prompt": prompt,
@@ -2709,77 +3197,101 @@ def _reference(args: argparse.Namespace) -> None:
         _print_request(preview)
         return
 
-    _ensure_credentials(creds, dry_run=False)
+    _precheck_outputs(
+        output_paths,
+        force=args.force,
+        downscale_max_dim=args.downscale_max_dim,
+        downscale_suffix=args.downscale_suffix,
+    )
     if args.check_model:
-        _check_model(creds, args.model, args.timeout)
+        _check_model(creds, args.model, timeout_s)
 
     _info("Calling the relay responses route with the image tool (reference generation).")
     started = time.time()
-    deadline = time.monotonic() + args.deadline
+    deadline = time.monotonic() + deadline_s
 
-    results: List[ImageResult] = []
-    statuses: List[str] = []
-    model_text: List[str] = []
-    revised_prompt: Optional[str] = None
-    failure_reason: Optional[str] = None
+    def run_stream_once() -> List[ImageResult]:
+        results: List[ImageResult] = []
+        statuses: List[str] = []
+        model_text: List[str] = []
+        revised_prompt: Optional[str] = None
+        failure_reason: Optional[str] = None
 
-    for event in _iter_sse_events(
-        f"{creds.base_url}/responses",
-        api_key=creds.api_key,
-        payload=payload,
-        timeout=_effective_timeout(args.timeout, deadline),
-        label="[reference]",
-    ):
-        for item in _sse_items(event):
-            kind = item.get("type")
-            if kind == "image_generation_call":
-                status = str(item.get("status") or "")
-                statuses.append(status)
-                if item.get("revised_prompt"):
-                    revised_prompt = str(item["revised_prompt"])
-                result = item.get("result") or ""
-                if status == "completed" and result:
-                    results.append(
-                        ImageResult(
-                            raw=base64.b64decode(result),
-                            actual_size=None,
-                            revised_prompt=revised_prompt,
-                            source="image_generation_call",
+        for event in _iter_sse_events(
+            f"{creds.base_url}/responses",
+            api_key=creds.api_key,
+            payload=payload,
+            timeout=timeout_s,
+            label="[reference]",
+            deadline=deadline,
+            slow_after=slow_after,
+        ):
+            for item in _sse_items(event):
+                kind = item.get("type")
+                if kind == "image_generation_call":
+                    status = str(item.get("status") or "")
+                    statuses.append(status)
+                    if item.get("revised_prompt"):
+                        revised_prompt = str(item["revised_prompt"])
+                    result = item.get("result") or ""
+                    if status == "completed" and result:
+                        results.append(
+                            ImageResult(
+                                raw=base64.b64decode(result),
+                                actual_size=None,
+                                revised_prompt=revised_prompt,
+                                source="image_generation_call",
+                            )
                         )
-                    )
-                elif status == "failed":
-                    failure_reason = "the upstream image tool rejected this request"
-            elif kind == "message":
-                text = "".join(
-                    part.get("text", "")
-                    for part in item.get("content", [])
-                    if isinstance(part, dict)
-                ).strip()
-                if text:
-                    model_text.append(text)
+                    elif status == "failed":
+                        failure_reason = "the upstream image tool rejected this request"
+                elif kind == "message":
+                    text = "".join(
+                        part.get("text", "")
+                        for part in item.get("content", [])
+                        if isinstance(part, dict)
+                    ).strip()
+                    if text:
+                        model_text.append(text)
 
-    total_s = time.time() - started
-    if not results:
-        detail = failure_reason or "the relay returned no image"
-        if model_text:
-            detail = f"{detail}. The model said: {model_text[-1][:400]}"
-        raise RelayError(
-            f"reference generation failed after {total_s:.0f}s (tool status: "
-            f"{', '.join(statuses) or 'none'}). {detail}"
-        )
+        if not results:
+            elapsed_now = time.time() - started
+            detail = failure_reason or "the relay returned no image"
+            if model_text:
+                detail = f"{detail}. The model said: {model_text[-1][:400]}"
+            raise RelayError(
+                f"reference generation failed after {elapsed_now:.0f}s (tool status: "
+                f"{', '.join(statuses) or 'none'}). {detail}",
+                retryable=False,
+            )
+        return results
 
+    results = _with_retries(
+        run_stream_once,
+        attempts=args.max_attempts,
+        label="[reference]",
+        deadline=deadline,
+    )
+
+    pipeline_info = _report_pipeline({}, args.model, route="responses")
     local_started = time.time()
     artifacts = _write_results(
         results,
         output_paths,
         force=args.force,
         output_format=output_format,
-        output_compression=None,
+        output_compression=args.output_compression,
         downscale_max_dim=args.downscale_max_dim,
         downscale_suffix=args.downscale_suffix,
+        exact_size=getattr(args, "exact_size", None),
+        exact_fit=getattr(args, "exact_fit", "cover"),
     )
     local_s = time.time() - local_started
-    _info(f"[timing] reference model+render={total_s - local_s:.1f}s local={local_s:.2f}s total={total_s:.1f}s")
+    total_s = time.time() - started
+    _info(
+        f"[timing] reference model+render={total_s - local_s:.1f}s "
+        f"local={local_s:.2f}s total={total_s:.1f}s"
+    )
 
     _write_report(
         args.report_json,
@@ -2787,17 +3299,98 @@ def _reference(args: argparse.Namespace) -> None:
             command="reference",
             model=args.model,
             prompt=prompt,
-            outputs=[str(p) for p in output_paths],
             artifacts=artifacts,
-            timing={"model_and_render": round(total_s - local_s, 2), "local": round(local_s, 2), "total": round(total_s, 2)},
+            timing={
+                "model_and_render": round(total_s - local_s, 2),
+                "local": round(local_s, 2),
+                "total": round(total_s, 2),
+            },
             base_url=creds.base_url,
+            pipeline_info=pipeline_info,
             preflight=preflight_applied,
         ),
     )
 
 
-def _run_generate_batch(args: argparse.Namespace) -> int:
-    creds = _resolve_credentials(args)
+def _prepare_batch_job(
+    args: argparse.Namespace,
+    base_fields: Dict[str, Optional[str]],
+    base_payload: Dict[str, Any],
+    out_dir: Path,
+    idx: int,
+    job: Dict[str, Any],
+    batch_style_dict: Dict[str, Any],
+) -> Dict[str, Any]:
+    """dry-run 与实际执行共用的 batch 单任务构造器（保证两者 100% 一致）。"""
+    raw_prompt = str(job["prompt"]).strip()
+    fields = _merge_non_null(base_fields, job.get("fields", {}))
+    fields = _merge_non_null(fields, {k: job.get(k) for k in base_fields.keys()})
+
+    job_payload = dict(base_payload)
+    job_payload = _merge_non_null(job_payload, {k: job.get(k) for k in base_payload.keys()})
+    job_payload = {k: v for k, v in job_payload.items() if v is not None}
+
+    effective_output_format = _normalize_output_format(job_payload.get("output_format"))
+    job_payload["output_format"] = effective_output_format
+    n = int(job_payload.get("n", 1))
+    model = str(job_payload.get("model", args.model))
+    size = str(job_payload.get("size", args.size))
+
+    _validate_image_job_options(
+        model=model,
+        n=n,
+        size=size,
+        quality=str(job_payload.get("quality", DEFAULT_QUALITY)),
+        background=job_payload.get("background"),
+        output_format=effective_output_format,
+        output_compression=job_payload.get("output_compression"),
+        moderation=job_payload.get("moderation"),
+        strict_size=args.strict_size,
+    )
+
+    augmented, job_preflight, _changes = _prepare_prompt(
+        raw_prompt,
+        augment=args.augment,
+        fields=fields,
+        quality=job_payload.get("quality"),
+        background=job_payload.get("background"),
+        preflight_mode=args.preflight,
+        has_reference=False,
+        log_preflight=not args.dry_run,
+        log_prefix=f"[job {idx} preflight]",
+    )
+    job_payload["prompt"] = augmented
+
+    outputs = _job_output_paths(
+        out_dir=out_dir,
+        output_format=effective_output_format,
+        idx=idx,
+        prompt=raw_prompt,
+        n=n,
+        explicit_out=job.get("out"),
+    )
+    wire = _wire_payload(model, augmented, n, size)
+    if batch_style_dict:
+        wire["style"] = dict(batch_style_dict)
+
+    return {
+        "idx": idx,
+        "model": model,
+        "n": n,
+        "prompt": augmented,
+        "payload": job_payload,
+        "output_format": effective_output_format,
+        "outputs": outputs,
+        "wire": wire,
+        "preflight": job_preflight,
+    }
+
+
+def _run_generate_batch(args: argparse.Namespace, creds: RelayCredentials) -> int:
+    cli_explicit: Set[str] = getattr(args, "_cli_explicit", set())
+    if "conv_key" in cli_explicit or "new_conv" in cli_explicit:
+        _warn("[generate-batch] 批量模式为每条任务独立建会话，--conv-key / --new-conv 已忽略。")
+
     jobs = _read_jobs_jsonl(args.input)
     out_dir = Path(args.out_dir)
 
@@ -2813,214 +3406,190 @@ def _run_generate_batch(args: argparse.Namespace) -> int:
         "moderation": args.moderation,
     }
 
+    # 批量是一批独立提示词：保留 mode/effort/model/gif_speed，强制去掉 mssk_conv
+    batch_style_dict = _build_wire_style(args, include_conv=False).as_json_style()
+
+    prepared_jobs = [
+        _prepare_batch_job(args, base_fields, base_payload, out_dir, i, job, batch_style_dict)
+        for i, job in enumerate(jobs, start=1)
+    ]
+
     if args.dry_run:
-        for i, job in enumerate(jobs, start=1):
-            prompt = str(job["prompt"]).strip()
-            fields = _merge_non_null(base_fields, job.get("fields", {}))
-            fields = _merge_non_null(fields, {k: job.get(k) for k in base_fields.keys()})
-            augmented = _augment_prompt_fields(args.augment, prompt, fields)
-            augmented = _apply_relay_prompt_extras(
-                augmented,
-                quality=job.get("quality", base_payload.get("quality")),
-                background=job.get("background", base_payload.get("background")),
+        for spec in prepared_jobs:
+            outputs = spec["outputs"]
+            downscaled = (
+                [str(_derive_downscale_path(p, args.downscale_suffix)) for p in outputs]
+                if args.downscale_max_dim is not None
+                else None
             )
-            augmented, _job_preflight, _job_changes = _apply_coverage_preflight(
-                augmented, mode=args.preflight, has_reference=False
-            )
-
-            job_payload = dict(base_payload)
-            job_payload["prompt"] = augmented
-            job_payload = _merge_non_null(
-                job_payload, {k: job.get(k) for k in base_payload.keys()}
-            )
-            job_payload = {k: v for k, v in job_payload.items() if v is not None}
-
-            _validate_generate_payload(job_payload, strict_size=args.strict_size)
-            effective_output_format = _normalize_output_format(
-                job_payload.get("output_format")
-            )
-            _validate_transparency(job_payload.get("background"), effective_output_format)
-            job_payload["output_format"] = effective_output_format
-
-            n = int(job_payload.get("n", 1))
-            outputs = _job_output_paths(
-                out_dir=out_dir,
-                output_format=effective_output_format,
-                idx=i,
-                prompt=prompt,
-                n=n,
-                explicit_out=job.get("out"),
-            )
-            downscaled = None
-            if args.downscale_max_dim is not None:
-                downscaled = [
-                    str(_derive_downscale_path(p, args.downscale_suffix)) for p in outputs
-                ]
-            preview = dict(job_payload)
-            preview["job"] = i
+            preview = dict(spec["payload"])
+            preview["job"] = spec["idx"]
             preview["endpoint"] = "/v1/images/generations"
             preview["outputs"] = [str(p) for p in outputs]
             preview["outputs_downscaled"] = downscaled
-            preview["wire_payload"] = _wire_payload(
-                str(job_payload.get("model", args.model)),
-                augmented,
-                n,
-                str(job_payload.get("size", args.size)),
-            )
+            preview["wire_payload"] = spec["wire"]
             preview["base_url"] = creds.base_url
             _print_request(preview)
         return 0
 
-    _ensure_credentials(creds, dry_run=False)
     if args.check_model:
-        _check_model(creds, args.model, args.timeout)
+        _check_model(creds, args.model, args.timeout or DEFAULT_STANDARD_TIMEOUT_SECONDS)
 
-    any_failed = False
-    records: List[Dict[str, Any]] = []
+    skip_existing = bool(getattr(args, "skip_existing", False))
+    secrets = (creds.api_key,) if creds.api_key else ()
 
-    def run_job(i: int, job: Dict[str, Any]) -> Tuple[int, Optional[str]]:
-        nonlocal any_failed
-        prompt = str(job["prompt"]).strip()
-        job_label = f"[job {i}/{len(jobs)}]"
+    def run_job(spec: Dict[str, Any]) -> Tuple[int, bool, Dict[str, Any]]:
+        i = spec["idx"]
+        job_label = f"[job {i}/{len(prepared_jobs)}]"
+        outputs: List[Path] = spec["outputs"]
 
-        fields = _merge_non_null(base_fields, job.get("fields", {}))
-        fields = _merge_non_null(fields, {k: job.get(k) for k in base_fields.keys()})
-        augmented = _augment_prompt_fields(args.augment, prompt, fields)
+        if skip_existing and all(p.exists() and p.stat().st_size > 0 for p in outputs):
+            _info(f"{job_label} skipped (already exists)")
+            return i, True, {
+                "ok": True,
+                "skipped": True,
+                "job": i,
+                "command": "generate-batch",
+                "model": spec["model"],
+                "outputs": [str(p) for p in outputs],
+            }
 
-        payload = dict(base_payload)
-        payload["prompt"] = augmented
-        payload = _merge_non_null(payload, {k: job.get(k) for k in base_payload.keys()})
-        payload = {k: v for k, v in payload.items() if v is not None}
-
-        augmented = _apply_relay_prompt_extras(
-            augmented, quality=payload.get("quality"), background=payload.get("background")
-        )
-        augmented, job_preflight, job_changes = _apply_coverage_preflight(
-            augmented, mode=args.preflight, has_reference=False
-        )
-
-        n = int(payload.get("n", 1))
-        _validate_generate_payload(payload, strict_size=args.strict_size)
-        effective_output_format = _normalize_output_format(payload.get("output_format"))
-        _validate_transparency(payload.get("background"), effective_output_format)
-        payload["output_format"] = effective_output_format
-        outputs = _job_output_paths(
-            out_dir=out_dir,
-            output_format=effective_output_format,
-            idx=i,
-            prompt=prompt,
-            n=n,
-            explicit_out=job.get("out"),
-        )
-        wire = _wire_payload(
-            str(payload.get("model", args.model)),
-            augmented,
-            n,
-            str(payload.get("size", args.size)),
-        )
-        # 【2026-11-19 修复】batch 也要带 surface/档位/上游模型，否则批量出图时这些参数静默失效。
-        #   批量是「一批独立提示词」，所以去掉 mssk_conv —— 不让所有图挤进同一个上游会话。
-        _batch_style = _style_payload(args)
-        _batch_style.pop("mssk_conv", None)
-        if _batch_style:
-            wire["style"] = dict(wire.get("style") or {}, **_batch_style)
         try:
-            print(f"{job_label} starting", file=sys.stderr)
-            started = time.time()
-            response, decoded = _post_json_with_retries(
-                creds,
-                "images/generations",
-                wire,
-                attempts=args.max_attempts,
-                timeout=args.timeout,
-                label=job_label,
-                deadline=time.monotonic() + args.deadline,
+            _precheck_outputs(
+                outputs,
+                force=args.force,
+                downscale_max_dim=args.downscale_max_dim,
+                downscale_suffix=args.downscale_suffix,
             )
-            _report_pipeline(
-        decoded,
-        getattr(args, "model", ""),
-        getattr(args, "web_mode", None),
-        getattr(args, "effort", None),
-        getattr(args, "agent_model", None),
-    )
-            results = _parse_images(decoded, creds=creds, timeout=args.timeout)
+            timeout_s, deadline_s, slow_after = _resolve_timeouts(
+                args,
+                command="generate-batch",
+                n=spec["n"],
+                web_mode=getattr(args, "web_mode", None),
+                effort=getattr(args, "effort", None),
+            )
+            job_deadline = time.monotonic() + deadline_s
+
+            _info(f"{job_label} starting")
+            started = time.time()
+
+            def do_call(attempt_prompt: str, dl: float) -> Tuple[HttpResponse, Dict[str, Any]]:
+                attempt_wire = dict(spec["wire"])
+                attempt_wire["prompt"] = attempt_prompt
+                return _post_json_with_retries(
+                    creds,
+                    "images/generations",
+                    attempt_wire,
+                    attempts=args.max_attempts,
+                    timeout=timeout_s,
+                    label=job_label,
+                    deadline=dl,
+                    slow_after=slow_after,
+                )
+
+            (response, decoded), final_prompt = _run_with_refusal_retry(
+                spec["prompt"],
+                retry_refusal=args.retry_refusal,
+                label=job_label,
+                deadline=job_deadline,
+                call_fn=do_call,
+            )
+
+            pipeline_info = _report_pipeline(
+                decoded,
+                spec["model"],
+                getattr(args, "web_mode", None),
+                getattr(args, "effort", None),
+                getattr(args, "agent_model", None),
+                web_sources=getattr(args, "_web_sources", None),
+            )
+            results = _parse_images(decoded, creds=creds, timeout=timeout_s, deadline=job_deadline)
             local_started = time.time()
             artifacts = _write_results(
                 results,
                 outputs,
                 force=args.force,
-                output_format=effective_output_format,
-                output_compression=payload.get("output_compression"),
+                output_format=spec["output_format"],
+                output_compression=spec["payload"].get("output_compression"),
                 downscale_max_dim=args.downscale_max_dim,
-          exact_size=getattr(args, "exact_size", None),
-          exact_fit=getattr(args, "exact_fit", "cover"),
                 downscale_suffix=args.downscale_suffix,
+                exact_size=getattr(args, "exact_size", None),
+                exact_fit=getattr(args, "exact_fit", "cover"),
             )
             local_s = time.time() - local_started
             elapsed = time.time() - started
-            _print_timing(f"{job_label}", response, local_s, elapsed)
-            print(f"{job_label} completed in {elapsed:.1f}s", file=sys.stderr)
-            records.append(
-                _report_record(
-                    command="generate-batch",
-                    model=str(payload.get("model", args.model)),
-                    prompt=augmented,
-                    outputs=[str(p) for p in outputs],
-                    artifacts=artifacts,
-                    timing={
-                        "relay_and_render": round(response.queue_wait_s, 2),
-                        "download": round(response.download_s, 2),
-                        "local": round(local_s, 2),
-                        "total": round(elapsed, 2),
-                    },
-                    base_url=creds.base_url,
-                )
+            _print_timing(job_label, response, local_s, elapsed)
+            _warn_if_extra_artifacts(spec["n"], artifacts)
+            _info(f"{job_label} completed in {elapsed:.1f}s")
+            rec = _report_record(
+                command="generate-batch",
+                model=spec["model"],
+                prompt=final_prompt,
+                artifacts=artifacts,
+                timing={
+                    "relay_and_render": round(response.queue_wait_s, 2),
+                    "download": round(response.download_s, 2),
+                    "local": round(local_s, 2),
+                    "total": round(elapsed, 2),
+                },
+                base_url=creds.base_url,
+                pipeline_info=pipeline_info,
+                preflight=spec["preflight"],
+                job=i,
             )
-            return i, None
-        except (RelayError, SystemExit) as exc:
-            any_failed = True
-            message = exc.args[0] if isinstance(exc, SystemExit) and exc.args else str(exc)
-            print(f"{job_label} failed: {message}", file=sys.stderr)
+            return i, True, rec
+        except RelayError as exc:
+            desc = _failure_dict(exc, secrets=secrets)
+            _info(f"{job_label} failed:")
+            _print_failure_lines(desc, str(exc), secrets=secrets)
+            rec = {
+                "ok": False,
+                "job": i,
+                "command": "generate-batch",
+                "model": spec["model"],
+                "error": desc,
+            }
             if args.fail_fast:
                 raise
-            return i, str(message)
+            return i, False, rec
+        except SystemExit as exc:
+            msg = str(exc.args[0]) if exc.args else "exited"
+            _info(f"{job_label} failed: {msg}")
+            rec = {
+                "ok": False,
+                "job": i,
+                "command": "generate-batch",
+                "model": spec["model"],
+                "error": describe_failure(msg, secrets=secrets),
+            }
+            if args.fail_fast:
+                raise
+            return i, False, rec
 
+    ordered_results: List[Tuple[int, bool, Dict[str, Any]]] = []
     if args.concurrency == 1:
-        for index, job in enumerate(jobs, start=1):
-            run_job(index, job)
+        for spec in prepared_jobs:
+            ordered_results.append(run_job(spec))
     else:
         with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-            futures = [
-                pool.submit(run_job, index, job)
-                for index, job in enumerate(jobs, start=1)
-            ]
+            futures = [pool.submit(run_job, spec) for spec in prepared_jobs]
             for future in futures:
-                future.result()
+                ordered_results.append(future.result())
+
+    ordered_results.sort(key=lambda t: t[0])
+    records = [rec for _i, _ok, rec in ordered_results]
+    any_failed = any(not ok for _i, ok, _rec in ordered_results)
 
     if args.report_json:
-        target = Path(args.report_json)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(records, indent=2, ensure_ascii=False), encoding="utf-8")
-        _info(f"Wrote report {target}")
+        _write_report(args.report_json, records)
 
     return 1 if any_failed else 0
 
 
-def _generate_batch(args: argparse.Namespace) -> None:
-    exit_code = _run_generate_batch(args)
+def _generate_batch(args: argparse.Namespace, creds: RelayCredentials) -> None:
+    exit_code = _run_generate_batch(args, creds)
     if exit_code:
         raise SystemExit(exit_code)
-
-
-def _check_model(creds: RelayCredentials, model: str, timeout: float) -> None:
-    payload = _list_models(creds, timeout)
-    ids = [str(item.get("id")) for item in payload.get("data", []) if isinstance(item, dict)]
-    if model not in ids:
-        _die(
-            f"model `{model}` is not exposed by this relay. Available image models: "
-            f"{', '.join(_image_model_ids(payload)) or 'none'}"
-        )
-    _info(f"Model check passed: {model} is exposed by the relay ({len(ids)} models total).")
 
 
 def _image_model_ids(payload: Dict[str, Any]) -> List[str]:
@@ -3037,9 +3606,7 @@ def _image_model_ids(payload: Dict[str, Any]) -> List[str]:
 
 def _list_models(creds: RelayCredentials, timeout: float) -> Dict[str, Any]:
     url = f"{creds.base_url}/models"
-    response = _http_request(
-        url, api_key=creds.api_key, timeout=timeout, method="GET"
-    )
+    response = _http_request(url, api_key=creds.api_key, timeout=timeout, method="GET", label="[models]")
     try:
         payload = json.loads(_decode_body(response.body))
     except Exception as exc:
@@ -3049,10 +3616,19 @@ def _list_models(creds: RelayCredentials, timeout: float) -> Dict[str, Any]:
     return payload
 
 
-def _models_command(args: argparse.Namespace) -> None:
-    creds = _resolve_credentials(args)
-    _ensure_credentials(creds, dry_run=False)
-    payload = _list_models(creds, args.timeout)
+def _check_model(creds: RelayCredentials, model: str, timeout: float) -> None:
+    payload = _list_models(creds, timeout)
+    ids = [str(item.get("id")) for item in payload.get("data", []) if isinstance(item, dict)]
+    if model not in ids:
+        _die(
+            f"model `{model}` is not exposed by this relay. Available image models: "
+            f"{', '.join(_image_model_ids(payload)) or 'none'}"
+        )
+    _info(f"Model check passed: {model} is exposed by the relay ({len(ids)} models total).")
+
+
+def _models_command(args: argparse.Namespace, creds: RelayCredentials) -> None:
+    payload = _list_models(creds, args.timeout or DEFAULT_STANDARD_TIMEOUT_SECONDS)
     ids = [str(item.get("id")) for item in payload.get("data", []) if isinstance(item, dict)]
     print(f"Relay: {creds.base_url}")
     print(f"Models total: {len(ids)}")
@@ -3062,31 +3638,13 @@ def _models_command(args: argparse.Namespace) -> None:
 
 
 # --------------------------------------------------------------------------
-# Argument parsing
+# Argument Parsing (Official _add_shared_args + # [relay] flags)
 # --------------------------------------------------------------------------
 
 
 def _add_shared_args(parser: argparse.ArgumentParser) -> None:
+    # Official imagegen CLI flags (order & names kept identical to official)
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    # 【2026-11-19】网页管线三件套（只对网页管线生效，原生路会忽略）
-    parser.add_argument(
-        "--web-mode",
-        choices=("chat", "work"),
-        default=None,
-        help="网页管线的 surface：chat（默认，生图通过率更高）/ work（做卡片/素材，可反复改）",
-    )
-    parser.add_argument(
-        "--effort",
-        choices=tuple(EFFORT_ORDER),
-        default=None,
-        help="网页管线推理档：none/minimal/low/medium/high/xhigh/max/ultra（仅 generate/edit 生效；"
-        "reference 路由请用 --reasoning-effort）",
-    )
-    parser.add_argument(
-        "--agent-model",
-        default=None,
-        help="直接指定上游推理模型 slug（默认自动；一般用 --effort 就够）",
-    )
     parser.add_argument("--prompt")
     parser.add_argument("--prompt-file")
     parser.add_argument("--n", type=int, default=1)
@@ -3104,64 +3662,87 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-augment", dest="augment", action="store_false")
     parser.set_defaults(augment=True)
 
-    # Prompt augmentation hints
-    parser.add_argument("--use-case")
-    parser.add_argument("--scene")
-    parser.add_argument("--subject")
-    parser.add_argument("--style")
-    parser.add_argument("--composition")
-    parser.add_argument("--lighting")
-    parser.add_argument("--palette")
-    parser.add_argument("--materials")
-    parser.add_argument("--text")
-    parser.add_argument("--constraints")
-    parser.add_argument("--negative")
+    # Prompt augmentation hints (official 11 fields)
+    for flag in (
+        "--use-case", "--scene", "--subject", "--style", "--composition",
+        "--lighting", "--palette", "--materials", "--text", "--constraints", "--negative",
+    ):
+        parser.add_argument(flag)
 
-    # Post-processing (optional): generate an additional downscaled copy for fast web loading.
+    # Post-processing (official)
     parser.add_argument("--downscale-max-dim", type=int)
-    # [relay] exact delivered pixels: the upstream ignores `size`, so we resample locally.
-    # [relay] 比例预设：不给值则需自己传 --size / --exact-size
-    parser.add_argument("--preset", type=str, default=None,
-                        help="ratio preset like 16:9@2k or 9:16@4k (sets ratio hint + exact pixels)")
-    parser.add_argument("--exact-size", dest="exact_size", type=_parse_exact_size, default=None,
-                        help="resample the delivered file to exactly WxH (e.g. 1024x1536)")
-    parser.add_argument("--fit", dest="exact_fit", choices=("cover", "contain"), default="cover",
-                        help="with --exact-size: cover = crop to fill (default), contain = letterbox")
     parser.add_argument("--downscale-suffix", default=DEFAULT_DOWNSCALE_SUFFIX)
-    # 【2026-11-06】上游对话钥匙：默认复用上次的（改图会接着同一个对话），--new-conv 换新的
+
+    # [relay] web-pipeline controls, presets, conversation continuity & resilience
+    parser.add_argument(
+        "--web-mode",
+        choices=("chat", "work"),
+        default=None,
+        help="网页管线的 surface：chat（默认，生图通过率更高）/ work（做卡片/素材，4 档滑杆）",
+    )
+    parser.add_argument(
+        "--effort",
+        choices=EFFORT_ORDER,
+        default=None,
+        help=f"网页管线推理档：{'/'.join(EFFORT_ORDER)}（chat 3 档：none/standard/extended；"
+        "work 4 档：minimal/low/standard/extended；reference 路由请用 --reasoning-effort）",
+    )
+    parser.add_argument(
+        "--agent-model",
+        default=None,
+        help="直接指定上游推理模型 slug（传 auto 可临时覆盖 config.json 回到自动）",
+    )
     parser.add_argument(
         "--conv-key",
         dest="conv_key",
         default=None,
-        help="指定上游对话钥匙（style.mssk_conv）。同一个钥匙 = 同一个上游对话，改图会基于上一张",
+        help="指定上游对话钥匙（style.mssk_conv）。同一钥匙 = 同一上游对话",
     )
     parser.add_argument(
         "--new-conv",
         dest="new_conv",
         action="store_true",
-        help="换一把新钥匙（开一个全新上游对话）；之后继续沿用这把",
+        help="换一把新钥匙（开一个全新上游对话）；请求成功后更新本地默认钥匙",
     )
-    # 【2026-11-06】GIF 速度档：1 = 原速，0.25~2 共 8 档（对齐官方）。
-    # 走 style.mssk_gif_speed —— new-api 会丢掉顶层自定义字段，style 是 json.RawMessage 能透传。
     parser.add_argument(
         "--gif-speed",
         dest="gif_speed",
         default=None,
         choices=["0.25", "0.5", "0.75", "1", "1.25", "1.5", "1.75", "2"],
-        help="GIF 播放速度档位（0.25~2，8 档）。只影响动图的 frame_duration_ms，GIF 文件本身是 1x",
+        help="GIF 播放速度档位（0.25~2，8 档）。只影响 animation.frame_duration_ms，GIF 文件本身是 1x",
     )
-
-    # [relay] relay-specific switches
+    parser.add_argument(
+        "--preset",
+        type=str,
+        default=None,
+        help="ratio preset like 16:9@2k or 9:16@4k (sets ratio hint + exact delivered pixels)",
+    )
+    parser.add_argument(
+        "--exact-size",
+        dest="exact_size",
+        type=_parse_exact_size,
+        default=None,
+        help="resample the delivered file to exactly WxH (e.g. 1024x1536)",
+    )
+    parser.add_argument(
+        "--fit",
+        dest="exact_fit",
+        choices=("cover", "contain"),
+        default="cover",
+        help="with --exact-size: cover = crop to fill (default), contain = letterbox",
+    )
     parser.add_argument("--base-url", help="override the relay base URL (token still comes from config.json)")
-    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="per-request HTTP timeout in seconds (auto: 150s normal / 300s heavy)",
+    )
     parser.add_argument(
         "--deadline",
         type=float,
-        default=DEFAULT_DEADLINE_SECONDS,
-        help=(
-            "overall wall-clock budget for one job in seconds; the CLI aborts cleanly instead "
-            "of grinding for tens of minutes (default: %(default)s)"
-        ),
+        default=None,
+        help="overall wall-clock budget for one job in seconds (auto: 240s normal / 480s heavy)",
     )
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--check-model", action="store_true")
@@ -3171,32 +3752,47 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
         "--preflight",
         choices=["off", "auto", "always"],
         default="off",
-        help=(
-            "coverage preflight. OFF by default: your prompt is sent exactly as written and the "
-            "CLI never rewrites it. auto = only for person/character prompts; always = every "
-            "request. When enabled it neutralises body/garment vocabulary and appends one "
-            "clothing/coverage constraint, printing every change."
-        ),
-    )
-    parser.add_argument(
-        "--retry-refusal",
-        type=int,
-        default=0,
-        metavar="N",
-        help=(
-            "OFF by default. N>0 re-sends a refused request up to N extra times with a "
-            "semantically neutral variation, because the upstream output-side gate is stochastic "
-            "(identical bodies are cached and return the same refusal). Useful for production, but "
-            "it hides the single-attempt rate -- leave it at 0 when you are measuring."
-        ),
+        help="coverage preflight (default: off; auto = person prompts only; always = all)",
     )
     parser.add_argument(
         "--no-preflight",
         dest="preflight",
         action="store_const",
         const="off",
-        help="shorthand for --preflight off (already the default)",
+        help="shorthand for --preflight off (default)",
     )
+    parser.add_argument(
+        "--retry-refusal",
+        type=int,
+        default=0,
+        metavar="N",
+        help="retry stochastic output-stage content-safety refusals up to N extra times (default: 0)",
+    )
+
+
+def _apply_config_web_defaults(args: argparse.Namespace) -> None:
+    """将 config.json 固化的网页三件套仅注入支持网页管线的子命令，并记录每个参数的来源。"""
+    cmd = getattr(args, "command", "")
+    explicit: Set[str] = set()
+    for attr in ("agent_model", "effort", "web_mode", "conv_key", "new_conv", "gif_speed"):
+        val = getattr(args, attr, None)
+        if val not in (None, False, ""):
+            explicit.add(attr)
+    args._cli_explicit = explicit
+
+    sources: Dict[str, str] = {}
+    if cmd in WEB_PIPELINE_COMMANDS:
+        defaults = _config_defaults()
+        for attr in ("agent_model", "effort", "web_mode"):
+            cur = getattr(args, attr, None)
+            if cur not in (None, ""):
+                sources[attr] = "flag"
+            elif defaults.get(attr):
+                setattr(args, attr, defaults[attr])
+                sources[attr] = "config"
+            else:
+                sources[attr] = "default"
+    args._web_sources = sources
 
 
 def main() -> int:
@@ -3212,6 +3808,11 @@ def main() -> int:
 
     gen_parser = subparsers.add_parser("generate", help="Create a new image")
     _add_shared_args(gen_parser)
+    gen_parser.add_argument(
+        "--strict-n",
+        action="store_true",
+        help="on the web pipeline with --n > 1, run N sequential n=1 calls to deliver exactly N images",
+    )
     gen_parser.set_defaults(func=_generate)
 
     batch_parser = subparsers.add_parser(
@@ -3219,11 +3820,14 @@ def main() -> int:
         help="Generate multiple prompts concurrently (JSONL input)",
     )
     _add_shared_args(batch_parser)
-    batch_parser.add_argument(
-        "--input", required=True, help="Path to JSONL file (one job per line)"
-    )
+    batch_parser.add_argument("--input", required=True, help="Path to JSONL file (one job per line)")
     batch_parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     batch_parser.add_argument("--fail-fast", action="store_true")
+    batch_parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="resume-friendly: skip jobs whose output file(s) already exist and are non-empty",
+    )
     batch_parser.set_defaults(func=_generate_batch)
 
     edit_parser = subparsers.add_parser("edit", help="Edit an existing image")
@@ -3239,15 +3843,14 @@ def main() -> int:
     edit_parser.add_argument("--input-fidelity")
     edit_parser.set_defaults(func=_edit)
 
-    # [relay] diagnostics only
     models_parser = subparsers.add_parser(
         "models", help="List the image-capable models this relay exposes"
     )
     models_parser.add_argument("--base-url")
-    models_parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
+    models_parser.add_argument("--timeout", type=float, default=DEFAULT_STANDARD_TIMEOUT_SECONDS)
     models_parser.add_argument("--report-json")
     models_parser.set_defaults(func=_models_command)
-    # [relay] 网页管线的推理档表（与 web 前端同一套名字），纯本地输出，不发请求
+
     tiers_parser = subparsers.add_parser(
         "tiers", help="List web-pipeline reasoning tiers (same names as the web UI)"
     )
@@ -3255,17 +3858,22 @@ def main() -> int:
     tiers_parser.add_argument("--json", action="store_true")
     tiers_parser.add_argument("--efforts", action="store_true", help="只列档位（需配合 --mode）")
     tiers_parser.set_defaults(func=_cmd_tiers)
-    # [relay] 把「驱动模型 / 推理档 / surface」固化进 config.json（首次提问后调用）
+
     setup_parser = subparsers.add_parser(
-        "setup", help="记住网页管线的模型/档位/surface（写进 config.json）"
+        "setup", help="查看或记住网页管线的模型/档位/surface（写进 config.json）"
     )
     setup_parser.add_argument("--agent-model", default=None, help="上游 slug；传 auto 或空串表示清除")
-    setup_parser.add_argument("--effort", choices=tuple(EFFORT_ORDER), default=None)
+    setup_parser.add_argument("--effort", choices=EFFORT_ORDER, default=None)
     setup_parser.add_argument("--web-mode", choices=("chat", "work"), default=None)
+    setup_parser.add_argument(
+        "--show",
+        action="store_true",
+        help="只读查看当前配置状态（绝不输出 api_key，适合 agent 检查是否已首次配置）",
+    )
+    setup_parser.add_argument("--json", action="store_true", help="配合 --show 输出 JSON")
+    setup_parser.add_argument("--base-url", default=None, help=argparse.SUPPRESS)
     setup_parser.set_defaults(func=_cmd_setup)
 
-    # [relay] the official skill's *primary* path, wired to this relay:
-    # reference-image generation through Responses + the hosted image_generation tool.
     ref_parser = subparsers.add_parser(
         "reference",
         help="Generate from reference image(s) via /v1/responses + the image_generation tool",
@@ -3288,76 +3896,56 @@ def main() -> int:
         "--reasoning-effort",
         choices=["low", "medium", "high", "xhigh"],
         default=None,
-        help=(
-            "reasoning effort for the chat model that drives the image tool. Sent as "
-            "reasoning.effort; do NOT use a -high model-name suffix, the relay answers 500 for those"
-        ),
+        help="reasoning effort for the chat model that drives the image tool (sent as reasoning.effort)",
     )
     ref_parser.set_defaults(func=_reference, model=DEFAULT_RESPONSES_MODEL)
 
     args = parser.parse_args()
+    _apply_config_web_defaults(args)
 
-    # 【2026-11-19】命令行没给 → 用 config.json 里记住的选择（首次提问后存下的）
-    # ⚠️ setup 例外：它就是用来「改配置」的，不能被旧值盖住（否则清除模型永远清不掉）。
-    if getattr(args, "command", "") != "setup":
-        _defaults = _config_defaults()
-        for _attr in ("agent_model", "effort", "web_mode"):
-            if getattr(args, _attr, None) in (None, "") and _defaults.get(_attr):
-                setattr(args, _attr, _defaults[_attr])
+    if args.command in ("tiers", "setup"):
+        return int(args.func(args) or 0)
+
+    if args.command == "models":
+        creds = _resolve_credentials(args)
+        _ensure_credentials(creds, dry_run=False)
+        try:
+            args.func(args, creds)
+        except RelayError as exc:
+            _emit_failure(exc, args, secrets=(creds.api_key,) if creds.api_key else ())
+        except KeyboardInterrupt:
+            _die("interrupted; nothing was written", code=130)
+        return 0
 
     _apply_preset(args)
 
-    global _EXACT_SIZE_REQUEST, _EXACT_FIT_REQUEST
-    _EXACT_SIZE_REQUEST = getattr(args, "exact_size", None)
-    _EXACT_FIT_REQUEST = getattr(args, "exact_fit", "cover")
+    if args.command in WEB_PIPELINE_COMMANDS:
+        _validate_web_controls(
+            getattr(args, "web_mode", None),
+            getattr(args, "effort", None),
+            getattr(args, "agent_model", None),
+        )
 
-    if args.command in ("models", "tiers", "setup"):
-        args.func(args)
-        return 0
-
-    if args.n < 1 or args.n > 10:
-        _die("--n must be between 1 and 10")
     if getattr(args, "concurrency", 1) < 1 or getattr(args, "concurrency", 1) > 25:
         _die("--concurrency must be between 1 and 25")
     if getattr(args, "max_attempts", 3) < 1 or getattr(args, "max_attempts", 3) > 10:
         _die("--max-attempts must be between 1 and 10")
-    if args.output_compression is not None and not (0 <= args.output_compression <= 100):
-        _die("--output-compression must be between 0 and 100")
     if args.command == "generate-batch" and not args.out_dir:
         _die("generate-batch requires --out-dir")
-    if (
-        getattr(args, "downscale_max_dim", None) is not None
-        and args.downscale_max_dim < 1
-    ):
+    if getattr(args, "downscale_max_dim", None) is not None and args.downscale_max_dim < 1:
         _die("--downscale-max-dim must be >= 1")
-    if args.timeout <= 0:
+    if args.timeout is not None and args.timeout <= 0:
         _die("--timeout must be > 0")
-    if args.deadline <= 0:
+    if args.deadline is not None and args.deadline <= 0:
         _die("--deadline must be > 0")
 
-    _validate_size(args.size, args.model, strict=args.strict_size)
-    if args.command == "reference":
-        # [relay] the responses route is driven by a chat model, not by gpt-image-*
-        _validate_quality(args.quality)
-        _validate_background(args.background)
-    else:
-        _validate_model(args.model)
-        _validate_quality(args.quality)
-        _validate_background(args.background)
-        _validate_moderation(args.moderation)
-        _validate_model_specific_options(
-            model=args.model,
-            background=args.background,
-            input_fidelity=getattr(args, "input_fidelity", None),
-        )
-    _ensure_credentials(_resolve_credentials(args), dry_run=args.dry_run)
+    creds = _resolve_credentials(args)
+    _ensure_credentials(creds, dry_run=args.dry_run)
 
     try:
-        args.func(args)
+        args.func(args, creds)
     except RelayError as exc:
-        # [relay] content-safety refusals, token problems and channel errors must read as a
-        # one-line message, never as a Python traceback.
-        _emit_failure(exc, args)
+        _emit_failure(exc, args, secrets=(creds.api_key,) if creds.api_key else ())
     except KeyboardInterrupt:
         _die("interrupted; nothing was written", code=130)
     return 0

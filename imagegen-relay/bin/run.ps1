@@ -1,9 +1,8 @@
 # imagegen-relay launcher  --  ASCII only on purpose (no BOM/encoding issues)
 #
 # Reads config.json from the skill root, injects IMAGE_RELAY_URL / IMAGE_RELAY_KEY,
-# then runs the relay CLI with the system Python. This is what makes "copy the
-# folder + fill one token" a complete install: no environment variables, no client
-# restart, no packages to install.
+# then runs the relay CLI with Python 3 (zero third-party deps required for core paths;
+# Pillow is only needed for --exact-size / --preset / --downscale / JPEG/WebP conversion).
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File run.ps1 generate --prompt "..." --size 1672x941 --out "out.png"
@@ -14,7 +13,6 @@ $cfgPath = Join-Path $root 'config.json'
 $cliPath = Join-Path $root 'scripts\image_gen.py'
 
 # Keep non-ASCII output (Chinese error text from the relay, non-ASCII paths) intact:
-# Windows PowerShell decodes native-command output with [Console]::OutputEncoding.
 try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
 $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 
@@ -50,7 +48,10 @@ if (-not $key -and $env:OPENAI_API_KEY)   { $key = $env:OPENAI_API_KEY.Trim() }
 if ($url) { $env:IMAGE_RELAY_URL = $url }
 if ($key) { $env:IMAGE_RELAY_KEY = $key }
 
-# pick an interpreter: prefer python, fall back to the py launcher
+# Pick an interpreter:
+#   1. If system Python already has Pillow (or no uv is installed), run it directly
+#      (fast startup, zero network / PyPI dependency in restricted sandboxes).
+#   2. Otherwise, if `uv` is available, use `uv run --with pillow` (works even without system python).
 $exe = ''
 $pre = @()
 $pyCmd = Get-Command python -ErrorAction SilentlyContinue
@@ -61,21 +62,25 @@ if ($pyCmd) {
     if ($pyLauncher) { $exe = $pyLauncher.Source; $pre = @('-3') }
 }
 
-if (-not $exe) {
-    Write-Host "[imagegen-relay] Python 3 was not found on PATH."
-    Write-Host "  Install Python 3.9+ or make sure 'python' is available in this shell."
-    exit 5
+$uvCmd = Get-Command uv -ErrorAction SilentlyContinue
+
+if ($exe) {
+    $hasPil = $false
+    try {
+        & $exe @pre -c "import PIL" 2>$null
+        if ($LASTEXITCODE -eq 0) { $hasPil = $true }
+    } catch { }
+    if ($hasPil -or (-not $uvCmd)) {
+        & $exe @pre $cliPath @args
+        exit $LASTEXITCODE
+    }
 }
 
-# Prefer `uv` when it is installed: it supplies Pillow on the fly (needed by --max-dim and
-# --exact-size) without installing anything into the user's Python. Without uv we run the
-# system interpreter -- every other flag works with the standard library alone.
-# Never retry after a non-zero exit: the CLI uses exit codes for real outcomes.
-$uvCmd = Get-Command uv -ErrorAction SilentlyContinue
 if ($uvCmd) {
     & $uvCmd.Source run --quiet --no-project --with pillow python $cliPath @args
     exit $LASTEXITCODE
 }
 
-& $exe @pre $cliPath @args
-exit $LASTEXITCODE
+Write-Host "[imagegen-relay] Python 3 was not found on PATH."
+Write-Host "  Install Python 3.9+ or make sure 'python' (or 'uv') is available in this shell."
+exit 5

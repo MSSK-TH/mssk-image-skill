@@ -1,652 +1,169 @@
 ---
 name: "imagegen-relay"
-description: "Generate or edit raster images through the MSSK relay (gpt-image-2). This is the image path on this Codex installation: the built-in image_gen tool does not work with a custom/relay model provider. Use whenever the user asks for a bitmap image -- 生图, 画图, 生成图片, 配图, 出图, 改图, 修图 -- or when a task needs photos, illustrations, posters, storyboards, character sheets, sprites, product shots, UI mockups, infographics, textures, or transparent-background cutouts. Do not substitute SVG/HTML/canvas/PIL/matplotlib when the user wants a bitmap. Images only, never video."
+description: "Generate or edit raster images through the MSSK relay (gpt-image-2 / codex-gpt-image-2) when the task benefits from AI-created bitmap visuals such as photos, illustrations, textures, sprites, mockups, posters, character sheets, or transparent-background cutouts. This is the image path on this Codex installation: the built-in image_gen tool does not work with a custom/relay model provider. Use whenever the user asks for a bitmap image -- 生图, 画图, 生成图片, 配图, 出图, 改图, 修图 -- and do not substitute SVG/HTML/canvas/PIL/matplotlib when the user wants a bitmap. Do not use when the task is better handled by editing existing SVG/vector/code-native assets, extending an established icon or logo system, or building the visual directly in HTML/CSS/canvas. Images only, never video."
 ---
 
-# Image Generation (Relay)
+# Image Generation Skill (Relay)
 
-Generates or edits images for the current project -- website assets, game assets, UI mockups,
-product mockups, posters, storyboards, character sheets, infographics, transparent cutouts.
+Generates or edits images for the current project (for example website assets, game assets, UI mockups, product mockups, wireframes, logo design, photorealistic images, character sheets, or infographics).
 
-This skill is the relay counterpart of Codex's built-in `imagegen` skill. The prompt craft,
-the use-case taxonomy, the CLI surface, and the iteration discipline are deliberately identical
-to that skill. What differs is the transport: requests go to the MSSK relay instead of the
-OpenAI backend, so a few of the official promises do not hold here. Those differences are listed
-below and they win wherever the two disagree.
+This skill is the relay counterpart of Codex's built-in `imagegen` skill. The prompt craft, use-case taxonomy, CLI surface, and iteration discipline stay aligned with official `imagegen`; what differs is the transport (MSSK relay instead of OpenAI built-in `image_gen` / `api.openai.com`), documented below and winning wherever the two disagree.
 
-## Relay facts (read first)
+## Relay modes and rules
 
-### 1. Two routes inside one CLI -- mirroring the official skill
+With a custom/relay provider, Codex does not expose the built-in `image_gen` tool. All image requests go through the bundled launcher (`bin/run.cmd` on Windows, `bin/run.sh` on macOS/Linux), which injects `config.json` credentials and exposes both relay routes:
 
-The official skill has two layers: the built-in `image_gen` tool (a **Responses-API hosted tool**
-that the chat model drives) and a fallback CLI that calls the **Images API** directly. This relay
-exposes both, so this skill exposes both, through one launcher.
-
-| Route | Subcommand(s) | Wire call | Use it for |
+| Route | Subcommand(s) | Wire call | Role |
 | --- | --- | --- | --- |
-| **Tool route** -- the official "built-in" analogue | `reference` | `POST /v1/responses` with `tools:[{"type":"image_generation"}]` | Anything that starts from reference image(s): "put this character/object into X", style transfer, scene compositing, identity-preserving variants. **Preferred for reference work.** |
-| **Images route** -- the official "fallback CLI" analogue | `generate`, `edit`, `generate-batch` | `POST /v1/images/generations`, `POST /v1/images/edits` | Text-only generation, `--n` variants, batch JSONL, masks, explicit size/format/quality handling |
+| **Images route** (primary) | `generate`, `edit`, `generate-batch` | `POST /v1/images/generations`, `POST /v1/images/edits` | Default path for text-to-image, edits, batches, and ratio-locked reference work. Carries full web-session pipeline controls (`style.mssk_*`), conversation continuity, and `degraded` reporting. |
+| **Responses tool route** | `reference` | `POST /v1/responses` + `tools:[{"type":"image_generation"}]` | Chat-model-driven reference generation. Use when you must **change aspect ratio** from the reference image or want a chat model to freely reinterpret pure style/composition references. Ignores `style.mssk_*` / `setup` defaults (use `--reasoning-effort`). |
 
-```powershell
-# tool route: the model integrates the reference itself
-& "$env:USERPROFILE\.codex\skills\imagegen-relay\bin\run.cmd" reference `
-  --image "character.png" --prompt "..." --out "output/imagegen/card.png"
-
-# images route: pure text generation, or pixel-level edits with explicit controls
-& "$env:USERPROFILE\.codex\skills\imagegen-relay\bin\run.cmd" generate `
-  --prompt "..." --size 1672x941 --out "output/imagegen/hero.png"
-```
+Two image model slugs on `generate` / `edit` / `generate-batch` (any other slug fails with `no_channel`):
+- `gpt-image-2` (**default**): web session pipeline first (~25–45 s, higher pass rate), auto-falls back to the native subscription endpoint (`degraded: true` + `degraded_reason`).
+- `codex-gpt-image-2`: native subscription endpoint only (~15–30 s, stricter safety gate, no fallback; ignores `--web-mode`/`--effort`/`--agent-model`).
 
 Rules:
-
-- Always call the launcher; it is what injects the relay URL and token.
-- Never build one-off wrappers around it, and never rewrite the transport to add an SDK.
-- `--dry-run` is free: no network, no token, and it echoes the exact payload.
-- The two routes do **not** share an upstream safety gate -- see fact 7 for which one refuses what.
-
-### 2. Two model slugs, two pipelines (both served by this relay)
-
-`--model` picks **which pipeline** the relay uses. Both reach the same upstream account; the
-difference is the judgement that decides whether an image is allowed through.
-
-| `--model` | Pipeline | Measured speed | Refusal means |
-| --- | --- | --- | --- |
-| `gpt-image-2` (**default**) | **Web pipeline first** (`backend-api/f/conversation` + `system_hints:["picture_v2"]`), auto-falls back to the native endpoint when the web attempt is refused | ~26-45 s (adds ~20 s only when it falls back) | **both** pipelines tried and refused |
-| `codex-gpt-image-2` | **Native subscription endpoint only** (`/backend-api/codex/images/*`) | ~15-30 s | native refused; no fallback |
-
-Rules of thumb:
-- **Default to `gpt-image-2`** — higher pass rate. Measured: a reference-image card request that the
-  native endpoint refused 6/6 went through on the first web attempt.
-- Use `codex-gpt-image-2` only when the caller needs **speed** or explicitly wants the Codex path.
-- Never promise a third image model name: any other slug fails with `No available channel`.
-
-### 3. Resolution: upstream render is fixed, delivered size is yours
-
-The upstream always renders at roughly **1.57 MP** per ratio and cannot be talked into anything else
-(`size` is ignored; measured 16:9 -> 1672x941, 1:1 -> 1254x1254). Two separate layers:
-
-1. **Ratio** -- pass `--size`; the relay folds it into one aspect-ratio requirement line.
-2. **Delivered pixels** -- `--preset <ratio>@<2k|4k>` or `--exact-size WxH` (local Lanczos resample;
-   `--fit cover` crops to fill, `--fit contain` letterboxes).
-
-| User asks for | Pass | Delivered file | Native render behind it |
-| --- | --- | --- | --- |
-| 1:1 / avatar | `--preset 1:1@2k` | 2048x2048 | ~1254x1254 (1.63x upscale) |
-| 16:9 / wallpaper | `--preset 16:9@2k` | 2048x1152 | ~1672x941 (1.22x) |
-| 16:9 at 4K | `--preset 16:9@4k` | 3840x2160 | same native render, 2.3x upscale |
-| 9:16 vertical | `--preset 9:16@2k` | 1152x2048 | ~941x1672 |
-| square, small | `--size 1254x1254` (no preset) | 1254x1254 | native, no resample |
-| anything else | `--size <same ratio> --exact-size WxH` | exactly WxH | resampled |
-
-- `--preset` accepts 11 ratios: `1:1 3:2 2:3 4:3 3:4 16:9 9:16 2:1 1:2 7:4 4:7`, each at `2k` or `4k`.
-- It validates **before** the paid call: 16-pixel alignment, max edge 4096, total-pixel range, and it
-  refuses a `--preset` that fights an explicit `--exact-size`.
-- When the resample factor is above 1.5x, say the file was **upscaled locally** -- do not imply real
-  4K detail. Never describe the native render itself as "2K" or "4K".
-- `edit` ignores the ratio part of `--preset` (the reference image sets the composition); only the
-  delivered size applies.
-
-| Ratio the user wants | Pass `--size` | Native output |
-| --- | --- | --- |
-| 1:1 square / avatar | `1254x1254` | 1254x1254 |
-| 16:9 widescreen / desktop wallpaper | `1672x941` | 1672x941 |
-| 9:16 vertical / phone wallpaper | `941x1672` | 941x1672 |
-| ultra-wide | `2206x713` | 2206x713 |
-| 3:2 | `1536x1024` | 1536x1024 |
-| 4:3 | `1448x1086` | 1448x1086 |
-
-- User named a ratio -> pass the matching `--size`. **Do not write the ratio into the prompt**;
-  the relay already folds `size` into one aspect-ratio requirement line.
-- User named no ratio -> leave `--size` alone (`auto` -> 1:1).
-- `2206x713` is **3.09:1, not 21:9**. If the user asks for 21:9, say this relay's ultra-wide is
-  wider than that and there is no exact 2.33:1 slot.
-
-### 4. `--quality` is a prompt hint, not a setting
-
-Upstream forces `auto`. The CLI folds `--quality high` into `Quality: high quality, rich detail`
-and `--quality low` into `Quality: keep it simple`, inside the prompt. If the user asks to change
-the quality slider, say honestly that this relay has no such control.
-
-### 5. Transparency is prompt-emulated
-
-`--background transparent` does not send an API parameter: the CLI appends a transparency
-requirement to the prompt and keeps PNG output. Measured on this relay, 46-52% of returned pixels
-came back fully transparent. State the requirement in the prompt as well (isolated subject, no
-backdrop/floor/shadow, clean alpha edges with detail preserved in semi-transparent areas) and
-preserve the alpha channel when saving. If the subject is complex and the alpha comes back dirty,
-fall back to `scripts/remove_chroma_key.py` on a flat-colour render.
-
-### 5a. `--n` on the web pipeline returns *at least* n (measured 2026-11-19)
-
-Asking for 4 variants produced **10 files** (4 square PNGs, 4 other-ratio PNGs, 2 eight-frame GIFs) and
-took **221 s** instead of the usual 25-30 s. That is the shim's design, not a failure: when `n > 1` it
-**drains the whole upstream turn**, so anything the model renders on its own initiative is saved too.
-
-- Extra files are usually welcome (they are free variations) -- the CLI keeps them all and prints a
-  warning with the count.
-- Need **exactly** n images? Call `generate --n 1` several times (verified).
-  `--model codex-gpt-image-2` is *expected* to honour `n` because it bypasses the web pipeline's
-  drain logic, but that specific claim has **not been measured** -- verify before relying on it.
-- Budget the time: an `n>1` web-pipeline run can take 3-4 minutes, not 30 seconds.
-
-### 5a-2. How to tell which pipeline actually served the image (2026-11-19)
-
-Every run now prints one line, **including the surface and effort actually in effect**:
-
-```
-[pipeline] 网页管线（Cookie 会话） · surface=chat（默认） · effort=默认（即时档）
-[pipeline] 网页管线（Cookie 会话） · surface=work（指定） · effort=extended · agent_model=gpt-6-thinking
-Warning: 本次图片来自备用通道（…降级…） · surface/effort 已失效（没走网页管线）
-[pipeline] 按 --model 指定，走原生端点（不经网页管线）
-```
-
-Note the wording **「默认」vs「指定」**: when `--web-mode` is absent the shim uses its own default
-(`chat`); the CLI has not chosen anything, so it says `默认`, never "you selected chat". Same for
-`effort`. When the run degrades, surface/effort are meaningless -- the line says so instead of
-printing a surface that was never applied.
-
-The same info lands in `--report-json` as `pipeline` (`web` / `degraded` / `native`) plus
-`pipeline_note`.
-
-How it is decided (shim contract): a normal web-pipeline response carries **no** `degraded` field; any
-automatic fallback carries `degraded: true` + `degraded_reason`. So:
-
-- no `degraded` + `--model gpt-image-2` -> web pipeline
-- `degraded: true` -> the web pipeline failed and the shim fell back (the reason is in the note)
-- `--model codex-gpt-image-2` -> native endpoint, by request
-
-**Never assume which one ran** -- read this line before telling the user "it went through the web
-pipeline". If it says `degraded`, say so and quote the reason: the image is real but it did not come
-from the path the user expected.
-
-### 5b-0. First web-pipeline image: two questions, then remember (2026-11-19)
-
-Surface first, because **the tier list depends on it**. Then model + tier together, because inside one
-surface the tier list is the same for every model.
-
-**Question 1** — `image_gen.py tiers`
-
-```
-模式：  1)聊天   2)工作
-```
-
-**Question 2** — `image_gen.py tiers --mode <their mode>`
-
-```
-（聊天）模型：1) GPT-6  2) GPT-6.1 Sol  3) GPT-5.6 Sol
-（聊天）档位：1)即时  2)中  3)高                       ← chat: THREE tiers
-
-（工作）模型：1) GPT-6  2) GPT-6.1 Sol  3) GPT-5.6 Sol
-（工作）档位：1)轻度  2)中  3)高  4)极高               ← work: FOUR tiers
-```
-
-Ask the model and the tier **in that one message** (e.g. "模型 1/2/3，档位 1-3"). Do not split them
-into two turns -- within a surface every model shares the same tier list.
-
-Map the names with `tiers --mode <choice> --json` and persist:
-
-```bash
-image_gen.py setup --agent-model gpt-6-thinking --effort high --web-mode chat
-```
-
-Why surface must come first (from `webpipe.mjs`):
-
-| | chat | work |
-| --- | --- | --- |
-| tiers | 3: 即时 / 中 / 高 (Instant / Medium / High) | 4: 轻度 / 中 / 高 / 极高 |
-| what changes | **each tier is its own preset slug** (`gpt-6-instant` vs `gpt-6-thinking`) | slug stays (`-wm` family), only `thinking_effort` changes |
-| effort values | `none` / `standard` / `extended` | `minimal` / `low` / `standard` / `extended` |
-| same tiers for all models? | yes | yes |
-
-`webpipe.mjs` also carries a fifth work value (`max` -> `max`) that the web UI does **not** offer; the
-skill mirrors the UI (advanced users may still pass `--effort max` by hand).
-
-After `setup`, every command inherits the three values; a CLI flag overrides for one run. **Never ask
-again.** If the user says "你随便": 聊天 + GPT-6 + 高, and say which three you used.
-
-### 5b. Web-pipeline controls: surface, effort, agent model (2026-11-19)
-
-The web pipeline has three knobs the native endpoint does not have. All three travel in the
-request's `style` object (`mssk_mode` / `mssk_effort` / `mssk_model`) because `new-api` drops
-unknown **top-level** JSON fields but passes `json.RawMessage` through untouched.
-
-```bash
-image_gen.py generate --prompt "..." --web-mode work --effort extended
-image_gen.py tiers                 # list the tiers (same names as the web UI)
-image_gen.py tiers --mode work --json
-```
-
-| Flag | Values | Default | Notes |
-| --- | --- | --- | --- |
-| `--web-mode` | `chat` / `work` | `chat` | `chat` has the higher pass rate. `work` suits cards / site assets / long iterative edits. Native endpoint ignores it |
-| `--effort` | see `tiers` | unset (instant) | Goes straight into `thinking_effort`. Two naming sets coexist -- **work** slider = `minimal/low/standard/extended/max`; **chat** uses whatever the account's presets declare (`medium/high/xhigh/ultra` seen). Both are accepted here |
-| `--agent-model` | slug | auto | Pick the upstream reasoning model explicitly. Rarely needed -- prefer `--effort` |
-
-Rules:
-
-- **Higher effort is not "better"** -- it is slower and gets refused more often. Do not raise it
-  unless the user asks for more detail, legible text, or repeated refinement.
-- An unsupported effort comes back as `bad_request`; drop one tier and retry once.
-- `work` has no instant tier. Asking for `--web-mode work --effort none` is a contradiction.
-
-### 5c. Conversation continuity is per project (changed 2026-11-19)
-
-`--conv-key` used to live in one file next to `config.json`, so two people (or two projects) on the
-same machine overwrote each other and edits landed in someone else's upstream conversation. The key
-now lives in `<current project>/.imagegen/conv-<hash(user+cwd)>` -- git-style isolation, matching how
-the web app scopes it by `sha256(user) + conversation id`.
-
-- Same directory, consecutive calls -> automatically the same upstream conversation.
-- Two projects in parallel -> isolated automatically.
-- Several threads **inside one project** -> pass `--conv-key <task-name>` explicitly. The web UI does
-  the same thing by giving each conversation its own id.
-- `--new-conv` starts a fresh thread.
-
-### 6. One render takes 20-60 s
-
-That is normal. The CLI waits up to `--timeout` seconds (default 300) and prints a timing line
-(`relay+render`, `download`, `local`, `total`). A `[waiting] …s elapsed` heartbeat prints every
-20 s while a request is in flight, so a slow render is distinguishable from a hang.
-
-- Do not re-issue a request because it "feels slow" -- a second render in parallel makes the
-  session slower, not faster.
-- One job has a hard wall-clock budget: `--deadline` (default 600 s). When it is used up the CLI
-  aborts with a clean message instead of grinding for 20 minutes.
-- Batch concurrency stays at 2. Higher values buy contention, timeouts, and refusals.
-- Keep the path short: one call produces the image. Do not chain dry-run -> generate -> convert ->
-  edit as a warm-up ritual, and do not trigger a package install unless the user asked for
-  something that needs one.
-
-### 7. Content-safety refusals: two gates, and the fix that keeps the intent
-
-There are **two** safety gates, and the latency tells you which one fired:
-
-| Gate | What is judged | Latency | Stable? |
-| --- | --- | --- | --- |
-| Prompt-level | the text you sent | 400 in a few seconds | stable -- always refused |
-| **Output-image level** | the image that was just rendered | **same as a success** (tens of seconds) | **stochastic** -- the same wording sometimes passes |
-
-Everything measured on this relay lands in the second row: refusals came back after ~100-140 s,
-`moderation: low` changed nothing, and re-sending an identical body returned the same cached
-refusal. Deleting words, cropping the reference, shrinking it to 512 px JPEG, or switching to the
-`/responses` tool route all failed.
-
-Why a browser client can pass the same request: **the web app is an agent**. Its chat model rewrites
-and expands your prompt first -- typically filling in clothing, setting and lighting -- before the
-image model ever sees it. An API call sends the prompt verbatim, so the model decides the outfit
-itself and the render drifts over the line. Same picture, different prompt reaching the renderer.
-
-**The fix that keeps the original intent: ADD an explicit coverage constraint instead of deleting
-words.** Measured on the refused baseball card (same reference image, same composition):
-
-| Variant | Result |
-| --- | --- |
-| original request | refused (~106 s) |
-| original + `服装与图1完全一致，为覆盖完整、不透明的运动套装；衣着保守、得体` | **PASS (93 s)** |
-| original + `穿着图1中的完整运动套装（外套、上衣与短裤），覆盖完整不透明` | **PASS (142 s)** |
-| control: original with one unrelated adjective swapped | refused (~106 s) |
-
-So, when a refusal names 性化内容 / 过度暴露 / 露骨:
-
-1. **First check the latency.** Seconds -> prompt-level: remove the offending word. Tens of seconds
-   -> output-level: go to step 2.
-2. **Add a coverage constraint** (clothing fully covering, opaque, consistent with the reference,
-   modest). Write it yourself -- the CLI does **not** add it by default; enable `--preflight auto`
-   only if you would rather have the CLI do it (see "Coverage preflight" below).
-3. **If it is still refused, do not patch the long brief.** Measured: the full "keep every detail"
-   brief plus the coverage line was still refused (153 s), while a **compact neutral brief** with
-   the same intent and the same reference image passed twice (93 s / 142 s). Rewrite instead of
-   appending.
-4. **Do not silently delete or soften the user's own description**, and do not quietly swap the
-   outfit. If the only way through is changing the content, say so and let the user decide.
-5. **Never fabricate a workaround.** Compositing the subject into a background locally is *not*
-   image generation: it changes what the deliverable is. Do it only if the user explicitly asks for
-   compositing as such, and never present it as 生图.
-6. **Relay the upstream text verbatim** and state that this is an upstream policy decision this
-   skill cannot override.
-
-#### Compact neutral brief (the shape that passed)
-
-Long constraint lists are what push the render over the line: enumerating garments and body
-metrics, "keep the clothing coverage unchanged", and a long `Avoid:` inventory all make the
-classifier read the brief as sexualised. When a person edit is refused, rebrief it like this and
-re-send -- short, no body vocabulary, one coverage line:
-
-```text
-Use case: identity-preserve
-Input images: 图1是编辑目标，也是角色外貌、服装、姿势与道具的唯一依据。
-Primary request: 将图1中的角色融入一张完整可见的收藏卡牌；只在角色身后与四周增加卡面背景与边缘装饰。
-Constraints: 保持图1角色的面貌、发型、姿势与道具形态不变；仅新增卡面与边缘装饰。
-Clothing: 服装与参考图一致，覆盖完整、不透明、保守得体。
-Avoid: 其他人物、额外肢体、改变造型、新增文字、水印。
-```
-
-#### Measured pass rates (this reference photo, one channel)
-
-The gate is stochastic, so single results mean nothing. Sample so far:
-
-| Brief style | Results | Pass rate |
-| --- | --- | --- |
-| long "keep every detail" list (agent-written) | 0 pass / 5 refusals | ~0% |
-| compact narrative brief + coverage line | 3 pass / 8 attempts | ~1/3 |
-| compact brief that lets the render **cover the outfit up** (no "keep the outfit identical" clause) | 1 pass / 1 attempt, first try (53.7 s) | high |
-
-Two practical consequences:
-
-- **Keeping the exact outfit is the expensive choice.** Demanding "clothing unchanged" while the
-  upstream wants coverage leaves roughly a 1-in-3 chance per attempt. Letting the render put the
-  character in fully covering sportswear normally succeeds first try.
-- **Retry, because the gate is stochastic.** `--retry-refusal N` (default 2) re-sends with a
-  semantically neutral variation on a refusal -- identical bodies are answered from a cache and
-  would return the same refusal. At a 1/3 pass rate, three attempts reach ~70%, five ~87%.
-  Each attempt costs a full render, so raise `N` deliberately, not by reflex.
-
-#### Coverage preflight (`--preflight`, **off by default**)
-
-**Default is `off`: the CLI sends your prompt exactly as written and never rewrites it.** That keeps
-the request byte-comparable with other clients, which is what you want when you are measuring.
-Enable it deliberately when you want the extra insurance:
-
-- **`auto`** -- only for prompts that mention a person/character;
-- **`always`** -- every request; **`off`** / `--no-preflight` -- never (the default).
-
-When enabled it does two things and **reports every change** on stderr (`[preflight] …`) and in the
-report (`coverage_preflight_applied`):
-
-1. neutralises phrases that pull the render toward a sexualised reading (undergarment nouns, body
-   metrics, "coverage" phrasing, revealing/sexy wording) -- matched with word boundaries, so
-   `surface`, `women`, `factor`, `hero image` and `3D model` are left alone (9/9 negative cases
-   verified);
-2. appends one explicit clothing/coverage constraint in the prompt's language.
-
-The preflight prevents the text-only class of refusals, but it is **not** a substitute for the
-compact brief above: on a long, heavily constrained person brief it was still refused, so treat it
-as the first cheap attempt, not a guarantee.
-
-### 8. Contracts: Codex JSON vs OpenAI multipart
-
-The official Codex client posts to `{provider_base_url}/images/generations` and
-`/images/edits` itself (source: `codex-rs/codex-api/src/endpoint/images.rs`) with a **JSON** body:
-
-```json
-{"images":[{"image_url":"data:image/png;base64,..."}],"prompt":"...","model":"gpt-image-2"}
-```
-
-OpenAI-compatible relays (new-api and friends) expect the **OpenAI Images contract** instead:
-`multipart/form-data` with one `image` file part per input, and they answer a Codex-contract
-request with `400 image is required for /v1/images/edits`.
-
-What this means in practice:
-
-- `edit` tries the Codex contract first and falls back to multipart automatically, reporting which
-  one it used (`[edit] contract used: …`). Nothing else changes for the caller.
-- **Verified limit (2026-10-16):** with a custom/relay provider the Codex client does **not** send
-  the hosted `image_generation` tool at all. Four `codex exec` runs with the provider `base_url`
-  pointed at a translating shim -- including a capture of the raw `/responses` body -- show a tools
-  array containing only harness tools: no `image_generation`, no `images/*` request, no new entry
-  in `$CODEX_HOME/generated_images`, and the model itself reports having no built-in image tool.
-  So neither a relay-side rewrite nor a translation shim brings the built-in `image_gen` back on a
-  relay provider; that tool exists only on the official account path. Never tell a user that a
-  relay-side change will restore it.
-- The contract knowledge still matters for this CLI and for any other client that speaks the Codex
-  images contract (a future Codex build, a script that mimics it): those requests are answered
-  correctly instead of failing with `400 image is required`.
-
-### 9. "It works in the web client but not here"
-
-When the user reports that the same reference image and prompt succeed in a browser client, do not
-guess. Ask for **one** concrete artifact:
-
-1. The working request from the browser: DevTools -> Network -> the image request -> *Copy as cURL*
-   (or the URL plus the request payload).
-2. The relay's own request log for that successful call: endpoint, model, and the token group and
-   channel it was routed to.
-
-The difference is nearly always one of three things: a different endpoint (chat/responses tool vs
-`images/edits`), a different upstream channel behind the same model name (`new-api` routes by token
-group), or a different reference image. Change something in this skill only after that comparison.
-
-### 10. Animated GIF (verified 2026-11-06)
-
-
-**Measured 2026-11-19**: an 8-frame request came back as a real GIF (438x438, 8 frames,
-120 ms/frame, loop=0, 115 KB). No `-sprite.png` was written because the upstream did not
-attach a sprite sheet that time -- the sprite file only appears when upstream includes one.
-Ask for a **loop animation** in the prompt (`…的动画GIF，循环播放`) and the relay's web pipeline
-returns a real animated GIF: `mime_type: "image/gif"`, `GIF89a`, 9-16 frames — plus two extra fields
-in the same `data[i]` item:
-
-```json
-{"b64_json":"…","mime_type":"image/gif",
- "sprite_sheet":"…","animation":{"rows":3,"columns":3,"frame_count":9,"frame_duration_ms":120}}
-```
-
-- `sprite_sheet` is a PNG grid the web UI plays on a canvas (it lives in the upstream
-  `parts[0].metadata.generation`, **not** in the message metadata). The CLI writes it next to the
-  GIF as `<name>-sprite.png` and prints the grid + frame timing.
-- **Never re-encode the GIF.** Pillow keeps only the first frame, so any "convert / resize /
-  exact-size" step destroys the animation. The CLI detects `GIF87a`/`GIF89a`, forces a `.gif`
-  extension, writes the bytes verbatim, and skips `--exact-size` / `--downscale` with a warning.
-- **`--gif-speed {0.25,0.5,0.75,1,1.25,1.5,1.75,2}`** picks one of the 8 official speed tiers. It
-  rides in `style.mssk_gif_speed` (top-level custom fields are dropped by new-api) and only changes
-  `animation.frame_duration_ms` (= base / speed) for the web player; the delivered GIF file stays
-  the 1x original.
-- One turn can return **several images at once** (upstream emits one `image_asset_pointer` per
-  message). The relay returns every new asset as its own `data[i]`; the CLI writes one file per
-  entry (`--out base.png` → `base.png`, `base-1.png`, …). Do not assume `data.length == 1`.
-
-Asking for "4 张不同的图" sometimes yields 1 and sometimes 4-5 — upstream decides. If the count
-matters, say it twice and check `data.length` before reporting.
+- Always call the launcher (`bin/run.cmd` / `bin/run.sh`); never build one-off HTTP wrappers or add an SDK, and never modify `scripts/image_gen.py`.
+- `--dry-run` is free, requires no network/token, makes zero disk writes, and prints the exact wire payload.
+- **Save-path policy** (aligned with official `imagegen`):
+  1. If the user names a destination, write there.
+  2. If the image is meant for the current project, save inside the workspace (prefer `output/imagegen/`), never in OS temp.
+  3. Do not overwrite an existing asset unless the user explicitly asked for replacement (`--force`); otherwise create a sibling versioned filename such as `hero-v2.png` or `item-icon-edited.png`.
+
+### First-run web setup (two steps, then remember)
+
+Before the first web-pipeline image, check status via `setup --show --json` (**never read `config.json` directly**, so `api_key` never enters chat). Only when `configured_web` is `false`, ask in **strictly two turns** (never dump both steps at once, and never split model & tier into three turns):
+
+1. **Step 1 — 模式** (`tiers`): ask `模式：1)聊天  2)工作` (must come first because the tier list depends on surface).
+2. **Step 2 — 模型 + 档位** (`tiers --mode <chat|work>`): ask model and tier **together in one message**:
+   - 聊天（`chat`，3 档）：`模型：1) GPT-6  2) GPT-6.1 Sol  3) GPT-5.6 Sol` / `档位：1)即时(none)  2)中(standard)  3)高(extended)`
+   - 工作（`work`，4 档，对齐网页 UI）：`模型：1) GPT-6  2) GPT-6.1 Sol  3) GPT-5.6 Sol` / `档位：1)轻度(minimal)  2)中(low)  3)高(standard)  4)极高(extended)`（无即时档，`work + --effort none` 会被拒；CLI 高级用法另放行未在网页 UI 展示的第 5 档 `--effort max`）
+3. Map names via `tiers --mode <choice> --json` and save once: `setup --web-mode <m> --agent-model <slug> --effort <e>`. If user says "你随便": use `聊天 + GPT-6 + 高` (`chat` / `gpt-6-thinking` / `extended`) and state what you picked. After `setup`, **never ask again**; CLI flags override per run (`--agent-model auto` overrides back to auto).
+
+### Operating discipline (4 rules that prevent wasted renders)
+
+1. **New topic → `--new-conv`; parallel tasks in one folder → distinct `--conv-key <task>`.** Continuity is per project directory (`<cwd>/.imagegen/conv-<hash>`), so an unrelated topic in the same folder would inherit the previous thread without `--new-conv`.
+2. **Multi-line prompts on Windows → `--prompt-file` (UTF-8).** PowerShell quoting mangles newlines/quotes; the CLI reads `--prompt-file` with `utf-8-sig` (BOM-safe; mutually exclusive with `--prompt`).
+3. **Subject drifted completely off-brief → `--new-conv`, not `edit`.** Continuing a drifted thread anchors the model to the wrong subject; start fresh instead of polishing an unrelated image.
+4. **Watch the heartbeat, then verify 3 items before reporting success.** `[waiting]` every 20 s (`[slow]` if stalled) means the process is alive — never spawn a duplicate parallel run. Only report success when all three align: a `[pipeline]` line (disclose `degraded` + reason if fallback happened), a `Wrote <path>` line, and the file existing on disk.
+
+Shared prompt guidance lives in `references/prompting.md` and `references/sample-prompts.md`. Relay-specific docs: `references/cli.md`, `references/relay-api.md`, `references/safety-refusals.md`, `references/codex-network.md`.
 
 ## When to use
-
-
-- Generate a new image (concept art, product shot, cover, website hero, character sheet)
+- Generate a new image (concept art, product shot, cover, website hero)
 - Generate a new image using one or more reference images for style, composition, or mood
-- Edit an existing image (inpainting, lighting or weather changes, background replacement,
-  object removal, compositing, transparent background)
+- Edit an existing image (inpainting, lighting or weather transformations, background replacement, object removal, compositing, transparent background)
 - Produce many assets or variants for one task
 
 ## When not to use
-
-- Extending or matching an existing SVG/vector icon set, logo system, or illustration library
-  inside the repo
-- Creating simple shapes, diagrams, wireframes, or icons that are better produced directly in
-  SVG, HTML/CSS, or canvas
-- Making a small project-local asset edit when the source file already exists in an editable
-  native format
-- Any task where the user clearly wants deterministic code-native output instead of a generated
-  bitmap
-
-## Operating discipline (learned the hard way)
-
-Four rules that prevent most wasted renders. They are cheap to follow and expensive to skip.
-
-**1. New topic -> `--new-conv`; parallel tasks in one folder -> their own `--conv-key`.**
-Conversation continuity is per project directory (see 5c), so a *new* subject in the same folder would
-silently continue the previous upstream conversation and inherit its style. Start a fresh one with
-`--new-conv`. When several independent jobs run in the same folder, give each `--conv-key <task>` so
-they do not overwrite each other.
-
-**2. Multi-line prompts on Windows: use `--prompt-file` with a UTF-8 file.**
-Passing long or multi-line text through PowerShell quoting mangles newlines and quotes. Write the
-brief to a file and point `--prompt-file` at it -- the CLI reads it as `utf-8-sig`, so a BOM from
-Notepad is stripped automatically (before 2026-11-23 a BOM leaked into the prompt as `\ufeff`).
-`--prompt` and `--prompt-file` are mutually exclusive.
-
-**3. If the subject drifts completely off-brief, start a new conversation instead of editing.**
-Continuing an existing thread anchors the model to the wrong subject -- each further edit inherits the
-drift. `--new-conv` (or a different `--conv-key`) is the fix; do not keep polishing an unrelated image.
-
-**4. While waiting, watch the heartbeat, then check the channel line and the file.**
-A `[waiting] …s elapsed` heartbeat every 20 s means the render is alive; silence with no heartbeat means
-the process died. When it finishes, three things must line up before you report success:
-
-- a `[pipeline]` line (which route actually served it -- see 5a-2),
-- a `Wrote <path>` line,
-- the file existing at the `--out` you asked for.
-
-If `Wrote` is missing, nothing was written -- do not tell the user "done".
+- Extending or matching an existing SVG/vector icon set, logo system, or illustration library inside the repo
+- Creating simple shapes, diagrams, wireframes, or icons that are better produced directly in SVG, HTML/CSS, or canvas
+- Making a small project-local asset edit when the source file already exists in an editable native format
+- Any task where the user clearly wants deterministic code-native output instead of a generated bitmap
 
 ## Decision tree
 
-Two separate questions:
+Think about two separate questions:
 
-1. **Intent:** a new image, or an edit / a reference-driven image?
-2. **Execution strategy:** one asset, or many assets/variants?
+1. **Intent:** is this a new image, an edit of an existing image, or a reference-driven image?
+2. **Execution strategy:** is this one asset or many assets/variants?
 
-Route first (Relay fact 1):
-
-- **Any request that carries a reference image (person/character, card, scene) -> `edit`.** The
-  relay now serves `/v1/images/*` straight from the upstream's own image endpoints
-  (`/backend-api/codex/images/*`), so this route is the fastest and sends the brief **verbatim**
-  (no chat model in the loop). Measured 2026-10-16 on this relay: reference edit **24.5 s**,
-  text-to-image **14.6 s**, refusal **26.9 s** with a structured reason
-  (`moderation_blocked`, stage/category/request id). The relay keeps its legacy
-  `/responses` + image-tool path as an **automatic fallback** if the native endpoint fails.
-- No images at all -> **`generate`**.
-- Use `reference` only when you specifically want a chat model to write the image prompt, or when
-  the relay's image path is unavailable. It is slower (measured **57 s**) and the model's rewrite can
-  lengthen or alter the brief.
-- Many distinct assets -> one `generate` call each, or `generate-batch`.
-
-### Infer the parameters; ask only what cannot be inferred
-
-Users speak in outcomes, not flags. Read the brief and fill these in yourself -- **do not
-interrogate them** for choices you can derive:
-
-| The user says | Set |
-| --- | --- |
-| "transparent background" / "cut it out" / "no backdrop" | `--background transparent` (see Relay fact 5 -- prompt-emulated) |
-| "poster" / "wide" / "16:9" / "banner" | `--preset 16:9@2k` |
-| "phone wallpaper" / "vertical" / "9:16" | `--preset 9:16@2k` |
-| "avatar" / "icon" / "square" | `--size 1024x1024` |
-| "4K" / "high-res" | `--preset <ratio>@4k` |
-| "more detail" / "legible text" / "refine it" | `--effort extended` |
-| "just a quick idea" / "rough" | `--effort minimal` |
-| "card" / "site asset" / "I'll iterate on this" | `--web-mode work` |
-| "give me four options" / "three variants" | `--n 4` (text route only) |
-| "same character" / "like this one" | `pass the image -> edit` |
-| "animated" / "loop" / "sticker" / "gif" | ask for a described frame sequence; `--gif-speed` defaults to 1, use `1.5` when they add "keep it small" |
-
-**Ask only when the answer changes the outcome and you cannot derive it:**
-
-1. No size cue at all in the brief ("draw me something") -- square vs. landscape is a big rework.
-2. They refer to "the image I made earlier" and this project has no conversation key yet -- new
-   render, or continue which thread?
-3. They ask for several variants **and** supplied a reference image -- the edit route forces `n=1`;
-   say so instead of silently returning one.
-
-Everything else: decide, then **state what you decided** in one line ("16:9, transparent background
-via prompt") rather than asking first.
-
-Intent:
-
-- The user wants to modify an existing image while preserving parts of it -> **edit**.
-- The user supplies images only as references for style, composition, mood, or subject ->
-  **reference**.
-- No images supplied -> **generate**.
+Intent → Relay subcommand:
+- Modify an existing image while preserving parts of it → **`edit`**.
+- Reference image(s) for identity/character-in-scene/compositing (keeping input aspect ratio) → **default to `edit`** (stays on the web session pipeline with full `surface`/`effort`/`mssk_conv` support, faster, verbatim prompt).
+- Reference image(s) where you need to **break out of the input image's aspect ratio** (e.g. vertical reference → 16:9 poster) or want a chat model to freely reinterpret pure style/mood references → **`reference`** (note: bypasses `style.mssk_*` / `setup` defaults; use `--reasoning-effort`).
+- No images supplied → **`generate`**.
 
 Execution strategy:
-
-- Many assets or variants -> one call per asset, or one `generate-batch` job per asset. Do not use
-  `n` as a substitute for separate prompts: `n` is variants of one prompt.
+- Many distinct assets → repeated `generate` calls or `generate-batch` (`--concurrency 2`, `--out-dir` required; `--skip-existing` to resume).
+- Do not use `--n` as a substitute for separate prompts: `--n` is for variants of one prompt.
 - Assume the user wants a new image unless they clearly ask to change an existing one.
 
-Relay-specific note: an **edit keeps the input's aspect ratio** and always outputs ~1.57 MP.
-"Change this image to 16:9" cannot be done by editing -- regenerate at the target ratio, or crop
-afterwards. Never fake it by pasting the subject onto a blank canvas at the target ratio; that
-produces flat border bands, not a composition.
+### Infer parameters; ask only what cannot be inferred
+
+Derive flags from user intent and state what you picked in one line:
+
+| User cue | Flag / action |
+| --- | --- |
+| "transparent background" / "cutout" / "透明底" | `--background transparent` (prompt-emulated PNG alpha) |
+| "poster" / "banner" / "wide" / "16:9" | `--preset 16:9@2k` (or `--size 1672x941`) |
+| "phone wallpaper" / "vertical" / "9:16" | `--preset 9:16@2k` (or `--size 941x1672`) |
+| "avatar" / "icon" / "square" | `--size 1254x1254` (or `--preset 1:1@2k`) |
+| "4K" / "high-res" | `--preset <ratio>@4k` (state clearly: locally upscaled) |
+| "more detail" / "legible text" / "refine" | `--effort extended` |
+| "quick idea" / "rough" | `--effort none` (chat) or `--web-mode work --effort minimal` |
+| "card" / "site asset" / "will iterate" | `--web-mode work` |
+| "give me 4 options" (text-only) | `--n 4 --strict-n` (exact 4) or `--n 4` (allows extra free variants) |
+| "same character" / "put this in X" / "改图" | `edit --image <path>` (or `reference` if changing aspect ratio) |
+| "animated" / "loop" / "gif" / "动图" | describe frame sequence + loop; `--gif-speed 1` (or `1.5` for faster playback) |
+
+Ask only when un-derivable and costly to rework: (1) zero aspect-ratio cue on a fresh image, (2) user refers to "the image I made earlier" and no project conversation key exists yet, (3) user asks for multiple variants **and** supplied a reference image (`edit` works best at `n=1`).
 
 ## Workflow
-
-1. Decide the intent: `generate` or `edit`.
-2. Decide whether the output is preview-only or meant to be consumed by the current project.
-3. Decide the execution strategy: single call, repeated calls, or `generate-batch`.
-4. Collect inputs up front: prompt(s), exact text (verbatim), constraints/avoid list, input images.
-5. For every input image, label its role explicitly: reference image / edit target / supporting
-   insert.
-6. Set `--size` from the requested ratio (Relay fact 3). For `edit`, do not pass `--size`.
-7. Augment the prompt based on specificity (see **Prompt augmentation**).
-8. Run the launcher with `generate`, `edit`, or `generate-batch`.
-9. Inspect the output: subject, style, composition, text accuracy, invariants/avoid items.
-10. Iterate with a single targeted change, then re-check.
-11. For project-bound work, put the final artifact inside the workspace (prefer
-    `output/imagegen/`), never in a temp path.
-12. Report the final path(s), the final prompt, `actual_size`, and the model.
+1. Check `setup --show --json` once if web-pipeline defaults are unknown; run two-step `tiers` + `setup` only when `configured_web` is `false`.
+2. Decide the intent and subcommand (`generate`, `edit`, `reference`, or `generate-batch`).
+3. Decide whether the output is preview-only or meant for the current project (prefer `output/imagegen/`).
+4. Collect inputs up front: prompt(s), exact text (verbatim), constraints/avoid list, and any input images.
+5. For every input image, label its role explicitly: `reference image` / `edit target` / `supporting insert`.
+6. Set `--size` or `--preset` from the requested ratio (do not repeat the ratio in the prompt). For `edit`, the input image fixes the aspect ratio.
+7. Augment the prompt based on specificity (see **Prompt augmentation**). For multi-line prompts on Windows, write a UTF-8 file and pass `--prompt-file`.
+8. Run the launcher. Watch `[waiting]` / `[slow]` heartbeats — never start a duplicate parallel run while one is in flight.
+9. Verify three items before claiming success: a `[pipeline]` line, a `Wrote <path>` line, and the file existing on disk. If `[pipeline]` reports `degraded`, disclose it and quote the reason.
+10. Inspect outputs (subject, style, composition, text accuracy, invariants/avoid items) and iterate with a single targeted `edit`, repeating invariants each round. If subject drifts off-brief, start fresh with `--new-conv`.
+11. Report: final absolute path(s), final prompt used, `actual_size` (and delivered pixels if resampled), model + pipeline (`web`/`degraded`/`native`/`responses`), and any differing `revised_prompt`. Then stop and wait.
 
 ## Prompt augmentation
 
-Reformat user prompts into a structured, production-oriented spec. Make the user's goal clearer
-and more actionable, but do not blindly add detail.
+Reformat user prompts into a structured, production-oriented spec. Make the user's goal clearer and more actionable, but do not blindly add detail.
 
-Treat this as prompt-shaping guidance, not a closed schema. Use only the lines that help, and add
-a short extra labeled line when it materially improves clarity.
+Treat this as prompt-shaping guidance, not a closed schema. Use only the lines that help, and add a short extra labeled line when it materially improves clarity.
 
 ### Specificity policy
 
-- If the prompt is already specific and detailed, preserve that specificity and only
-  normalize/structure it.
-- If the prompt is generic, you may add tasteful augmentation when it will materially improve the
-  result.
+- If the prompt is already specific and detailed, preserve that specificity and only normalize/structure it.
+- If the prompt is generic, you may add tasteful augmentation when it will materially improve the result.
 
 Allowed augmentations:
-
 - composition or framing hints
 - polish level or intended-use hints
 - practical layout guidance
 - reasonable scene concreteness that supports the stated request
 
 Not allowed augmentations:
-
 - extra characters or objects that are not implied by the request
 - brand names, slogans, palettes, or narrative beats that are not implied
 - arbitrary side-specific placement unless the surrounding layout supports it
 
-The CLI implements this directly: `--use-case`, `--scene`, `--subject`, `--style`, `--composition`,
-`--lighting`, `--palette`, `--materials`, `--text`, `--constraints`, `--negative` build the labeled
-spec for you, and `--augment` / `--no-augment` controls the behaviour (augment is the default).
-
-`--augment` output is byte-identical to the official skill's CLI for the same inputs. When only the
-relay-specific hints are added (`--quality high|low`, `--background transparent`), the CLI appends
-them as extra labeled lines at the end -- never reword the user's own lines.
+The CLI implements this directly (`--use-case`, `--scene`, `--subject`, `--style`, `--composition`, `--lighting`, `--palette`, `--materials`, `--text`, `--constraints`, `--negative`, `--augment` / `--no-augment`). Already-labeled specs auto-skip wrapping.
 
 ## Use-case taxonomy (exact slugs)
 
-Classify each request into one of these buckets and keep the slug consistent across prompts and
-references.
+Classify each request into one of these buckets and keep the slug consistent across prompts and references.
 
 Generate:
-
-- `photorealistic-natural` -- candid/editorial lifestyle scenes with real texture and natural
-  lighting.
-- `product-mockup` -- product/packaging shots, catalog imagery, merch concepts.
-- `ui-mockup` -- app/web interface mockups and wireframes; specify the desired fidelity.
-- `infographic-diagram` -- diagrams/infographics with structured layout and text.
-- `scientific-educational` -- classroom explainers, scientific diagrams, and learning visuals with
-  required labels and accuracy constraints.
-- `ads-marketing` -- campaign concepts and ad creatives with audience, brand position, scene, and
-  exact tagline/copy.
-- `productivity-visual` -- slide, chart, workflow, and data-heavy business visuals.
-- `logo-brand` -- logo/mark exploration, vector-friendly.
-- `illustration-story` -- comics, children's book art, narrative scenes.
-- `stylized-concept` -- style-driven concept art, 3D/stylized renders.
-- `historical-scene` -- period-accurate/world-knowledge scenes.
+- `photorealistic-natural` — candid/editorial lifestyle scenes with real texture and natural lighting.
+- `product-mockup` — product/packaging shots, catalog imagery, merch concepts.
+- `ui-mockup` — app/web interface mockups and wireframes; specify the desired fidelity.
+- `infographic-diagram` — diagrams/infographics with structured layout and text.
+- `scientific-educational` — classroom explainers, scientific diagrams, and learning visuals with required labels and accuracy constraints.
+- `ads-marketing` — campaign concepts and ad creatives with audience, brand position, scene, and exact tagline/copy.
+- `productivity-visual` — slide, chart, workflow, and data-heavy business visuals.
+- `logo-brand` — logo/mark exploration, vector-friendly.
+- `illustration-story` — comics, children's book art, narrative scenes.
+- `stylized-concept` — style-driven concept art, 3D/stylized renders.
+- `historical-scene` — period-accurate/world-knowledge scenes.
 
 Edit:
-
-- `text-localization` -- translate/replace in-image text, preserve layout.
-- `identity-preserve` -- try-on, person-in-scene; lock face/body/pose.
-- `precise-object-edit` -- remove/replace a specific element (including interior swaps).
-- `lighting-weather` -- time-of-day/season/atmosphere changes only.
-- `background-extraction` -- transparent background / clean cutout.
-- `style-transfer` -- apply reference style while changing subject/scene.
-- `compositing` -- multi-image insert/merge with matched lighting/perspective.
-- `sketch-to-render` -- drawing/line art to photoreal render.
+- `text-localization` — translate/replace in-image text, preserve layout.
+- `identity-preserve` — try-on, person-in-scene; lock face/body/pose.
+- `precise-object-edit` — remove/replace a specific element (including interior swaps).
+- `lighting-weather` — time-of-day/season/atmosphere changes only.
+- `background-extraction` — transparent background / clean cutout (`--background transparent`, fallback `scripts/remove_chroma_key.py`).
+- `style-transfer` — apply reference style while changing subject/scene.
+- `compositing` — multi-image insert/merge with matched lighting/perspective.
+- `sketch-to-render` — drawing/line art to photoreal render.
 
 ## Shared prompt schema
-
-Use the following labeled spec as prompt scaffolding for both generation and editing:
 
 ```text
 Use case: <taxonomy slug>
@@ -666,88 +183,37 @@ Avoid: <negative constraints>
 ```
 
 Notes:
+- Use only the lines that help; `Asset type` and `Input images` are prompt scaffolding, not CLI flags.
+- `Scene/backdrop` is the visual setting, not `--background transparent`.
+- Keep edits short and list invariants (`change only X; keep Y unchanged`).
 
-- Use only the lines that help. This is not a form to fill in.
-- `Asset type` and `Input images` are prompt scaffolding, not CLI flags.
-- `Scene/backdrop` is the visual setting, not a transparency control.
-- Do **not** add an aspect-ratio line; `--size` already handles it.
+### Person / character brief rule (relay safety discipline)
 
-Augmentation rules:
-
-- Keep it short.
-- Add only the details needed to improve the prompt materially.
-- For edits, explicitly list invariants (`change only X; keep Y unchanged`).
-- If any critical detail is missing and blocks success, ask a question; otherwise proceed.
-
-**人物/角色类提示词必须写明服装 —— 但要写成"一句覆盖/一致性约束"，不要逐件列举。**
-
-实测数据（同一参考图、同一渠道）：
-
-| 简报写法 | 结果 |
-| --- | --- |
-| 一句「服装与图1完全一致，为覆盖完整、不透明的运动套装；衣着保守、得体」 | ✅ 2/2 通过，且出图保留了原服装 |
-| 逐件列举（"白色露肩上衣、银色百褶短裙、腰部多层银链…"） | ❌ 几乎全被拒（长清单 0/5） |
-
-逐件列举是**风险来源**，而且不管你写不写，改写层都会自己加上去（Codex 的 agent 和图像工具背后的模型都会）。
-
-#### 默认简报模板（写人物/角色类请求时照这个来）
-
-**这是实测最优写法**（紧凑简报 + 一句覆盖约束：6 过 / 17 试 ≈ 35%，重试 3 次约 70%；对照的长清单是 0/5）。
+Long garment/body inventories trigger the output-side safety classifier (~0% pass rate). Compress person/character briefs to **5–7 lines** with **one** `Clothing:` consistency/coverage line — never enumerate individual garments, jewellery, or body/skin terms (`露肩/贴身/曲线/覆盖范围`):
 
 ```text
 Use case: identity-preserve
-Asset type: <这张图用在哪儿，例如"单张完成的游戏收藏卡牌">
+Asset type: <e.g. 单张完成的游戏收藏卡牌>
 Input images: 图1是编辑目标，也是角色外貌、服装、姿势与道具的唯一依据。
-Primary request: <一到两句：要做什么、放进什么场景/卡面里>
-Constraints: 保持图1角色的面貌、发型、姿势与道具形态不变；只新增<卡面/背景/装饰>。
+Primary request: <1–2 sentences: action + target scene/card>
+Constraints: 保持图1角色的面貌、发型、姿势与道具形态不变；只新增<背景/卡面/装饰>。
 Clothing: 角色服装与图1完全一致，为覆盖完整、不透明的服装；衣着保守得体。
 Avoid: 其他人物、额外肢体、新增文字、水印。
 ```
 
-硬规则：
-
-1. **总长控制在 5～7 行**。不要写"必须逐一保持不变"的长清单；
-2. **服装只写一行**（`Clothing:`）—— 这是收益最高的一句，也是唯一必须写的一句；
-3. **禁止**逐件列举衣物/首饰/身体细节（如"白色露肩上衣、银色百褶短裙、多层银链"），**禁止**"露肩/贴身/曲线/覆盖范围"这类词；
-4. 用户给的超长约束清单**不要原样转贴**，压缩成上面那两行 `Constraints` 与 `Clothing`；
-5. 用 `--prompt-file` 传这份简报时，**加 `--no-augment`**（简报本身已是标签式规格，不需要再加包装；CLI 现在也会自动识别并跳过包装）。
-所以：**一句话写清"服装与参考图一致、覆盖完整"，然后停手**；不要发明用户没提过的服装、首饰或身体细节。
-
 ## Examples
 
 ### Generation example (hero image)
-
-```text
-Use case: product-mockup
-Asset type: landing page hero
-Primary request: a minimal hero image of a ceramic coffee mug
-Style/medium: clean product photography
-Composition/framing: wide composition with usable negative space for page copy if needed
-Lighting/mood: soft studio lighting
-Constraints: no logos, no text, no watermark
-```
-
 ```powershell
 & "$env:USERPROFILE\.codex\skills\imagegen-relay\bin\run.cmd" generate `
   --prompt "A minimal hero image of a ceramic coffee mug" `
-  --use-case product-mockup `
-  --style "clean product photography" `
+  --use-case product-mockup --style "clean product photography" `
   --composition "wide composition with usable negative space for page copy" `
-  --lighting "soft studio lighting" `
-  --constraints "no logos, no text, no watermark" `
-  --size 1672x941 `
-  --out "output/imagegen/mug-hero.png"
+  --lighting "soft studio lighting" --constraints "no logos, no text, no watermark" `
+  --size 1672x941 --out "output/imagegen/mug-hero.png"
 ```
 
 ### Edit example (invariants)
-
-```text
-Use case: precise-object-edit
-Asset type: product photo background replacement
-Primary request: replace only the background with a warm sunset gradient
-Constraints: change only the background; keep the product and its edges unchanged; no text; no watermark
-```
-
 ```powershell
 & "$env:USERPROFILE\.codex\skills\imagegen-relay\bin\run.cmd" edit `
   --image "input/product.png" `
@@ -757,121 +223,54 @@ Constraints: change only the background; keep the product and its edges unchange
 ```
 
 ## Prompting best practices
-
-- Structure the prompt as scene/backdrop -> subject -> details -> constraints.
+- Structure prompt as scene/backdrop -> subject -> details -> constraints.
 - Include intended use (ad, UI mock, infographic) to set the mode and polish level.
 - Use camera/composition language for photorealism.
-- Specify framing and viewpoint (close-up, wide, top-down) and placement only when it helps.
-- Call out negative space if the asset needs room for UI or copy.
-- For people, describe body framing, scale, gaze, and object interactions when they matter.
-- Quote exact text and specify typography + placement. For tricky words, spell them letter by
-  letter and require verbatim rendering.
+- Only use SVG/vector stand-ins when the user explicitly asked for vector output or a non-image placeholder.
+- Quote exact text and specify typography + placement; spell tricky words letter-by-letter and require verbatim rendering.
 - For multi-image inputs, reference images by index and describe how they should be used.
-- For edits, repeat invariants every iteration to reduce drift.
-- Iterate with single-change follow-ups.
-- If the prompt is generic, add only the extra detail that will materially help.
-- If the prompt is already detailed, normalize it instead of expanding it.
-- Only use SVG/vector stand-ins when the user explicitly asked for vector output.
-- **Do not promise 2K/4K, other models, or a working quality slider** (Relay facts 2-4).
+- For edits, repeat invariants every iteration to reduce drift; iterate with single-change follow-ups.
+- If the prompt is generic, add only the extra detail that will materially help; if already detailed, normalize instead of expanding.
+- Never promise native 4K detail, a third image model, or an upstream quality slider.
 
-## Iteration discipline
+More principles: `references/prompting.md`. Copy/paste specs: `references/sample-prompts.md`.
 
-**Inspect every output; when something is wrong, make a single targeted change and re-check.**
+## Relay controls & caveats (where relay differs from official)
+- **Resolution (~1.57 MP native)**: upstream ignores `size` pixel counts and renders fixed ~1.57 MP per ratio (`1:1 -> 1254x1254`, `16:9 -> 1672x941`, `9:16 -> 941x1672`, `3:2 -> 1536x1024`, `4:3 -> 1448x1086`, ultra-wide `3.09:1 -> 2206x713`). Use `--preset <ratio>@2k|4k` or `--exact-size WxH` (`--fit cover|contain`) for exact delivered pixels via local Lanczos resample; when upscaling >1.5× (e.g. `@4k`), state honestly that it was **upscaled locally**.
+- **Prompt-emulated controls**: `--quality high|low` folds a hint line into the prompt; `--background transparent` appends a transparency line and keeps PNG alpha (complex subjects: fall back to `scripts/remove_chroma_key.py` on a flat-colour render).
+- **`--n > 1` on web pipeline**: upstream drains the whole turn and may return >`n` files and take 3–4 min. Pass `--strict-n` (runs `n` sequential `n=1` calls) or `--model codex-gpt-image-2` when you need strictly `n` outputs.
+- **Animated GIF**: request a loop animation (`…的动画GIF，循环播放`). The CLI writes `.gif` verbatim (never re-encodes via Pillow), writes `<name>-sprite.png` if provided, and `--gif-speed {0.25..2}` scales `animation.frame_duration_ms`.
+- **Conversation continuity**: isolated per project (`<cwd>/.imagegen/conv-<hash>`). New topic → `--new-conv`; parallel tasks in one folder → `--conv-key <task>`.
+- **Higher `--effort` is not always better**: slower and refused more often; raise only for dense text, fine detail, or refinement. (`work` UI shows 4 tiers `minimal/low/standard/extended`; `--effort max` is an advanced CLI-only passthrough not listed in `tiers`.)
+- **Defaults**: `--preflight off`, `--retry-refusal 0`, layered timeouts (`150s/240s` normal single-image; `300s/480s` heavy `n>1`/`work`/`extended+`/`reference`). Never fabricate a local PIL composite and call it generation.
 
-1. Inspect: subject, style, composition, text accuracy, and whether constraints/avoid items were
-   violated.
-2. Found a problem -> **change one thing**, then look again.
-3. **Make the change with `edit`, not by regenerating.** Regenerating also throws away everything
-   that was already right, and every generation consumes real relay quota.
-4. Repeat the invariants on every iteration to reduce drift.
-5. Ask only when blocked: if a critical detail is missing and you cannot get it right without
-   asking, ask once. Otherwise proceed.
+## Failure handling (`CODE=` / `RETRYABLE=`)
 
-Use `generate` again only when the command errored (no image was produced) or the user explicitly
-asks to redo the whole thing.
+Every failure writes `CODE=`, `RETRYABLE=`, `HINT=`, `RAW=` to stderr (with automatic `sk-*` redaction) and `{ok: false, error: {...}}` to `--report-json`. Decide by `CODE`, never by prose:
 
-## Reporting
-
-After every image, tell the user:
-
-1. The image's **absolute path**
-2. The final prompt used
-3. **`actual_size`** from the response (for example `1672x941`) -- not a "requested size"
-4. The model (`gpt-image-2`)
-5. Any `revised_prompt` that differs from what was sent
-
-Then stop and wait. If you just made a single targeted change, say what you changed. A closing
-question such as "Tell me what to adjust and I'll edit it" is fine.
-
-## Failure handling
-
-| Error | Cause | Action |
+| `CODE` | `RETRYABLE` | Action |
 | --- | --- | --- |
-| `Relay token is not configured` | `api_key` in `config.json` is empty | **Let the user fill it in** -- open `%USERPROFILE%\.codex\skills\imagegen-relay\config.json`, put the token in `api_key`, save, then retry. Never ask for the token in chat |
-| `relay rejected the token (HTTP 401)` | token deleted or expired | recreate it in the relay console; the user updates `config.json` |
-| `relay has no channel for this model` | a model other than `gpt-image-2` | use `gpt-image-2` |
-| timeout / `429` / `5xx` | upstream busy | the CLI already retried; wait and retry once, never in a loop. `--deadline` caps the total wait |
-| `上游内容安全系统拒绝：<text>` | upstream content-safety decision on the **input image** -- not a fault, no image was produced | **Relay `<text>` to the user verbatim.** The relay already exhausted its internal retries, so do not re-send the same request and do not quietly make the description more modest. State that it is an upstream policy decision, and escalate the diagnosis (Relay fact 8). **Never substitute a local composite and call it generation.** |
-| 4K / higher resolution requested | upstream fixed at ~1.57 MP | say no plainly; the only control is the aspect ratio |
-| Skill not loaded / launcher missing | installed but not refreshed | have the user **open a new conversation** |
+| `no_image_data` | yes | Re-send once (empty-stream responses cluster) |
+| `content_refusal` | yes | Stochastic output-stage gate: use compact neutral brief + coverage line or retry once (`--retry-refusal 1`); a more conservative reference passes fastest |
+| `bad_request` | yes | Unsupported tier/slug — drop one `--effort` tier or switch model and retry once |
+| `timeout` / `rate_limited` / `network_error` | yes | Wait briefly and retry once; on repeated timeout, try `--new-conv` or `--model codex-gpt-image-2` |
+| `upstream_error` | yes | Retry once verbatim, then report `RAW` |
+| `content_safety` | no | Upstream moderation decision: relay verbatim, do not loop-retry; see `references/safety-refusals.md` |
+| `model_refusal` | no | Chat model declined (`reference` route): rephrase or switch to `edit` / `--model codex-gpt-image-2` |
+| `deadline_exceeded` | no | Budget exhausted, nothing written — raise `--deadline`, try `--new-conv`, or switch to `codex-gpt-image-2` |
+| `upstream_overloaded` / `relay_cpu` | no | Upstream `NO_MORE_RETRY` or relay CPU saturated — wait, do not retry immediately |
+| `token_invalid` / missing token | no | User updates `api_key` in `config.json` locally (**never ask for or print tokens in chat**) |
+| `no_model_access` / `no_channel` / `token_revoked` | no | Use `gpt-image-2` / `codex-gpt-image-2`, or notify relay owner to grant access / re-seed OAuth |
 
-### Machine-readable failures (2026-11-19)
-
-Every failure now prints three parseable lines to **stderr** after the human sentence:
-
-```
-Error: 中转站返回 HTTP 401，没有出图
-CODE=token_invalid   RETRYABLE=no
-HINT=中转站不认这个令牌：检查 config.json 里的 api_key …
-RAW=relay rejected the token (HTTP 401): Invalid token …
-```
-
-`--report-json <path>` also writes a failure record (`ok: false` + `error.{code,hint,retryable,
-http_status,raw}`), so a caller never has to parse prose.
-
-Use `CODE` to decide, not the sentence:
-
-| `CODE` | `RETRYABLE` | What to do |
-| --- | --- | --- |
-| `no_image_data` | **yes** | re-send once -- measured to come back empty in clusters |
-| `content_refusal` | yes | stochastic upstream image-safety gate; one retry is meaningful, but a more conservative reference image passes faster |
-| `bad_request` | yes | unsupported parameter (usually effort tier) -- drop one tier and retry once |
-| `content_safety` | no | the render finished and was then judged; retrying is a lottery, swapping the reference wins |
-| `model_refusal` | no | the chat model itself declined (legacy `/responses` path only) -- rephrase or use `--model codex-gpt-image-2` |
-| `upstream_overloaded` | no | upstream said `NO_MORE_RETRY`; wait 1-2 minutes |
-| `relay_cpu` | no | the relay box is CPU-bound; wait, or tell the owner to add a core |
-| `token_invalid` | no | the token is wrong/disabled -- the user fixes `config.json` |
-| `no_model_access` | no | the token lacks this model -- add it in the relay's token limits |
-| `token_revoked` | no | upstream OAuth was invalidated -- owner must re-seed credentials |
-| `upstream_error` | yes | unclassified -- retry once verbatim, then report the `RAW` line |
-
-Rules:
-
-- Never retry a `RETRYABLE=no` code. Content-safety and model refusals are decisions, not faults.
-- Retry **at most once**, and never in a loop -- repeated sends deepen the upstream's risk scoring.
-- Report `CODE` and `HINT` to the user in plain language; keep `RAW` for the owner.
-
-## Token and security
-
-- The token lives in `config.json`. **Never** print it into a conversation, a log, a report, or a
-  file, and never expose the full `Authorization` header when reporting an error.
-- If a token appears in relayed error text, redact it first.
-- `config.json` also accepts the environment fallbacks `IMAGE_RELAY_URL` / `IMAGE_RELAY_KEY`
-  (then `CODEX_API_URL` / `CODEX_API_KEY`, then `OPENAI_*`), but `config.json` takes precedence and
-  is what normal use relies on.
+Rules: **never retry `RETRYABLE=no`**; retry `RETRYABLE=yes` **at most once**; if the skill/launcher is newly installed and missing, have the user open a new conversation.
 
 ## Reference map
-
-- `references/prompting.md` -- shared prompting principles (verbatim from the official skill)
-- `references/sample-prompts.md` -- copy/paste prompt recipes (verbatim from the official skill)
-- `references/cli.md` -- full CLI usage, sizes, batch format, relay-only flags
-- `references/relay-api.md` -- wire contract, measured behaviour, error vocabulary
-- `references/codex-network.md` -- network/sandbox notes for this installation
-- `scripts/image_gen.py` -- the CLI itself
-- `scripts/remove_chroma_key.py` -- fallback for transparent cutouts (verbatim from the official skill)
-- `scripts/relay_errors.py` -- failure classifier behind `CODE=`/`HINT=` (mirrors the web app's `lib/errors.mjs`)
-
-## One-line summary
-
-**Write the prompt like the official skill, pick the ratio with `--size`, one call per image,
-iterate with `edit`, and report `actual_size` -- no 4K, one model, 20-60 s per render.**
+- `references/prompting.md`: shared prompting principles (**verbatim from official skill — use for prompt craft only; ignore its `Fallback-only execution controls` section, which mentions `gpt-image-1.5` and native 4K**).
+- `references/sample-prompts.md`: shared copy/paste prompt recipes (verbatim from official skill).
+- `references/cli.md`: full CLI flags, sizes/presets, masks, batch JSONL format, `--dry-run`.
+- `references/relay-api.md`: wire contracts (Codex JSON vs OpenAI multipart), `style.mssk_*`, GIF JSON schema, tier mechanics.
+- `references/safety-refusals.md`: input vs output safety gates, measured ablation data, `--preflight`, browser-vs-CLI DevTools troubleshooting.
+- `references/codex-network.md`: network/sandbox notes for this installation.
+- `scripts/image_gen.py`: the relay CLI itself.
+- `scripts/relay_errors.py`: single-source failure classifier & secret redactor.
+- `scripts/remove_chroma_key.py`: local chroma-key cutout fallback (verbatim from official skill).

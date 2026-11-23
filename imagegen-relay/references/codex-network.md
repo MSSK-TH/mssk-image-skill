@@ -7,7 +7,7 @@ approval prompts you get when the official fallback CLI reaches `api.openai.com`
 
 ## What this CLI needs
 
-- **Outbound HTTPS** to `relay.msskwithth.com:9443` (or whatever `api_url` says).
+- **Outbound HTTPS** to `relay.example.com:9443` (or whatever `api_url` says).
 - **Nothing else**: no `openai` package, no environment variables, no other credentials,
   no inbound ports, no local service.
 
@@ -42,7 +42,7 @@ One render takes 20-60 s and the CLI waits up to `--timeout` seconds (default 30
 
 ## Certificate
 
-`relay.msskwithth.com:9443` serves a valid Let's Encrypt certificate. Certificate verification
+`relay.example.com:9443` serves a valid Let's Encrypt certificate. Certificate verification
 stays on; there is deliberately no `--insecure` flag. If verification ever starts failing, the
 relay's certificate has expired -- tell the user rather than disabling verification.
 

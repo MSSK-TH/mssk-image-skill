@@ -2,21 +2,29 @@
 
 来源与维护约定
 --------------
-本文件是 image-web 后端 ``lib/errors.mjs`` 的 Python 对应物。
-**两份要同步维护**：改动任何一条规则，两个仓库都要改。
-以本文件（Python）为准 —— skill 是主战场，image-web 已冻结。
+本文件是错误分类、人话化与脱敏的**唯一真相源**（也是 image-web 后端 ``lib/errors.mjs`` 的
+Python 对应物；以本文件为准，image_gen.py 不再重复维护同类正则或映射表）。
 
-三个函数
+核心函数
 --------
 ``humanize_moderation(stage, categories, request_id)``
-    内容安全拒绝 → 一句中文（含判定阶段与请求 ID）
+    内容安全拒绝字段 → 一句中文（含判定阶段与请求 ID）
+
+``humanize_moderation_text(message)``
+    从服务端原文提取 ``判定阶段/类别/请求 ID`` 并转人话（不再误切 ``sexual/minors``）
 
 ``translate_upstream(text)``
     上游偶尔回英文原话 → 一句中文摘要；认不出就返回空串
 
-``classify_error(text)``
+``redact_secrets(text, extra_secrets=())``
+    把报错文本中可能夹带的 ``sk-...`` 令牌 / Bearer 头 / 指定凭据替换为 ``[REDACTED]``
+
+``classify_error(text, *, http_status=None, code=None)``
     归类 → ``{"code": ..., "hint": ..., "retryable": bool}``
-    ``retryable`` 是给 agent 的决策信号：True 才值得再发一次
+    支持按已知 ``code`` 精确取元信息，也支持用 ``http_status`` 兜底（避免裸 401/429 落入未知错误）
+
+``describe_failure(text, *, http_status=None, code=None, stage="", categories="", request_id="", secrets=())``
+    一次性产出可打印、可落 ``--report-json``、且已脱敏的失败描述
 
 两条过载必须分清（实测结论）
 ----------------------------
@@ -30,11 +38,14 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 __all__ = [
     "humanize_moderation",
+    "humanize_moderation_text",
     "translate_upstream",
+    "redact_secrets",
+    "is_refusal_code",
     "classify_error",
     "describe_failure",
 ]
@@ -54,6 +65,23 @@ _CATEGORY_ZH = {
     "sexual/minors": "未成年人性化",
 }
 
+_BEARER_RE = re.compile(r"(Authorization\s*:\s*Bearer\s+|Bearer\s+)([^\s\"',;]+)", re.I)
+_SK_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{8,}")
+
+
+def redact_secrets(text: str = "", extra_secrets: Iterable[str] = ()) -> str:
+    """脱敏报错或日志文本中的令牌，防止写入 stderr 或 --report-json。"""
+    out = str(text or "")
+    if not out:
+        return ""
+    for secret in extra_secrets:
+        s = str(secret or "").strip()
+        if len(s) >= 6 and s in out:
+            out = out.replace(s, "[REDACTED]")
+    out = _BEARER_RE.sub(r"\1[REDACTED]", out)
+    out = _SK_TOKEN_RE.sub("[REDACTED]", out)
+    return out
+
 
 def humanize_moderation(
     stage: str = "",
@@ -63,9 +91,9 @@ def humanize_moderation(
     """内容安全拒绝 → 一句中文（含可选的请求 ID）。"""
     s = _STAGE_ZH.get(str(stage or "").lower(), str(stage or ""))
     cats = [
-        _CATEGORY_ZH.get(c.lower(), c)
+        _CATEGORY_ZH.get(c.strip().lower(), c.strip())
         for c in re.split(r"[,，\s]+", str(categories or ""))
-        if c
+        if c.strip()
     ]
     cat = "、".join(cats)
     parts = [
@@ -76,6 +104,21 @@ def humanize_moderation(
         f" · 请求 ID：{request_id}" if request_id else "",
     ]
     return "".join(p for p in parts if p)
+
+
+def humanize_moderation_text(message: str = "") -> str:
+    """从上游原文提取 ``判定阶段/类别/请求 ID`` 并转成统一中文；无字段时原样返回。"""
+    text = str(message or "")
+    if "判定阶段" not in text and "类别" not in text:
+        return text
+    stage_m = re.search(r"判定阶段[=:：]\s*([A-Za-z_-]+)", text)
+    cats_m = re.search(r"类别[=:：]\s*([A-Za-z0-9_/-，,\s]+?)(?:，|,|请求|$)", text)
+    rid_m = re.search(r"请求\s*ID[=:：]\s*([0-9a-fA-F-]{8,})", text)
+    return humanize_moderation(
+        stage=stage_m.group(1) if stage_m else "",
+        categories=cats_m.group(1) if cats_m else "",
+        request_id=rid_m.group(1) if rid_m else "",
+    )
 
 
 _TRANSLATE_RULES = [
@@ -91,6 +134,9 @@ _TRANSLATE_RULES = [
     (re.compile(r"system cpu overloaded", re.I), "我们中转站自己的 CPU 打满了"),
     (re.compile(r"token_revoked|invalidated oauth", re.I), "中转站的授权凭据被踢了"),
     (re.compile(r"no access to model", re.I), "这个令牌没有该模型的权限"),
+    (re.compile(r"no available channel|model_not_found|has no channel", re.I), "中转站没有该模型的可用渠道"),
+    (re.compile(r"--deadline|deadline budget|overall deadline", re.I), "单任务总时间预算（--deadline）已耗尽，已安全中止"),
+    (re.compile(r"timed out|read operation timed out|\btimeout\b", re.I), "等待中转站/上游响应超时"),
 ]
 
 
@@ -99,6 +145,8 @@ def translate_upstream(text: str = "") -> str:
     t = str(text or "")
     if not t:
         return ""
+    if "判定阶段" in t or "类别" in t:
+        return humanize_moderation_text(t)
     for pattern, zh in _TRANSLATE_RULES:
         if pattern.search(t):
             return zh
@@ -115,16 +163,42 @@ _RULES = [
         "以及令牌是否被禁用、是否绑定到了别的分组。",
     ),
     (
-        "content_safety",
-        re.compile(r"moderation_blocked|内容安全系统拒绝（原生端点）|判定阶段="),
+        "token_revoked",
+        re.compile(r"token_revoked|invalidated oauth", re.I),
         False,
-        "这不是故障：图片已经渲染完成，被上游的图像安全系统判成了不允许的内容（多为「性化/暴露」类）。"
-        "判定是随机的，再发一次仍有机会（实测约 1/3），但通常换参考图更快 —— "
-        "同一角色换一张穿得更保守的图，通过率明显更高。",
+        "中转站凭据被踢了 —— 需要在服务器上重跑「重新播种凭据」脚本，或让 owner 重新登录上游账号。",
+    ),
+    (
+        "no_model_access",
+        re.compile(r"no access to model", re.I),
+        False,
+        "这个令牌没有该模型的权限，去 new-api 后台的令牌限制里把它加上。",
+    ),
+    (
+        "no_channel",
+        re.compile(r"no available channel|model_not_found|has no channel", re.I),
+        False,
+        "中转站没有该模型的可用渠道：图像路由只提供 gpt-image-2（默认，网页管线优先）和 codex-gpt-image-2（原生端点）。",
+    ),
+    (
+        "deadline_exceeded",
+        re.compile(r"--deadline|deadline budget|overall deadline", re.I),
+        False,
+        "单任务总时间预算（--deadline）已耗尽，已中止且未写盘。可增大 --deadline、加 --new-conv 换新会话，或切 --model codex-gpt-image-2。",
+    ),
+    (
+        "content_safety",
+        re.compile(r"moderation_blocked|内容安全系统拒绝（原生端点）|判定阶段=", re.I),
+        False,
+        "这不是故障，是上游安全系统的审核判定（原生端点常见于「性化/暴露」类）。"
+        "直接原样重发成功率低且可能命中缓存；优先改写为紧凑中性简报（加一句服装覆盖约束）或换一张更保守的参考图。",
     ),
     (
         "model_refusal",
-        re.compile(r"抱歉[，,]\s*我(?:无法|不能)|我无法(?:直接)?(?:基于|按)这张|I (?:can'?t|cannot|am unable to)", re.I),
+        re.compile(
+            r"抱歉[，,]\s*我(?:无法|不能)|我无法(?:直接)?(?:基于|按)这张|I (?:can'?t|cannot|am unable to)",
+            re.I,
+        ),
         False,
         "这次是对话模型自己拒绝（不是内容安全系统）：它不愿意基于这张参考图做合成，还给了替代方案。"
         "重试没有意义（同一段拒绝是确定的）。两个办法：① 换个说法（明确写「把参考图1的角色合成进新场景、保持人物不变」）；"
@@ -132,15 +206,19 @@ _RULES = [
     ),
     (
         "content_refusal",
-        re.compile(r"内容安全|安全系统|safety system|image safety|flagged by the image|rejected by the image", re.I),
+        re.compile(
+            r"内容安全|安全系统|safety system|image safety|flagged by the image|"
+            r"rejected by the image|safety_violations",
+            re.I,
+        ),
         True,
-        "不是故障，是上游的图像安全系统把这个提示词/参考图判成了不允许的内容"
-        "（常见触发：人物服装暴露或性化、真人肖像、暴力）。"
-        "判定发生在出图之后且是随机的（实测同一张图重试约 1/3 能过）—— 所以再发一次有意义，但换一张更保守的参考图见效更快。",
+        "不是故障，是上游图像安全系统在输出层把这张图判掉了（常见触发：人物服装暴露/性化、真人肖像、暴力）。"
+        "输出层判定带随机性：可用紧凑中性简报 + 覆盖约束重发一次（或用 --retry-refusal 1），"
+        "但换一张服装更保守的参考图见效更快。",
     ),
     (
         "no_image_data",
-        re.compile(r"没有返回图片数据|no image data", re.I),
+        re.compile(r"没有返回图片数据|no image data|returned no images", re.I),
         True,
         "上游这次 HTTP 200 但流里没有图（实测是「成簇」发生：同一个请求上一次成功、这一次就空手而归）。"
         "再发一次通常第二次就出来了。",
@@ -156,39 +234,90 @@ _RULES = [
         "relay_cpu",
         re.compile(r"system cpu overloaded", re.I),
         False,
-        "这是中转站自己的 CPU 打满了（1 核机器），和上游无关。等一会儿再试；如果经常发生，该升级到 2 核了。",
+        "这是中转站自己的 CPU 打满了（1 核机器），和上游无关。不要连续重试，等一会儿再试；如果经常发生，该升级到 2 核了。",
     ),
     (
-        "token_revoked",
-        re.compile(r"token_revoked|invalidated oauth", re.I),
-        False,
-        "中转站凭据被踢了 —— 需要在服务器上重跑「重新播种凭据」脚本，或让 owner 重新登录上游账号。",
+        "rate_limited",
+        re.compile(r"rate limit|too many requests", re.I),
+        True,
+        "触发限流（HTTP 429）。稍等片刻再试；如果是频繁新建会话触发限速，去掉 --new-conv 续接当前会话即可绕开。",
     ),
     (
-        "no_model_access",
-        re.compile(r"no access to model", re.I),
-        False,
-        "这个令牌没有该模型的权限，去 new-api 后台的令牌限制里把它加上。",
+        "timeout",
+        re.compile(r"timed out|read operation timed out|\btimeout\b", re.I),
+        True,
+        "等待中转站/上游响应超时（可能后端排队或当前会话卡死）。"
+        "可重试一次；如果再次超时，建议加 --new-conv 换新会话或切 --model codex-gpt-image-2。",
+    ),
+    (
+        "network_error",
+        re.compile(
+            r"network error talking to|connection refused|connection reset|"
+            r"temporary failure in name resolution|name or service not known|ssl:",
+            re.I,
+        ),
+        True,
+        "连接中转站失败（网络中断、DNS 解析失败或沙盒未放行出站）。检查网络与 config.json 的 api_url 后重试一次。",
     ),
     (
         "bad_request",
-        re.compile(r"Invalid value|Unsupported value|not supported", re.I),
+        re.compile(r"Invalid value|Unsupported value|not supported|invalid json", re.I),
         True,
-        "请求参数被上游拒绝（比如不支持的推理档位/工具参数）—— 降一档 effort 再试。",
+        "请求参数被上游拒绝（常见原因：当前账号/模式不支持该推理档位或模型 slug）—— 降一档 --effort 或换模型再试。",
     ),
 ]
 
+_DEFAULT_UNKNOWN = (
+    "upstream_error",
+    True,
+    "上游返回了没有归类的错误。可以原样重试一次；连续出现就把原始报错贴出来。",
+)
 
-def classify_error(text: str = "") -> Dict[str, Any]:
-    """归类错误 → ``{"code", "hint", "retryable"}``。"""
+_CODE_META: Dict[str, Tuple[bool, str]] = {
+    code: (retryable, hint) for code, _pat, retryable, hint in _RULES
+}
+_CODE_META[_DEFAULT_UNKNOWN[0]] = (_DEFAULT_UNKNOWN[1], _DEFAULT_UNKNOWN[2])
+
+_STATUS_FALLBACK: Dict[int, str] = {
+    401: "token_invalid",
+    408: "timeout",
+    429: "rate_limited",
+}
+
+
+def is_refusal_code(code: str) -> bool:
+    return code in ("content_safety", "content_refusal")
+
+
+def classify_error(
+    text: str = "",
+    *,
+    http_status: Optional[int] = None,
+    code: Optional[str] = None,
+) -> Dict[str, Any]:
+    """归类错误 → ``{"code", "hint", "retryable"}``。
+
+    若调用方已明确给出已知 ``code``（如 ``no_image_data`` / ``deadline_exceeded``），
+    直接返回对应的 ``hint`` 与 ``retryable``，避免 ``CODE`` 与 ``HINT`` 错配。
+    """
+    if code and code in _CODE_META:
+        retryable, hint = _CODE_META[code]
+        return {"code": code, "hint": hint, "retryable": retryable}
+
     t = str(text or "")
-    for code, pattern, retryable, hint in _RULES:
+    for rule_code, pattern, retryable, hint in _RULES:
         if pattern.search(t):
-            return {"code": code, "hint": hint, "retryable": retryable}
+            return {"code": rule_code, "hint": hint, "retryable": retryable}
+
+    if http_status in _STATUS_FALLBACK:
+        fb_code = _STATUS_FALLBACK[http_status]
+        retryable, hint = _CODE_META[fb_code]
+        return {"code": fb_code, "hint": hint, "retryable": retryable}
+
     return {
-        "code": "upstream_error",
-        "hint": "上游返回了没有归类的错误。可以原样重试一次；连续出现就把原始报错贴出来。",
-        "retryable": True,
+        "code": _DEFAULT_UNKNOWN[0],
+        "hint": _DEFAULT_UNKNOWN[2],
+        "retryable": _DEFAULT_UNKNOWN[1],
     }
 
 
@@ -196,25 +325,15 @@ def describe_failure(
     text: str = "",
     *,
     http_status: Optional[int] = None,
+    code: Optional[str] = None,
     stage: str = "",
     categories: str = "",
     request_id: str = "",
+    secrets: Iterable[str] = (),
 ) -> Dict[str, Any]:
-    """一次性产出一份可打印、可写进 report-json 的失败描述。
-
-    返回::
-
-        {
-          "code": "content_refusal",
-          "hint": "...",
-          "retryable": False,
-          "zh": "一句中文摘要",
-          "http_status": 200,
-          "raw": "原始报错（截断）"
-        }
-    """
-    raw = str(text or "")
-    cls = classify_error(raw)
+    """一次性产出一份可打印、可写进 report-json、且已脱敏的失败描述。"""
+    raw = redact_secrets(str(text or ""), extra_secrets=secrets)
+    cls = classify_error(raw, http_status=http_status, code=code)
     zh = translate_upstream(raw)
     if not zh and stage:
         zh = humanize_moderation(stage=stage, categories=categories, request_id=request_id)
@@ -223,6 +342,7 @@ def describe_failure(
             zh = f"中转站返回 HTTP {http_status}，没有出图"
         else:
             zh = "出图失败"
+    zh = redact_secrets(zh, extra_secrets=secrets)
     return {
         "code": cls["code"],
         "hint": cls["hint"],

@@ -1,6 +1,6 @@
 # MSSK Image（`imagegen-relay`）
 
-给 Codex 用的生图技能，专配 **MSSK 中转站**（`relay.msskwithth.com:9443`）。
+给 Codex 用的生图技能，对接内部图像生成服务（地址在你的 `config.json` 里配）。
 装完直接说话就能出图——**不用装 Node.js / Go，不用配环境变量，不用重启客户端**。
 
 > **前置条件只有一个：Python 3.9+ 在 PATH 里**（Windows 上是 `python` 或 `py`）。
@@ -8,12 +8,17 @@
 > 只有用 `--max-dim` / `--exact-size` / `--output-format` 这几个高级参数时才需要 Pillow
 > （装了 `uv` 的话 launcher 会自动带上 Pillow，不用手动装）。
 
-> **v1.4.0（2026-11-19）**：网页管线的三个开关终于能用命令行控制了
-> （`--web-mode` / `--effort` / `--agent-model`，走 `style.mssk_*` 透传）；
-> 失败可以编程处理（`CODE=` / `RETRYABLE=` / `HINT=`，配 `--report-json`）；
-> 会话钥匙改成**按项目隔离**（原来同机两人会互相覆盖）。
+> **v1.5.0（2026-11-23）**：架构收敛 + 现存 bug 全清 + 分层超时 + 文档瘦身。
+> 错误分类收敛为单一真相源（`scripts/relay_errors.py`），`RAW=` 与 report-json 自动脱敏
+> `sk-*` / `Bearer` / `api_key`；去除全局可变态（batch 并发不再串扰）；`--dry-run` 严格零磁盘副作用；
+> 新增 `setup --show`（安全查看配置，绝不回显 key）、`--strict-n`、`--skip-existing`、Fail-Fast 预检；
+> 分层超时（常规 150s/240s，重任务 300s/480s）；自检从 31 项扩到 **58 项**。
+> `SKILL.md` 从 877 行精简到 ~270 行（与官方骨架对齐），实测数据下沉到 `references/safety-refusals.md`。
 >
-> 更早：v1.3.0 加了 GIF 动图与多图返回；v1.2.0 起图像请求直连上游原生端点（快 2～3 倍）。
+> **v1.4.0（2026-11-19）**：网页管线三件套（`--web-mode` / `--effort` / `--agent-model`，走 `style.mssk_*` 透传）；
+> 失败可编程（`CODE=` / `RETRYABLE=` / `HINT=` + `--report-json`）；会话钥匙按项目隔离。
+>
+> 更早：v1.3.0 加了 GIF 动图与多图返回；v1.2.0 起图像请求直连原生端点（快 2～3 倍）。
 > 行为契约看 `imagegen-relay/SKILL.md` 与 `imagegen-relay/references/relay-api.md`。
 
 ---
@@ -62,7 +67,7 @@ cp imagegen-relay/config.example.json imagegen-relay/config.json
 
 ```json
 {
-  "api_url": "https://relay.msskwithth.com:9443/v1",
+  "api_url": "https://relay.example.com:9443/v1",
   "api_key": "sk-你的令牌"
 }
 ```
@@ -165,7 +170,7 @@ imagegen-relay/                  ← 一个标准 skill 目录，整体拷进 .c
 | 提示 `Output already exists` | 加 `--force`，或换个输出路径 |
 | 完全不出图 | 先确认 `config.json` 里的令牌没过期；再看 shim 容器是否在跑 |
 | `Python 3 was not found` | 装 Python 3.9+，或确认 `python` 在 PATH 里 |
-| `SSL: UNEXPECTED_EOF_WHILE_READING` / 连不上 | **开 Clash 的时候容易踩**：如果 `msskwithth.com` 没走 DIRECT，或 DNS 用了 `1.1.1.1`（国内直连不通）→ 解析超时 5 秒 → 打不开。把域名加进 DIRECT 规则并指定国内 DNS；最省事的办法是**访问本站时不挂代理**（本来就该直连，更快） |
+| `SSL: UNEXPECTED_EOF_WHILE_READING` / 连不上 | **开 Clash 的时候容易踩**：如果服务域名没走 DIRECT，或 DNS 用了 `1.1.1.1`（国内直连不通）→ 解析超时 5 秒 → 打不开。把域名加进 DIRECT 规则并指定国内 DNS；最省事的办法是**访问本站时不挂代理**（本来就该直连，更快） |
 | 401 / `invalid token` | 令牌填错，或建令牌时**没留空分组**、开了模型限制 |
 
 运维命令（在 VPS 上）：
@@ -182,6 +187,24 @@ cd /opt/codex-relay/deploy && sudo sed -i 's/NATIVE_IMAGES=1/NATIVE_IMAGES=0/' d
 ---
 
 ## 变更记录
+
+**v1.5.0（2026-11-23）**
+
+- 修复 11 个 `@4k` 预设全挂（`_apply_preset` 上限对齐 8,294,400 像素）
+- 修复 `generate-batch` 读 JSONL 未去 BOM（改 `utf-8-sig`）
+- 错误分类收敛为单一真相源：删掉 `image_gen.py` 里的重复实现（顺带修掉 `sexual/minors` 被 `/` 误切）、
+  修 503 `system cpu overloaded` 被当可重试、修 `no_image_data` 匹配不到 `returned no images`、
+  补 `timeout` / `deadline_exceeded` / `network_error` / `rate_limited` / `no_channel`
+- `RAW=` 与 `--report-json` 强制脱敏 `sk-*` / `Bearer` / `api_key`
+- 消除结构性重复：删重复 `_cmd_setup`、统一 `WireStyle`（`style.mssk_*` → multipart `web_*` 单一映射）、
+  去掉 `_LAST_PIPELINE` / `_EXACT_SIZE_REQUEST` 全局态（消除 batch 并发竞态）
+- `--dry-run` 严格零磁盘副作用（不再写 `.imagegen/conv-*`）；edit/batch 预览如实含 style
+- 新增 `setup --show [--json]`（安全查看配置，不回显 key）、`--strict-n`、`generate-batch --skip-existing`、
+  付费调用前 Fail-Fast 预检路径可写性、原子写盘（tempfile + os.replace）
+- 修复 `n>1` 多余产物命名（`foo-1..foo-4` 而非 `foo-1-1`）、`--report-json` 记录真实落盘路径
+- 分层超时：常规单图 150s/240s；重任务（`n>1` / `work` / `extended+` / `reference`）300s/480s
+- 文档：`SKILL.md` 877 行 → ~270 行，与官方骨架对齐；实测数据下沉 `references/safety-refusals.md`
+- 自检 31 项 → **58 项**
 
 **v1.4.0（2026-11-19）**
 

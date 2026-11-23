@@ -1,52 +1,24 @@
 # CLI reference (`scripts/image_gen.py`)
 
-This CLI is a sibling of the official `imagegen` skill's fallback CLI: same subcommands, same
-flags, same prompt-augmentation engine, same output-path rules, same batch JSONL semantics.
-Only the transport differs -- it talks to the MSSK relay instead of `api.openai.com`, and it
-needs no `openai` package.
+This CLI is the relay sibling of official `imagegen`'s `scripts/image_gen.py`: same core subcommands (`generate`, `edit`, `generate-batch`), same official flags and prompt-augmentation engine, same output-path and batch JSONL semantics — plus relay-specific routes (`reference`, `setup`, `tiers`, `models`) and a stdlib-only HTTP transport (Python 3.9+; Pillow optional for local resample/re-encode).
 
 ## What this CLI does
+- `generate`: generate a new image from a prompt (`POST /v1/images/generations`)
+- `edit`: edit existing image(s) or run ratio-locked reference-driven generation (`POST /v1/images/edits`, primary reference route on this relay)
+- `reference`: chat-model-driven reference generation via `POST /v1/responses` + hosted `image_generation` tool (use when changing aspect ratio from the reference or for free style reinterpretation; ignores `style.mssk_*`, use `--reasoning-effort`)
+- `generate-batch`: run many generation jobs concurrently from a JSONL file (`--out-dir` required)
+- `setup`: persist web-pipeline defaults (`--web-mode`, `--effort`, `--agent-model`) into `config.json`, or inspect safely with `--show [--json]` (never exposes `api_key`)
+- `tiers`: list web-pipeline surface & reasoning tiers (`tiers` → `tiers --mode chat|work [--json]`)
+- `models`: list image-capable models exposed by the relay (`GET /v1/models`)
 
-Two routes, matching the official skill's two layers (see `SKILL.md`, Relay fact 1):
+Real calls require **network access** + `config.json` (or `IMAGE_RELAY_URL`/`IMAGE_RELAY_KEY`). `--dry-run` requires neither, writes zero files (does not touch `.imagegen/conv-*`), and echoes the exact wire payload (redacting base64 images on `reference`).
 
-- **Tool route** (`reference`): `POST /v1/responses` with the hosted `image_generation` tool. The
-  chat model integrates the reference image(s) itself. This is the relay counterpart of the
-  official built-in `image_gen` path.
-- **Images route** (`generate` / `edit` / `generate-batch`): `POST /v1/images/generations` and
-  `POST /v1/images/edits` -- the relay counterpart of the official fallback CLI.
-- `models`: list the image-capable models the relay exposes (relay-only diagnostics).
+## Quick start (via launcher)
 
-Real calls need network access plus a relay token. `--dry-run` needs neither.
-
-## Reference mode (tool route)
-
-```powershell
-& "$env:USERPROFILE\.codex\skills\imagegen-relay\bin\run.cmd" reference `
-  --image "input/character.png" `
-  --prompt "把这个角色放进一张炫酷的收藏卡牌，卡面加入夜间球场灯光与蓝金边框" `
-  --out "output/imagegen/character-card.png"
-```
-
-- `--image` may be repeated; every image is sent as a reference.
-- `--model` defaults to `gpt-6-astra` (a chat model that drives the image tool). `gpt-5.6-sol`
-  also works. This is not the Images-route model.
-- `--size`, `--quality`, `--background` are forwarded to the **tool definition**, not to the
-  Images API.
-- `--max-dim` (default 1400) downscales the reference before upload when Pillow is available;
-  `--max-dim 0` uploads the original bytes.
-- Measured: 44.6 s wall clock, output 1024x1536 for a portrait reference (the tool picks its own
-  geometry, unlike the Images route's fixed ~1.57 MP fold).
-- Failure shape: the tool call ends `status=failed`, the CLI prints one clean
-  `Error: reference generation failed ... (tool status: ...)` line and relays the model's own
-  explanation. It never retries a refusal.
-
-## Images route
-
-## How to call it
-
-Always go through the launcher, which reads `config.json` and injects the endpoint and token:
+Always invoke through the launcher so `config.json` credentials are injected automatically:
 
 ```powershell
+# Windows (PowerShell)
 & "$env:USERPROFILE\.codex\skills\imagegen-relay\bin\run.cmd" generate `
   --prompt "A cozy alpine cabin at dawn" `
   --size 1672x941 `
@@ -54,105 +26,78 @@ Always go through the launcher, which reads `config.json` and injects the endpoi
 ```
 
 ```bash
+# macOS / Linux
 sh ~/.codex/skills/imagegen-relay/bin/run.sh generate \
   --prompt "A cozy alpine cabin at dawn" \
   --size 1672x941 \
   --out output/imagegen/alpine-cabin.png
 ```
 
-Calling `python scripts/image_gen.py` directly works too, when `IMAGE_RELAY_URL` and
-`IMAGE_RELAY_KEY` (or `config.json`) are already in place.
-
-## Guardrails
-
-- Prefer the launcher; it is what makes the token configuration invisible.
-- Do **not** create one-off runners (`gen_images.py` and friends) around this CLI.
-- Do **not** rewrite the transport layer to add an SDK; it is dependency-free on purpose.
-- A content-safety refusal is final -- do not retry it, do not soften the user's wording on your
-  own initiative.
-
-## Defaults
-
-- Model: `gpt-image-2` (the only image model this relay serves)
-- Size: `auto` (renders 1:1)
-- Quality: `medium` (no prompt hint; see the mapping table in `relay-api.md`)
-- Output format: `png`
-- Default one-off output path: `output/imagegen/output.png`
-- Batch concurrency: `2` (official CLI default is 5; calibrated for this relay)
-- Request timeout: 300 s, retries: 3
-
-## Sizes
-
-`--size` selects an aspect ratio; the upstream always renders at roughly 1.57 MP.
-
-| Wanted ratio | Pass `--size` | Actual output |
-| --- | --- | --- |
-| 1:1 square | `1254x1254` | 1254x1254 |
-| 16:9 landscape | `1672x941` | 1672x941 |
-| 9:16 portrait | `941x1672` | 941x1672 |
-| ultra-wide | `2206x713` | 2206x713 |
-| 3:2 | `1536x1024` | 1536x1024 |
-| 4:3 | `1448x1086` | 1448x1086 |
-
-- No size given -> `auto` -> 1:1.
-- `--size 1024x1024` is accepted and produces 1254x1254: the pixel count is not honoured.
-- Official gpt-image-2 size constraints (multiples of 16, long:short <= 3:1, 655,360-8,294,400
-  pixels) are checked as **warnings** here; `--strict-size` turns them back into hard errors.
-- If the user asks for 4K/2K, say plainly that this relay cannot: the upstream is fixed at
-  ~1.57 MP and the only control is the aspect ratio.
-
-Fast draft / final asset examples:
+Dry-run (free, zero disk side effects):
 
 ```powershell
 & "$env:USERPROFILE\.codex\skills\imagegen-relay\bin\run.cmd" generate `
-  --prompt "A product thumbnail of a matte ceramic mug on a stone surface" `
-  --size 1254x1254 --out output/imagegen/mug-draft.png
-
-& "$env:USERPROFILE\.codex\skills\imagegen-relay\bin\run.cmd" generate `
-  --prompt "A polished landing-page hero image of a matte ceramic mug on a stone surface" `
-  --size 1672x941 --out output/imagegen/mug-hero.png
+  --prompt "Test" --out output/imagegen/test.png --dry-run
 ```
 
-## Quality, background, fidelity, masks
+Check setup safely without reading `config.json`:
 
-`--quality` works for `generate`, `edit`, and `generate-batch`, but it is folded into the prompt
-(`high` -> `Quality: high quality, rich detail`, `low` -> `Quality: keep it simple`, `medium`/`auto`
--> nothing). There is no real quality setting on this relay.
+```powershell
+& "$env:USERPROFILE\.codex\skills\imagegen-relay\bin\run.cmd" setup --show --json
+```
 
-`--background transparent` appends a transparency requirement to the prompt and keeps PNG output.
-It is an emulation, not an API parameter; for complex subjects use
-`scripts/remove_chroma_key.py` as the fallback. `--background opaque` / `auto` are no-ops.
+## Guardrails
+- Always call the bundled launcher (`bin/run.cmd` / `bin/run.sh`).
+- Do **not** create one-off runners (`gen_images.py` and friends) or add an OpenAI SDK.
+- **Never modify** `scripts/image_gen.py`. If something is missing, ask the user before doing anything else.
+- Never retry a `RETRYABLE=no` failure code; never silently rewrite the user's clothing/intent on content-safety refusal.
 
-`--input-fidelity` is edit-only and validated as `low|high`, then ignored (gpt-image-2 always uses
-high fidelity). `--mask` is edit-only and passed through as a multipart part; upstream behaviour is
-not yet characterised -- describe the region in the prompt as well.
+## Defaults
+- Model: `gpt-image-2` (web session pipeline first + native fallback) or `codex-gpt-image-2` (native subscription endpoint only); `reference` defaults to `gpt-6-astra`
+- Size: `auto` (renders 1:1 at 1254×1254)
+- Quality: `medium` (no prompt hint)
+- Output format: `png`
+- Default one-off output path: `output/imagegen/output.png`
+- Batch concurrency: `2` (calibrated for this relay; official default is 5)
+- Layered timeouts (overridable with `--timeout` / `--deadline`):
+  - Normal single-image (`n=1`, not `work`, not `extended/xhigh/max`): `150s` timeout / `240s` deadline
+  - Heavy (`n>1`, `work`, `extended/xhigh/max`, `reference`): `300s` timeout / `480s` deadline
+- Retries: `--max-attempts 3` (long >=60s render timeouts capped at 1 retry; non-retryable codes like `relay_cpu` 503 are never retried); `--retry-refusal 0`; `--preflight off`
+
+## Sizes & Presets
+
+Upstream always renders at ~1.57 MP per aspect ratio. Pass `--size` for native output or `--preset <ratio>@2k|4k` / `--exact-size WxH` (`--fit cover|contain`) for exact locally-resampled delivery (11 ratios: `1:1 3:2 2:3 4:3 3:4 16:9 9:16 2:1 1:2 7:4 4:7`, up to 8,294,400 px):
+
+| Wanted ratio | Native `--size` | 2K preset | 4K preset (local upscale) |
+| --- | --- | --- | --- |
+| 1:1 square | `1254x1254` | `1:1@2k` (2048×2048) | `1:1@4k` (2880×2880) |
+| 16:9 landscape | `1672x941` | `16:9@2k` (2048×1152) | `16:9@4k` (3840×2160) |
+| 9:16 portrait | `941x1672` | `9:16@2k` (1152×2048) | `9:16@4k` (2160×3840) |
+| 3:2 / 4:3 / ultra-wide (3.09:1) | `1536x1024` / `1448x1086` / `2206x713` | `3:2@2k` / `4:3@2k` | `3:2@4k` / `4:3@4k` |
+
+## Quality, background, input fidelity, and masks
+- `--quality` works for `generate`, `edit`, and `generate-batch`, folded into the prompt (`high` → `Quality: high quality, rich detail`, `low` → `Quality: keep it simple`, `medium`/`auto` → none).
+- `--background transparent` appends a transparency requirement to the prompt and keeps PNG alpha (complex subjects: fall back to `scripts/remove_chroma_key.py`). `--background opaque`/`auto` are no-ops.
+- `--input-fidelity` is **edit-only**, validated as `low|high`, then ignored (`gpt-image-2` always uses high fidelity).
+- `--mask` is **edit-only** and uploaded as a multipart part.
 
 Mask notes:
-
-- For multi-image edits, pass repeated `--image` flags; their order is meaningful.
-- Image and mask should be the same size and format, each under 50MB.
-- Masks should be PNG with an alpha channel.
-- If multiple input images are provided, the mask applies to the first image.
-- Masking is prompt-guided; do not promise pixel-perfect boundaries.
+- For multi-image edits, pass repeated `--image` flags; their order is meaningful, so reference each image by index and role in the prompt.
+- Image and mask must be under 50MB and should share size/format; masks should be PNG with an alpha channel.
+- If multiple input images are provided, `--mask` applies to the first image.
+- Masking is prompt-guided; describe the edit region and repeat invariants (`change only X; keep Y unchanged`) in the prompt.
 
 ## Output handling
+- Use `tmp/imagegen/` for temporary JSONL inputs or scratch files; use `output/imagegen/` for final workspace outputs.
+- Target file conflicts (without `--force`) and directory write permissions are checked **before** making any paid API request.
+- All outputs, sprites, and JSON reports are written atomically (`tempfile` + `os.replace`).
+- `--out-dir` changes one-off naming to `image_1.<ext>`, `image_2.<ext>`, and so on; downscaled copies use `-web`.
+- Animated GIFs (`GIF87a`/`GIF89a`) force `.gif`, write upstream bytes verbatim (skipping Pillow resample/re-encode), and save `<name>-sprite.png` if supplied.
+- `--report-json` records actual written paths (including `.gif` switches, extra web-pipeline assets, `sprites`, `downscaled`, and PNG/GIF/JPEG/WebP `pixels`).
 
-- Use `tmp/imagegen/` for temporary JSONL inputs or scratch files.
-- Use `output/imagegen/` for final outputs.
-- Reruns fail if a target file already exists unless you pass `--force`.
-- `--out-dir` changes one-off naming to `image_1.<ext>`, `image_2.<ext>`, and so on.
-- Downscaled copies use the default suffix `-web` unless you override it.
-- Non-PNG `--output-format` values (and `--output-compression`) are produced by local re-encoding
-  and need Pillow. Without Pillow the CLI stops with a message that shows how to run through `uv`.
-- **Animated GIF** (2026-11-06): when the relay returns `mime_type: image/gif`, the CLI forces a
-  `.gif` extension, writes the upstream bytes **verbatim** (Pillow would keep only frame 1), skips
-  `--exact-size` / `--downscale`, and writes the accompanying sprite grid as `<name>-sprite.png`.
-  `data[]` can hold **several** images per turn: `--out base.png` then writes `base.png`,
-  `base-1.png`, `base-2.png`, … one file per entry.
+## Common recipes
 
-## Recipes
-
-Generate with augmentation fields (identical output to the official CLI):
+Generate with augmentation fields + 2K preset:
 
 ```powershell
 & "$env:USERPROFILE\.codex\skills\imagegen-relay\bin\run.cmd" generate `
@@ -161,111 +106,67 @@ Generate with augmentation fields (identical output to the official CLI):
   --style "clean product photography" `
   --composition "wide product shot with usable negative space for page copy" `
   --constraints "no logos, no text" `
+  --preset 16:9@2k `
   --out output/imagegen/mug-hero.png
 ```
 
-Generate plus a downscaled copy for fast web loading:
+Generate strictly 4 variants on the web pipeline (`--strict-n` runs 4 sequential `n=1` calls):
 
 ```powershell
 & "$env:USERPROFILE\.codex\skills\imagegen-relay\bin\run.cmd" generate `
-  --prompt "A cozy alpine cabin at dawn" `
-  --size 1254x1254 --downscale-max-dim 1024 `
-  --out output/imagegen/alpine-cabin.png
+  --prompt "Four cozy lantern icons" --n 4 --strict-n --out output/imagegen/lantern.png
 ```
 
-Batch (JSONL), two prompts concurrently:
+Edit with reference image + multi-line prompt file:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\imagegen-relay\bin\run.cmd" edit `
+  --image "input/character.png" `
+  --prompt-file "tmp/imagegen/brief.txt" `
+  --out "output/imagegen/character-card.png"
+```
+
+Batch (JSONL, `utf-8-sig` PowerShell BOM safe) with resume support:
 
 ```powershell
 New-Item -ItemType Directory -Force tmp/imagegen, output/imagegen/batch | Out-Null
 @'
-{"prompt":"Cavernous hangar interior with a compact shuttle parked near the center","use_case":"stylized-concept","composition":"wide-angle, low-angle","lighting":"volumetric light rays through drifting fog","constraints":"no logos or trademarks; no watermark","size":"1672x941"}
-{"prompt":"Gray wolf in profile in a snowy forest","use_case":"photorealistic-natural","composition":"eye-level","constraints":"no logos or trademarks; no watermark","size":"1254x1254"}
+{"prompt":"Cavernous hangar interior with a compact shuttle parked near the center","use_case":"stylized-concept","size":"1672x941"}
+{"prompt":"Gray wolf in profile in a snowy forest","use_case":"photorealistic-natural","size":"1254x1254"}
 '@ | Set-Content tmp/imagegen/prompts.jsonl -Encoding UTF8
 
 & "$env:USERPROFILE\.codex\skills\imagegen-relay\bin\run.cmd" generate-batch `
   --input tmp/imagegen/prompts.jsonl `
   --out-dir output/imagegen/batch `
-  --concurrency 2
+  --concurrency 2 `
+  --skip-existing `
+  --report-json tmp/imagegen/batch-report.json
 ```
 
 Notes:
-
-- `generate-batch` requires `--out-dir`.
-- Per-job overrides are supported in JSONL (`model`, `n`, `size`, `quality`, `background`,
-  `output_format`, `output_compression`, `moderation`, `out`, all 11 augmentation fields either
-  flat or nested under `fields`).
-- `--n` generates variants of one prompt; `generate-batch` is for many different prompts.
-- In batch mode, per-job `out` is treated as a filename under `--out-dir`.
-- Keep `--concurrency` at 2. One render takes 20-60 s here; higher concurrency buys contention,
-  timeouts, and content-safety refusals rather than speed.
+- `generate-batch` requires `--out-dir`; per-job overrides support `model`, `n`, `size`, `quality`, `background`, `output_format`, `output_compression`, `moderation`, `out`, and all 11 augmentation fields (flat or under `fields`).
+- Batch strips `mssk_conv` (each job runs independently) and writes ordered success + failure records to `--report-json`.
 
 ## Relay-only flags
 
 | Flag | Purpose |
 | --- | --- |
-| `--base-url URL` | override the relay URL for one run (token still comes from `config.json`) |
-| `--timeout SECONDS` | per-request timeout, default 300 |
-| `--deadline SECONDS` | hard wall-clock budget for one job, default 600; the CLI aborts cleanly instead of grinding for tens of minutes |
-| `--max-attempts N` | transient-failure retries (5xx / 429 / timeouts), default 3 |
-| `--retry-refusal N` | re-sends after an upstream content-safety refusal with a semantically neutral variation, **default 0 (off)**. The output-side gate is stochastic, so this is the difference between ~1/3 and ~70-87% success on a person edit; identical bodies are cached and get the same refusal |
-| `--preflight` | coverage preflight, **default `off`** (prompt is sent unchanged). `auto` = person prompts only, `always` = every request; it neutralises body/garment vocabulary and appends one clothing/coverage constraint, printing every change (see `SKILL.md`, Relay fact 7) |
-| `--check-model` | verify the model against `/v1/models` before spending a generation |
-| `--strict-size` | restore the official hard failure on gpt-image-2 size constraints |
-| `--report-json PATH` | write a JSON report (prompt, outputs, `actual_size`, pixels, timing); **on failure** it writes `{ok:false, error:{code,hint,retryable,http_status,raw}}` instead |
-| `--web-mode chat\|work` | web-pipeline surface. `chat` (default) has the higher pass rate; `work` suits cards / site assets / long iterative edits. Native endpoint ignores it |
-| `--effort TIER` | web-pipeline reasoning tier, sent as `thinking_effort`. `none/minimal/low/standard/medium/high/extended/xhigh/max/ultra` -- run `tiers` for the list. Higher is **slower and refused more often** |
-| `--agent-model SLUG` | pick the upstream reasoning model explicitly (default auto). Prefer `--effort` |
-| `--conv-key NAME` | pin the upstream conversation explicitly; needed when several threads run inside one project |
-| `--new-conv` | start a fresh upstream conversation |
-
-While a request is in flight the CLI prints a `[waiting] …s elapsed` heartbeat every 20 s, so a
-long render never looks like a hang. Content-safety refusals are printed as a single clean
-`Error: …` line (never a traceback) and are never retried locally.
-
-## Reasoning tiers (web pipeline)
-
-```bash
-image_gen.py tiers                      # chat surface (default)
-image_gen.py tiers --mode work          # work surface (5 slider steps, no "instant")
-image_gen.py tiers --json               # machine-readable
-```
-
-Tiers are **not** a quality slider for the image model -- they pick how much reasoning the upstream
-chat model spends before it draws. Two naming sets coexist because the upstream uses different
-vocabularies per surface:
-
-| Surface | Values sent as `thinking_effort` |
-| --- | --- |
-| work (slider) | `minimal` / `low` / `standard` / `extended` / `max` |
-| chat (account presets) | whatever the account declares -- `medium` / `high` / `xhigh` / `ultra` observed |
-
-`none` means "send no `thinking_effort`" (instant). An unsupported value returns `bad_request`;
-drop one tier and retry once.
-
-## Dry run (free)
-
-```powershell
-& "$env:USERPROFILE\.codex\skills\imagegen-relay\bin\run.cmd" generate `
-  --prompt "test" --dry-run
-```
-
-`--dry-run` makes no network call, needs no token, and echoes the payload. It prints the same keys
-as the official CLI plus three relay keys: `wire_payload` (what actually goes on the wire),
-`base_url`, and `endpoint`.
-
-## Common failure messages
-
-| Message | Cause | Action |
-| --- | --- | --- |
-| `Relay token is not configured` | `api_key` in `config.json` is empty | the user fills it in locally; never ask for the token in chat |
-| `relay rejected the token (HTTP 401)` | token deleted or expired | recreate it in the relay console, update `config.json` |
-| `relay has no channel for this model` | model other than `gpt-image-2` | use `gpt-image-2` |
-| `上游内容安全系统拒绝：<text>` | upstream content-safety decision | relay `<text>` verbatim; do not retry or rewrite |
-| timeout / `429` / `5xx` | upstream busy | the CLI already retried; wait and retry once, never in a loop |
+| `--base-url URL` | Override relay URL for one run |
+| `--timeout SECONDS` | Per-request HTTP timeout (auto: `150` normal / `300` heavy) |
+| `--deadline SECONDS` | Hard per-job wall-clock budget shared across all retries (auto: `240` normal / `480` heavy) |
+| `--max-attempts N` | Transient retries (default `3`; >=60s render timeouts capped at `1`) |
+| `--retry-refusal N` | Retry stochastic output-stage safety refusals with neutral variations (default `0`; skips `stage=input`) |
+| `--preflight off\|auto\|always` | Coverage preflight (default `off`; see `references/safety-refusals.md`) |
+| `--strict-n` | On `generate` with `gpt-image-2` and `--n > 1`, run `n` sequential `n=1` calls |
+| `--skip-existing` | On `generate-batch`, skip already-completed non-empty outputs |
+| `--preset RATIO@2k\|4k` / `--exact-size WxH` / `--fit` | Ratio hint + exact local Lanczos resample |
+| `--web-mode chat\|work` / `--effort TIER` / `--agent-model SLUG` | Web-pipeline controls (`work` + `--effort none` rejected; `--effort max` is an advanced CLI-only tier hidden from `tiers`'s 4-tier UI menu; `--agent-model auto` overrides config back to auto) |
+| `--conv-key NAME` / `--new-conv` | Pin or rotate `<cwd>/.imagegen/conv-<hash>` (persisted after live call succeeds) |
+| `--gif-speed 0.25..2` | GIF playback speed multiplier (`animation.frame_duration_ms` only) |
+| `--check-model` / `--strict-size` / `--report-json PATH` | Model probe / official hard size validation / structured report |
 
 ## See also
-
-- `references/relay-api.md` -- wire contract, measured behaviour, error vocabulary
-- `references/prompting.md` -- shared prompting principles (verbatim from the official skill)
-- `references/sample-prompts.md` -- copy/paste prompt recipes (verbatim from the official skill)
-- `references/codex-network.md` -- network/sandbox notes for this installation
+- `references/relay-api.md` — wire contracts, `style.mssk_*`, GIF JSON schema, tier mechanics
+- `references/safety-refusals.md` — safety gates, ablation data, `--preflight`, browser-vs-CLI troubleshooting
+- `references/prompting.md` & `references/sample-prompts.md` — shared prompting principles & recipes
+- `references/codex-network.md` — network/sandbox notes for this installation

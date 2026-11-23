@@ -1,117 +1,38 @@
 # Relay API quick reference
 
 This file describes the MSSK relay image routes that `scripts/image_gen.py` talks to.
-It replaces the official skill's `references/image-api.md`, which documents the OpenAI-hosted
-Image API (`api.openai.com`) and therefore does not apply here.
+It replaces the official skill's `references/image-api.md` (which targets `api.openai.com`).
 
-Read it when you need the exact wire contract, the measured behaviour of this relay, or the
-error vocabulary used by `new-api`.
+## Endpoint & Credential Resolution
 
-## Endpoint resolution
+1. `config.json` in the skill root (`api_url`, `api_key`) — normal path.
+2. Environment variables: `IMAGE_RELAY_URL` / `IMAGE_RELAY_KEY` → `CODEX_API_URL` / `CODEX_API_KEY` → `OPENAI_BASE_URL` / `OPENAI_API_KEY`.
+3. `--base-url` overrides the URL only; a URL without trailing `/vN` gets `/v1` appended automatically.
+4. Both `api_url` (`http://` or `https://`) and `api_key` are required before any live call (missing either fails fast cleanly).
 
-The CLI resolves credentials in this order:
+The relay certificate is verified normally; there is deliberately no `--insecure` flag.
 
-1. `config.json` in the skill root (`api_url`, `api_key`) -- the normal path.
-2. Environment variables: `IMAGE_RELAY_URL` / `IMAGE_RELAY_KEY`,
-   then `CODEX_API_URL` / `CODEX_API_KEY`, then `OPENAI_BASE_URL` / `OPENAI_API_KEY`.
-3. Built-in default: `https://relay.msskwithth.com:9443/v1`.
-
-`--base-url` overrides the URL only; the token always comes from `config.json` or the environment.
-A URL without a trailing `/v1` gets `/v1` appended automatically.
-
-The certificate on `relay.msskwithth.com:9443` is a valid Let's Encrypt certificate, so no
-`-k` / `--insecure` / certificate-bypass flag exists or is needed.
-
-## Routes
+## Routes & Pipelines
 
 | Route | Method | Body | Auth |
 | --- | --- | --- | --- |
-| `/v1/responses` | POST (**`stream: true` required**) | JSON | `Authorization: Bearer <token>` |
 | `/v1/images/generations` | POST | JSON | `Authorization: Bearer <token>` |
-| `/v1/images/edits` | POST | `multipart/form-data` | `Authorization: Bearer <token>` |
-| `/v1/models` | GET | -- | `Authorization: Bearer <token>` |
+| `/v1/images/edits` | POST | Codex JSON or OpenAI `multipart/form-data` | `Authorization: Bearer <token>` |
+| `/v1/responses` | POST (**`stream: true` required**) | JSON (SSE response) | `Authorization: Bearer <token>` |
+| `/v1/models` | GET | — | `Authorization: Bearer <token>` |
 
-## Responses route (the tool route)
+### Two image model slugs (execution layer routing)
 
-`POST /v1/responses` with `stream: true` (without it the relay answers 400 `Stream must be set to
-true`), a chat model (`gpt-6-astra`, `gpt-5.6-sol`), and the hosted image tool:
+- **`gpt-image-2`** (default): web session pipeline first (`backend-api/f/conversation` + `system_hints:["picture_v2"]`, ~25–45 s), automatically falls back to the native subscription endpoint if the web attempt fails. On fallback, the response includes `degraded: true` and `degraded_reason`.
+- **`codex-gpt-image-2`**: native subscription endpoint only (`/backend-api/codex/images/*`, ~15–30 s, stricter safety gate, no fallback).
 
-```json
-{
-  "model": "gpt-6-astra",
-  "input": [{"role": "user", "content": [
-    {"type": "input_text", "text": "<prompt>"},
-    {"type": "input_image", "image_url": "data:image/png;base64,..."}
-  ]}],
-  "tools": [{"type": "image_generation"}],
-  "store": false,
-  "stream": true
-}
-```
+### Why `image_generation` built-in tool does not work on custom providers (verified 2026-10-16)
 
-The image arrives in an SSE event as an `image_generation_call` item with a `status` of
-`in_progress` -> `generating` -> `completed` (or `failed`) and a base64 `result`. Measured event
-types: `response.created`, `response.output_item.added`, `response.image_generation_call.*`,
-`response.output_text.delta`, `response.output_item.done`, `response.completed`, plus `keepalive`
-frames during long renders.
+Four `codex exec` captures against a custom provider `base_url` confirmed that the Codex client omits the hosted `image_generation` tool from `/v1/responses` whenever a custom/relay provider is active. Neither a relay rewrite nor a translation shim restores the built-in tool; this CLI is the supported image path.
 
-Practical notes:
+## Web-Pipeline Controls (`style.mssk_*` & Multipart `web_*`)
 
-- Latency: 42 s (reference card render) to 135 s (when the tool refuses and two models are tried).
-- The tool chooses its own output geometry (measured 1024x1536 for a portrait reference).
-- `--size` / `--quality` / `--background` belong to the tool definition here, not to the Images
-  route parameters.
-- When the tool reports `failed`, the assistant usually writes an explanation; the CLI relays it
-  verbatim.
-
-## Generate request
-
-Only these fields go on the wire. Anything else the official CLI accepts is resolved locally
-(see "Locally resolved controls" below) instead of being sent, so the relay can never reject
-the request because of an unknown parameter.
-
-```json
-{
-  "model": "gpt-image-2",
-  "prompt": "<final prompt, augmentation already applied>",
-  "n": 1,
-  "size": "1672x941"
-}
-```
-
-- `size` is **omitted** when it is `auto`; the relay then renders 1:1.
-- `n` is 1-10 (variants of one prompt).
-
-## Edit request
-
-Multipart fields: `model`, `prompt`, `n`, plus one repeated `image` part per input image and an
-optional `mask` part. `size` is not sent: an edit follows the input image's aspect ratio.
-
-## Response
-
-```json
-{
-  "created": 1792120342,
-  "data": [
-    {
-      "b64_json": "iVBORw0KGgo...",
-      "revised_prompt": "a single flat red circle ...",
-      "size": "1254x1254"
-    }
-  ]
-}
-```
-
-- `data[].b64_json` is the normal path; `data[].url` is also supported by the CLI.
-- `data[].size` is the **actual** output size -- report it verbatim (`actual_size`).
-- `data[].revised_prompt` has been observed to echo the request, not to rewrite it. When the CLI
-  reports a `revised_prompt` that differs from what it sent, trust the reported one.
-
-## Web-pipeline controls go inside `style`
-
-`new-api` deserialises the image request into a strongly-typed struct, so **unknown top-level JSON
-fields are silently dropped** before the request reaches the shim. The `style` field is
-`json.RawMessage` and passes through untouched, which is why every relay-only knob lives there:
+`new-api` deserializes JSON image requests into a strongly-typed struct and **silently drops unknown top-level JSON fields**. Only `style` (`json.RawMessage`) passes through untouched to the execution layer:
 
 ```json
 {
@@ -119,123 +40,92 @@ fields are silently dropped** before the request reaches the shim. The `style` f
   "prompt": "...",
   "n": 1,
   "style": {
-    "mssk_conv": "project-a:card-1",
+    "mssk_conv": "skill-a1b2c3d4e5f6",
     "mssk_mode": "work",
     "mssk_effort": "extended",
-    "mssk_model": "",
+    "mssk_model": "gpt-6-astra-wm",
     "mssk_gif_speed": "1.5"
   }
 }
 ```
 
-| Key | Meaning |
-| --- | --- |
-| `mssk_conv` | conversation key; the shim maps it to the upstream `conversation_id` + `parent_message_id` and continues that thread |
-| `mssk_mode` | `chat` / `work` surface |
-| `mssk_effort` | reasoning tier -> `thinking_effort` |
-| `mssk_model` | upstream reasoning model slug (empty = auto) |
-| `mssk_gif_speed` | GIF playback speed multiplier |
+| JSON (`style.*`) | Multipart `/v1/images/edits` field | Meaning |
+| --- | --- | --- |
+| `mssk_conv` | `web_conv_key` | Conversation key mapped to upstream `conversation_id` + `parent_message_id` (avoids new-conversation rate limit) |
+| `mssk_mode` | `web_mode` | Surface: `chat` (default) or `work` |
+| `mssk_effort` | `web_effort` | Reasoning tier → `thinking_effort` (`none` MUST be omitted, never sent as `"none"`) |
+| `mssk_model` | `web_model` | Upstream reasoning model slug (omitted for `auto`) |
+| `mssk_gif_speed` | `gif_speed` | GIF playback speed multiplier (`0.25`..`2`, scales `animation.frame_duration_ms` only) |
 
-On the **multipart** `/v1/images/edits` route the same values travel as plain top-level fields
-(`web_conv_key`, `web_mode`, `web_model`, `web_effort`) because multipart bodies are forwarded as-is.
-The shim accepts both spellings.
+### Surface & Tier Mechanics (`webpipe.mjs`)
 
-## Measured behaviour (this relay, 2026-10-16)
+| | `chat` surface | `work` surface |
+| --- | --- | --- |
+| UI tiers | 3: `即时` / `中` / `高` | 4: `轻度` / `中` / `高` / `极高` (`max` accepted on CLI for advanced use) |
+| What changes | Each tier maps to its own preset slug (`gpt-6-instant` vs `gpt-6-thinking`) | Slug stays in `-wm` family; only `thinking_effort` changes |
+| `effort` values | `none` (omitted) / `standard` / `extended` (account presets may also accept `medium`/`high`/`xhigh`) | `minimal` / `low` / `standard` / `extended` (no `none` tier) |
+| Same tiers across models? | Yes | Yes |
 
-| Observation | Value |
-| --- | --- |
-| Model served | exactly one: `gpt-image-2` (`supported_endpoint_types` includes `image-generation`) |
-| Generate latency | 24.6 s for one image (`n=1`) |
-| Edit latency | 21.3 s for one image |
-| Output pixels | ~1.57 MP, fixed. `size` selects the **aspect ratio**, not the pixel count |
-| `size: 1024x1024` produced | 1254 x 1254 |
-| Quality knob | not honoured upstream; folded into the prompt by this CLI |
-| True transparency | not available as a parameter; emulated in the prompt (measured 46-52% fully transparent pixels) |
-| Total models exposed | 222 (`GET /v1/models`) |
+Because `/web/models` on the execution layer is a top-level route and `new-api` only forwards `/v1/*`, the CLI cannot query the account's live web-model list; candidate slugs in `tiers` are common defaults, and an unavailable slug/tier returns `bad_request`.
 
-### Aspect ratio -> `size` cheat sheet
+## Edit Contracts: Codex JSON vs OpenAI Multipart
 
-| Wanted ratio | Pass `--size` |
-| --- | --- |
-| 1:1 square / avatar | `1254x1254` |
-| 16:9 widescreen | `1672x941` |
-| 9:16 vertical | `941x1672` |
-| ultra-wide (3.09:1) | `2206x713` |
-| 3:2 | `1536x1024` |
-| 4:3 | `1448x1086` |
+- **Codex JSON contract** (`codex-rs/codex-api/src/endpoint/images.rs`): JSON body with `images: [{"image_url": "data:image/...;base64,..."}]` + `style.mssk_*`.
+- **OpenAI Images contract** (`new-api` default): `multipart/form-data` with repeated `image` file parts, optional `mask`, and top-level `web_*` / `gif_speed` fields.
 
-`1K` / `2K` / `4K` are accepted by the relay but only fold to a 1:1 or 16:9 shape; the pixel count
-stays ~1.57 MP. **This relay can never produce 4K.** The official gpt-image-2 size constraints
-(multiples of 16, ratio <= 3:1, the 655,360-8,294,400 pixel window) are validated by the CLI as
-semantics only -- pass `--strict-size` to restore the official hard failure.
+`edit` probes Codex JSON first and falls back on HTTP 400 `"image is required"` (cached in-process per `base_url`). To skip the probe on `new-api` permanently, set `"edit_contract": "openai-multipart"` in `config.json` (which also skips base64 encoding for `edit`).
 
-## Locally resolved controls
+## Responses Route (`reference` subcommand)
 
-| Flag | What actually happens |
-| --- | --- |
-| `--quality high` | appends `Quality: high quality, rich detail` to the prompt |
-| `--quality low` | appends `Quality: keep it simple` to the prompt |
-| `--quality medium` / `auto` | nothing is appended |
-| `--background transparent` | appends a transparency requirement line to the prompt and keeps PNG output |
-| `--background opaque` / `auto` | no-op |
-| `--output-format jpeg/webp`, `--output-compression` | local re-encode after the response (needs Pillow) |
-| `--moderation` | validated, then ignored (relay-controlled) |
-| `--input-fidelity` | validated, then ignored (gpt-image-2 always uses high fidelity) |
-| `--downscale-max-dim` | local downscale copy with `-web` suffix (needs Pillow) |
+`POST /v1/responses` requires `"stream": true` (otherwise HTTP 400 `"Stream must be set to true"`), a chat model (`gpt-6-astra`, `gpt-5.6-sol`), `"tools": [{"type": "image_generation"}]`, and optional `"reasoning": {"effort": "low|medium|high|xhigh"}` (never use `-high` model-name suffixes, which fail with HTTP 500).
 
-## Errors
+SSE events carry `image_generation_call` items (`in_progress` → `generating` → `completed` / `failed` with base64 `result`) plus periodic `keepalive` frames during long renders. The CLI enforces `--deadline` across keepalive frames so stalled streams abort cleanly. Note that `/v1/responses` passes through without reading `style.mssk_*`.
 
-`new-api` returns errors in this shape:
+## Response Formats (Static, Multi-Asset & Animated GIF)
+
+Standard response:
 
 ```json
-{"error": {"code": "", "message": "...", "type": "new_api_error"}}
+{
+  "created": 1792120342,
+  "data": [
+    {
+      "b64_json": "iVBORw0KGgo...",
+      "revised_prompt": "...",
+      "size": "1254x1254"
+    }
+  ]
+}
 ```
 
-| Status / message | Meaning | CLI behaviour |
-| --- | --- | --- |
-| `401` `Invalid token` | token deleted, expired, or wrong | fatal, with instructions to update `config.json` |
-| `503` `No available channel for model X under group auto (distributor)` | the relay has no channel for that model | fatal; only `gpt-image-2` is served |
-| `400` `invalid JSON request body` | malformed request (a CLI bug, not a user error) | fatal |
-| `上游内容安全系统拒绝：<text>` | upstream content-safety decision | fatal, no local retry. **Relay `<text>` to the user verbatim; do not rewrite the prompt on your own.** Measured: the decision follows the **input image**, the relay retries twice internally (so a refusal costs ~120 s), and an identical request returns the identical refusal text and request ID |
-| `429`, `408`, `5xx`, network timeouts | transient | retried up to `--max-attempts` (default 3) with backoff; one job is additionally capped by `--deadline` (default 600 s) |
+Animated GIF response item (verified 2026-11-06 & 2026-11-19):
 
-The CLI never retries a content-safety refusal and never softens a user's description by itself.
+```json
+{
+  "b64_json": "...",
+  "mime_type": "image/gif",
+  "sprite_sheet": "...",
+  "animation": {"rows": 3, "columns": 3, "frame_count": 9, "frame_duration_ms": 120}
+}
+```
 
-### Content-safety refusals in detail (measured 2026-10-16)
+- `sprite_sheet` (when attached by upstream) comes from `parts[0].metadata.generation`; the CLI writes `<name>-sprite.png` alongside the `.gif`.
+- GIF bytes are written **verbatim** (never re-encoded via Pillow, which would drop frames).
+- One turn can emit multiple `data[i]` assets (especially when `--n > 1` on the web pipeline, which drains the full turn). The CLI writes every entry (`foo.png`, `foo-1.png`… or `foo-1.png`, `foo-2.png`, `foo-3.png`…) and records all actual written paths in `--report-json`.
 
-| Experiment | Result |
+## Resolution & Locally Resolved Controls
+
+Upstream always renders at **~1.57 MP** per aspect ratio (`1:1 -> 1254x1254`, `16:9 -> 1672x941`, `9:16 -> 941x1672`, `3:2 -> 1536x1024`, `4:3 -> 1448x1086`, ultra-wide `3.09:1 -> 2206x713`).
+
+| Flag | Behaviour |
 | --- | --- |
-| `/images/edits`, original prompt + character photo, sent twice | identical refusal text **and identical request ID** -- deterministic, cached upstream (6.6 s the second time) |
-| `/images/edits`, thoroughly reworded prompt + same photo | refused again, **new** request ID (`482d646d...`), ~123 s (relay retried internally twice) |
-| `/images/edits`, head-and-shoulders crop of the same photo | refused (~130 s); upstream text suggests "提高服装覆盖度、弱化胸部强调" |
-| `/images/generations` + `image` field (data URI, bare base64, array) | not supported -- HTTP 500 `do_request_failed` |
-| `/responses` + `{"type":"image_generation"}` tool, `gpt-6-astra` and `gpt-5.6-sol` | tool call returns `status=failed` (~135 s / ~105 s); the model explains the reference was judged sexualised |
-| `/responses` + 512 px JPEG + `detail: low` / 768 px + `detail: low` | `status=failed` (~51 s / ~68 s) |
-| Person-free prompts (product shot, landscape, empty card frame) | pass on both routes |
+| `--preset <ratio>@2k\|4k` / `--exact-size WxH` | Sends ratio via `size`, then locally Lanczos-resamples to exact delivered pixels (all 11 ratios × 2K/4K, max 8,294,400 px) |
+| `--quality high\|low` | Appends `Quality: ...` hint to prompt (`medium`/`auto` = no-op) |
+| `--background transparent` | Appends transparency requirement to prompt and preserves PNG alpha |
+| `--output-format jpeg\|webp`, `--output-compression` | Single-pass local encode via Pillow |
+| `--downscale-max-dim` | Writes additional `-web` downscaled copy via Pillow |
+| `--moderation`, `--input-fidelity` | Validated locally, ignored upstream |
 
-So on the API surface of this relay, neither rewording the prompt nor shrinking, cropping or
-downgrading the reference changes the outcome for this class of photo. The refusal is an upstream
-policy decision, and it is attached to the picture.
+## Error Vocabulary & Classification
 
-When a user reports that the same reference and prompt succeed in a **browser client**, the
-difference has to be in the request or the routing, not in the prompt. Collect one of:
-
-- the browser's working request (DevTools -> Network -> *Copy as cURL*), or
-- the relay's request log for that call (endpoint, model, token group, channel).
-
-`new-api` routes by token group, so the same model name can resolve to different upstream channels
-with different safety gates.
-
-## Diagnostics
-
-- `models` subcommand: lists the image-capable models the relay exposes.
-- `--check-model`: verifies the model against `/v1/models` before spending a generation.
-- Timing line on stderr: `relay+render`, `download`, `local`, `total` seconds.
-- `--report-json <path>`: writes model, endpoint, prompt, outputs, `actual_size`, pixels,
-  `revised_prompt`, and the timing breakdown.
-
-## Security
-
-- The token lives in `config.json` (or an environment variable). It is never printed, never
-  echoed into a report, and never written to a log.
-- If a token ever appears in relayed error text, redact it before showing it to the user.
+All errors are classified in `scripts/relay_errors.py` (single source of truth) into machine-readable `CODE=` / `RETRYABLE=` / `HINT=` / `RAW=` (with automatic `sk-*` / `Bearer` secret redaction). For detailed content-safety refusal behavior, ablation measurements, and browser-vs-CLI troubleshooting, see `references/safety-refusals.md`.

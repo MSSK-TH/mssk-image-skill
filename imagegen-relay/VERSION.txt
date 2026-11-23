@@ -1,67 +1,48 @@
 imagegen-relay  —— 版本戳
 ==================================================
-version : 1.4.0
-date    : 2026-11-19（网页管线三件套 + 失败可编程 + 钥匙按项目隔离，v1.4.0）
-baseline: 官方 imagegen（.system/imagegen）；其中 6 个文件逐字节完全一致：
+version : 1.5.0
+date    : 2026-11-23（架构收口 + 现存 bug 全清 + 分层超时 + SKILL.md 瘦身，v1.5.0）
+baseline: 官方 imagegen（.system/imagegen）；以下 6 个文件内容完全一致（文本文件仅行尾符 LF/CRLF 差异）：
           prompting.md / sample-prompts.md / remove_chroma_key.py / LICENSE.txt / 两个图标
 
-v1.4.0 新增（2026-11-19）
+v1.5.0 新增与修复（2026-11-23）
 ------------------------------
-  · 网页管线三件套：--web-mode chat|work、--effort（推理档）、--agent-model（上游 slug），
-    全部走 style.mssk_mode / mssk_effort / mssk_model（顶层字段会被 new-api 丢掉）。
-  · tiers 子命令：打印推理档（与 web 前端同一套中文标签；work 模式只有 5 档滑杆）。
-    注意两套值并存：work = minimal/low/standard/extended/max，
-    chat = 账号 presets 声明的值（实测见过 medium/high/xhigh/ultra）。
-  · 失败可编程：新增 scripts/relay_errors.py（镜像 image-web/lib/errors.mjs），
-    失败时 stderr 打印 CODE= / RETRYABLE= / HINT= / RAW=，
-    --report-json 同时落一份 {ok:false,error:{code,hint,retryable,http_status,raw}}。
-  · 会话钥匙改为按项目隔离：<cwd>/.imagegen/conv-<hash(user+cwd)>（原来是一个全局
-    .conv-key，同机两人或两个项目会互相覆盖）；--conv-key 仍可显式指定。
-  · SKILL.md 新增：参数推断表（从用户话里取，不问）、只在三种情况下才问用户、
-    错误码→行动对照表；references/cli.md 与 relay-api.md 补对应说明。
-  · 未改动：6 个与官方 imagegen 逐字节一致的文件、config.json、bin/、会话续接与 GIF 逻辑。
+  · 修复 11 个 @4k 预设全挂：_apply_preset 上限对齐 GPT_IMAGE_2_MAX_PIXELS（8,294,400）。
+  · 修复 generate-batch 读 JSONL 未去 BOM（改用 utf-8-sig），解决 PowerShell 首行 JSON 变纯文本。
+  · 错误分类单一真相源（relay_errors.py）：
+      - 删去 image_gen.py 重复人话化代码（同时修掉 sexual/minors 被 `/` 误切 bug）
+      - 修复 503 system cpu overloaded 被当可重试猛撞 3 次且错打 RETRYABLE=yes
+      - 修复 no_image_data 匹配不到 "returned no images" 导致配错通用 HINT
+      - 修复 _is_refusal_error 扫不到人话化拒绝导致 --retry-refusal 失效（并跳过确定性 stage=input）
+      - 补全 timeout / deadline_exceeded / network_error / rate_limited / no_channel 及 HTTP 401/408/429 兜底
+      - stderr RAW= 与 --report-json 强制脱敏 sk-* / Bearer / api_key
+  · 消除结构性重复与全局可变态：
+      - 删去重复定义的 _cmd_setup
+      - 统一 _prepare_prompt / WireStyle（style.mssk_* ↔ multipart web_* 单一映射表） / _run_with_refusal_retry
+      - 去掉 _LAST_PIPELINE / _EXACT_SIZE_REQUEST 全局态（消除 batch 并发竞态与进程内残留）
+      - --dry-run 严格零磁盘副作用（不写 .imagegen/conv-*），edit/batch 预览如实包含 style，reference 预览脱敏 base64
+      - config.json 默认值仅注入网页管线命令，消除 setup 后 reference 必刷的误报 Warning
+  · 新增可用性与幂等能力：
+      - setup --show [--json]（安全只读查看配置状态，绝不暴露 api_key）；拦截 work + --effort none
+      - --agent-model auto 可单次覆盖 config.json 回到 auto
+      - 付费调用前 Fail-Fast 预检目标路径与目录可写性 + 原子写盘（tempfile + os.replace）
+      - 修复 n>1 多余产物命名 bug（foo-1..foo-4 而非 foo-1-1）+ --report-json 记录真实落盘路径与 PNG/GIF/JPEG/WebP 像素
+      - 新增 generate --strict-n（拆 N 次 n=1 严格出图）与 generate-batch --skip-existing
+      - 支持 config.json 可选 "edit_contract": "openai-multipart" 固定契约（不写额外隐藏缓存文件）
+  · 分层超时与 deadline 穿透修复：
+      - 修复 refusal 重试循环内重置 deadline、reference SSE keepalive 永不超时、URL 下载无视 deadline 三处 bug
+      - 默认超时分层：常规单图 150s/240s，重任务（n>1 / work / extended+ / reference）300s/480s；>=60s 超时最多自动重试 1 次；读取 HTTP Retry-After 响应头；心跳超阈值升级 [slow]
+  · 文档对齐官方 imagegen（.system/imagegen）：
+      - SKILL.md 保留官方完整骨架与提示词段（When to use/not to use、Decision tree、Workflow、Specificity policy、19 个 Use-case 定义、Shared prompt schema、Examples、Prompting best practices、非覆盖保存规范），消除 7 处矛盾并从 877 行（49 KB）精简至 ~270 行（~19 KB，与官方 315 行 / 19.5 KB 基本等长）
+      - 消融实验数据与浏览器对比排障下沉至 references/safety-refusals.md
+      - references/cli.md 对齐官方章节结构（补回 Guardrails / Mask notes / Recipes），references/relay-api.md 同步更新
+  · 自检升级：selfcheck.py 修复 edit 并集盲区，覆盖上述全部回归项（58 项零成本自检）。
 
-  共用代码提醒（改这三处会同时影响两条管线）：foldParams / passthrough / relay_errors。
-
-v1.3.0 新增（2026-11-06 实测）
+v1.4.0（2026-11-19）
 ------------------------------
-  · 动图 GIF：data[i].mime_type=image/gif 时按原字节保存（不重编码、不丢帧），
-    自动改扩展名 .gif，跳过 --exact-size / --downscale，并写出 <name>-sprite.png
-    + 打印 animation（rows/columns/frame_count/frame_duration_ms）
-  · --gif-speed {0.25..2}：8 档，走 style.mssk_gif_speed（顶层字段会被 new-api 丢掉），
-    只缩放 animation.frame_duration_ms，GIF 文件本身仍是 1x
-  · 多图：上游一次可能回多张（实测 4~5 张），data[] 每项写一个文件
-    （base.png → base.png / base-1.png / …），不再只有第一张
+  · 网页管线三件套（--web-mode / --effort / --agent-model）、tiers / setup、
+    scripts/relay_errors.py、会话钥匙按项目隔离。
 
-默认值（出厂状态）
-------------------
-  图像模型            gpt-image-2（本中转站唯一）
-  reference 路线模型  gpt-6-astra
-  --preflight         off      ← 不自动改你的提示词
-  --retry-refusal     0        ← 被拒不自动重发（一次算一次）
-  --deadline          600 秒   ← 单任务硬上限，杜绝"跑 20 分钟才失败"
-
-已固化的能力
-------------
-  · 两条路线：reference（/v1/responses + 图像工具，模型自己融合参考图）
-              generate / edit / generate-batch（/v1/images/*，官方 fallback 同构）
-  · Codex JSON 契约与 OpenAI multipart 契约自动探测（edit）
-  · 输出层安审判别：按延迟区分"提示词层 / 输出图层"，附消融实测数据
-  · 内容安全拒绝处理流程（Relay fact 7）+ 紧凑中性简报模板
-  · 人物简报规则：必须写明服装，但写成"一句覆盖/一致性约束"，不逐件列举
-  · 心跳日志 + 干净报错（不再吐 traceback）
-  · 动图 GIF + sprite sheet + 8 档速度（v1.3.0）
-  · 一次多图全部落地（v1.3.0）
-
-实测基线（同一渠道、同一参考图）
---------------------------------
-  逐件列举服装的长简报                    0 / 5   全拒
-  一句话覆盖约束的紧凑简报                2 / 2   通过（且保留原服装）
-  跨 4 张参考图 8 次单跑                  3 / 8   ≈ 37%（输出层判定随机）
-
-可选择的开关（默认都关着）
---------------------------
-  --preflight auto|always   自动中和风险词 + 追加覆盖约束（每条改动都会打印）
-  --retry-refusal N         被拒后换中性措辞重发 N 次
-  --reasoning-effort high   reference 路线给改写模型开高（不要用 -high 模型 ID，会 500）
-  --report-json PATH        落一份 JSON 报告（含最终提示词、actual_size、耗时）
+v1.3.0（2026-11-06）
+------------------------------
+  · 动图 GIF 原字节保存 + sprite sheet + --gif-speed 8 档 + 一次多图全部落地。

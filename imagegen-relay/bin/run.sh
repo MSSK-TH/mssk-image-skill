@@ -2,7 +2,7 @@
 # imagegen-relay launcher (macOS / Linux)
 #
 # Reads config.json from the skill root, injects IMAGE_RELAY_URL / IMAGE_RELAY_KEY,
-# then runs the relay CLI with the system Python.
+# then runs the relay CLI with Python 3 (or uv when Pillow is missing).
 #
 # Usage:
 #   sh run.sh generate --prompt "..." --size 1672x941 --out "out.png"
@@ -19,8 +19,15 @@ if [ ! -f "$CLI" ]; then
   exit 4
 fi
 
-if [ -f "$CFG" ]; then
-  URL_FROM_CFG=$(python3 - "$CFG" <<'PY' 2>/dev/null || true
+PY_BIN=""
+if command -v python3 >/dev/null 2>&1; then
+  PY_BIN="python3"
+elif command -v python >/dev/null 2>&1; then
+  PY_BIN="python"
+fi
+
+if [ -f "$CFG" ] && [ -n "$PY_BIN" ]; then
+  URL_FROM_CFG=$("$PY_BIN" - "$CFG" <<'PY' 2>/dev/null || true
 import json, sys
 try:
     with open(sys.argv[1], 'r', encoding='utf-8-sig') as fh:
@@ -30,7 +37,7 @@ except Exception:
     print('')
 PY
 )
-  KEY_FROM_CFG=$(python3 - "$CFG" <<'PY' 2>/dev/null || true
+  KEY_FROM_CFG=$("$PY_BIN" - "$CFG" <<'PY' 2>/dev/null || true
 import json, sys
 try:
     with open(sys.argv[1], 'r', encoding='utf-8-sig') as fh:
@@ -45,20 +52,29 @@ PY
 fi
 
 if [ -z "${IMAGE_RELAY_URL:-}" ]; then
-  [ -n "${CODEX_API_URL:-}" ] && export IMAGE_RELAY_URL="$CODEX_API_URL" || true
+  if [ -n "${CODEX_API_URL:-}" ]; then
+    export IMAGE_RELAY_URL="$CODEX_API_URL"
+  elif [ -n "${OPENAI_BASE_URL:-}" ]; then
+    export IMAGE_RELAY_URL="$OPENAI_BASE_URL"
+  fi
 fi
 if [ -z "${IMAGE_RELAY_KEY:-}" ]; then
-  [ -n "${CODEX_API_KEY:-}" ] && export IMAGE_RELAY_KEY="$CODEX_API_KEY" || true
-fi
-if [ -z "${IMAGE_RELAY_KEY:-}" ]; then
-  [ -n "${OPENAI_API_KEY:-}" ] && export IMAGE_RELAY_KEY="$OPENAI_API_KEY" || true
+  if [ -n "${CODEX_API_KEY:-}" ]; then
+    export IMAGE_RELAY_KEY="$CODEX_API_KEY"
+  elif [ -n "${OPENAI_API_KEY:-}" ]; then
+    export IMAGE_RELAY_KEY="$OPENAI_API_KEY"
+  fi
 fi
 
-if command -v python3 >/dev/null 2>&1; then
-  exec python3 "$CLI" "$@"
-elif command -v python >/dev/null 2>&1; then
-  exec python "$CLI" "$@"
-else
-  echo "[imagegen-relay] Python 3 was not found on PATH." >&2
-  exit 5
+if [ -n "$PY_BIN" ]; then
+  if "$PY_BIN" -c "import PIL" >/dev/null 2>&1 || ! command -v uv >/dev/null 2>&1; then
+    exec "$PY_BIN" "$CLI" "$@"
+  fi
 fi
+
+if command -v uv >/dev/null 2>&1; then
+  exec uv run --quiet --no-project --with pillow python "$CLI" "$@"
+fi
+
+echo "[imagegen-relay] Python 3 was not found on PATH." >&2
+exit 5
