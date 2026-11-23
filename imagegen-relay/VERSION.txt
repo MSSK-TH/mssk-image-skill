@@ -1,9 +1,19 @@
 imagegen-relay  —— 版本戳
 ==================================================
-version : 1.5.2
-date    : 2026-11-23（新对话 1 句轻确认 + 按对话生效模型选择 + 网页先降级线索透传，v1.5.2）
+version : 1.5.3
+date    : 2026-11-23（彻底封堵 high/medium/low/minimal 别名 422 + 模型与档位拆分为独立单选，v1.5.3）
 baseline: 官方 imagegen（.system/imagegen）；以下 6 个文件内容完全一致（文本文件仅行尾符 LF/CRLF 差异）：
           prompting.md / sample-prompts.md / remove_chroma_key.py / LICENSE.txt / 两个图标
+
+v1.5.3 档位别名防呆与单选交互优化（2026-11-23）
+------------------------------
+  · 彻底封堵网页管线档位别名 422（与 DMIT 服务端 webpipe.mjs 双端对齐）：
+      - `--effort high` 自动映射为 `extended`，`--effort medium` 自动映射为 `standard`（chat / work 通用，解决 Agent 把“高”传成 `high` 触发上游 422 Invalid conversation body）；
+      - `work` 下 `minimal` / `low` 自动映射为 `min`；`chat` 思考模型下 `minimal` / `low` / `min` 自动映射为 `standard`；
+      - `setup` 写入时同样自动归一化，杜绝把 `high`/`medium` 持久化进 `config.json`。
+  · 优化选模型与选档位交互体验：
+      - `SKILL.md` 明确要求**模型**与**档位**必须拆成**两道独立单选**（支持多题表单时拆两道独立单选题，纯文本时分两轮单选），禁止合在同一题里让用户回 `(1,2)` / `(1,3)` 坐标对；
+      - `tiers --mode <chat|work>` 新增 `--models` 选项（与现有 `--efforts` 对称）。
 
 v1.5.2 交互策略与错误细节优化（2026-11-23）
 ------------------------------

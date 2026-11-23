@@ -341,12 +341,19 @@ def check_tiers() -> None:
         ok = False
     record("tiers --mode work --json 含 10 个 -wm 模型与 5 档真值", ok, out[-200:] if not ok else "")
 
+    code, out, _ = run(["tiers", "--mode", "chat", "--models"])
+    ok = code == 0 and "模型" in out and "档位" not in out
+    record("--models 只列模型", ok, out[-200:] if not ok else "")
+
     code, out, _ = run(["tiers", "--mode", "chat", "--efforts"])
     ok = code == 0 and "档位" in out and "模型" not in out
     record("--efforts 只列档位", ok, out[-200:] if not ok else "")
 
     code, _, _ = run(["tiers", "--efforts"])
     record("--efforts 缺 --mode 应报错", code != 0, f"退出码 {code}")
+
+    code, _, _ = run(["tiers", "--mode", "chat", "--models", "--efforts"])
+    record("--models 与 --efforts 同时传应报错", code != 0, f"退出码 {code}")
 
     code, out, _ = run(["tiers", "--mode", "chat", "--json"])
     try:
@@ -425,7 +432,7 @@ def check_setup() -> None:
             out[-260:],
         )
 
-        # work 模式下旧写法 minimal 自动映射为 min 并给告警
+        # work 模式下旧写法 minimal / low 自动映射为 min，high/medium 自动映射为 extended/standard
         code, out, err = run(["generate", "--prompt", "x", "--web-mode", "work", "--effort", "minimal", "--dry-run"])
         record(
             "work + --effort minimal 自动归一为 min 并告警",
@@ -433,8 +440,46 @@ def check_setup() -> None:
             (out + err)[-260:],
         )
 
-        # setup work + minimal 落盘为 min
-        code, _, err = run(["setup", "--web-mode", "work", "--effort", "minimal"])
+        code, out, err = run([
+            "generate", "--prompt", "x", "--web-mode", "chat",
+            "--agent-model", "gpt-6-thinking", "--effort", "high", "--dry-run",
+        ])
+        record(
+            "chat + --effort high 自动归一为 extended（防 422）",
+            code == 0 and '"mssk_effort": "extended"' in out and "422" in err,
+            (out + err)[-260:],
+        )
+
+        code, out, err = run([
+            "generate", "--prompt", "x", "--web-mode", "chat",
+            "--agent-model", "gpt-6-thinking", "--effort", "medium", "--dry-run",
+        ])
+        record(
+            "chat + --effort medium 自动归一为 standard（防 422）",
+            code == 0 and '"mssk_effort": "standard"' in out and "422" in err,
+            (out + err)[-260:],
+        )
+
+        code, out, err = run([
+            "generate", "--prompt", "x", "--web-mode", "work",
+            "--agent-model", "gpt-6-astra-wm", "--effort", "low", "--dry-run",
+        ])
+        record(
+            "work + --effort low 自动归一为 min（防 422）",
+            code == 0 and '"mssk_effort": "min"' in out and "422" in err,
+            (out + err)[-260:],
+        )
+
+        # setup chat + high 落盘为 extended，setup work + minimal 落盘为 min
+        code, _, err = run(["setup", "--web-mode", "chat", "--agent-model", "gpt-6-thinking", "--effort", "high"])
+        cfg_hi = json.loads(CONFIG.read_text(encoding="utf-8"))
+        record(
+            "setup chat + high 落盘为 extended",
+            code == 0 and cfg_hi.get("web_effort") == "extended" and "extended" in err,
+            json.dumps(cfg_hi, ensure_ascii=False),
+        )
+
+        code, _, err = run(["setup", "--web-mode", "work", "--agent-model", "gpt-6-astra-wm", "--effort", "minimal"])
         cfg_min = json.loads(CONFIG.read_text(encoding="utf-8"))
         record(
             "setup work + minimal 落盘为 min",

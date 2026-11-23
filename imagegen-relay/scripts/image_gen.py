@@ -2,7 +2,7 @@
 """Relay CLI for explicit image generation or editing with gpt-image-2.
 
 This is the relay counterpart of the official ``imagegen`` skill's
-``scripts/image_gen.py`` (v1.5.2).
+``scripts/image_gen.py`` (v1.5.3).
 
 Kept aligned with the official implementation:
   * subcommands ``generate`` / ``edit`` / ``generate-batch`` (plus relay ``reference`` /
@@ -117,7 +117,7 @@ DEFAULT_TIMEOUT_SECONDS = DEFAULT_STANDARD_TIMEOUT_SECONDS
 DEFAULT_DEADLINE_SECONDS = DEFAULT_STANDARD_DEADLINE_SECONDS
 HEAVY_EFFORTS = frozenset({"extended", "xhigh", "max"})
 
-USER_AGENT = "imagegen-relay/1.5.2 (stdlib)"
+USER_AGENT = "imagegen-relay/1.5.3 (stdlib)"
 MAX_ERROR_TEXT = 400
 MAX_IMAGE_BYTES = 50 * 1024 * 1024
 MAX_BATCH_JOBS = 500
@@ -545,11 +545,23 @@ def _validate_web_controls(
     if mode == "work" and eff == "none":
         _die("work 模式没有即时档（--effort none）；请选 min/standard/extended/xhigh/max，或改用 --web-mode chat。")
 
-    # 旧版 v1.4/v1.5 曾把 work 轻度档错写为 minimal，上游会以 422 Invalid conversation body 拒绝；自动归一为 min。
-    if mode == "work" and eff == "minimal":
-        _warn("work 模式轻度档的真实值为 min（上游会以 422 拒绝 minimal），已自动映射为 min。")
+    # 上游 /f/conversation 别名自动归一（防 Agent 或旧配置传 high/medium/low/minimal 触发 422 Invalid conversation body）
+    if eff == "high":
+        _warn("网页管线高档的真实值为 extended（上游会以 422 拒绝 high），已自动映射为 extended。")
+        effort = "extended"
+        eff = "extended"
+    elif eff == "medium":
+        _warn("网页管线中档的真实值为 standard（上游会以 422 拒绝 medium），已自动映射为 standard。")
+        effort = "standard"
+        eff = "standard"
+    elif mode == "work" and eff in ("minimal", "low"):
+        _warn(f"work 模式轻度档的真实值为 min（上游会以 422 拒绝 {effort}），已自动映射为 min。")
         effort = "min"
         eff = "min"
+    elif mode == "chat" and eff in ("minimal", "low", "min") and not model_str.endswith("-instant"):
+        _warn(f"chat 思考档仅支持 standard/extended（上游可能以 422 拒绝 {effort}），已自动映射为 standard。")
+        effort = "standard"
+        eff = "standard"
     elif mode == "work" and eff and eff not in WEB_WORK_VALID_EFFORTS:
         _warn(
             f"work 模式实测 5 档为 min/standard/extended/xhigh/max，当前指定 --effort {effort} "
@@ -579,15 +591,21 @@ def _validate_web_controls(
 
 
 def _cmd_tiers(args: argparse.Namespace) -> int:
-    """两步提问：
-      1) tiers                → 模式：1)聊天 2)工作
-      2) tiers --mode chat    → 模型 + 档位（一次列完）
+    """分步列出网页管线选项：
+      1) tiers                        → 模式：1)聊天 2)工作
+      2) tiers --mode chat --models   → 仅列模型（单选）
+      3) tiers --mode chat --efforts  → 仅列档位（单选）
+      4) tiers --mode chat            → 模型 + 档位（供一次性查询或 --json 映射）
     """
     mode = getattr(args, "mode", None)
+    only_efforts = bool(getattr(args, "efforts", False))
+    only_models = bool(getattr(args, "models", False))
+    if only_efforts and only_models:
+        _die("--models 与 --efforts 不能同时传；都要看请直接 tiers --mode <chat|work>")
 
     if not mode:
-        if getattr(args, "efforts", False):
-            _die("--efforts 需要配合 --mode 一起用（先选模式）")
+        if only_efforts or only_models:
+            _die("--models / --efforts 需要配合 --mode 一起用（先选模式）")
         if getattr(args, "json", False):
             print(json.dumps({"modes": WEB_MODE_CHOICES}, ensure_ascii=False, indent=2))
             return 0
@@ -606,17 +624,20 @@ def _cmd_tiers(args: argparse.Namespace) -> int:
             "models": models,
             "efforts": [{"name": t["name"], "value": t["effort"]} for t in tiers],
         }
-        if getattr(args, "efforts", False):
+        if only_efforts:
             data.pop("models")
+        elif only_models:
+            data.pop("efforts")
         print(json.dumps(data, ensure_ascii=False, indent=2))
         return 0
 
-    if not getattr(args, "efforts", False):
+    if not only_efforts:
         print("模型（%s）：" % label)
         for i, m in enumerate(models, 1):
             print("  %d) %s" % (i, m["name"]))
-    print("档位（%s）：" % label)
-    print("  " + "   ".join("%d)%s" % (i, t["name"]) for i, t in enumerate(tiers, 1)))
+    if not only_models:
+        print("档位（%s）：" % label)
+        print("  " + "   ".join("%d)%s" % (i, t["name"]) for i, t in enumerate(tiers, 1)))
     return 0
 
 
@@ -3934,6 +3955,7 @@ def main() -> int:
     )
     tiers_parser.add_argument("--mode", choices=("chat", "work"), default=None)
     tiers_parser.add_argument("--json", action="store_true")
+    tiers_parser.add_argument("--models", action="store_true", help="只列模型（需配合 --mode）")
     tiers_parser.add_argument("--efforts", action="store_true", help="只列档位（需配合 --mode）")
     tiers_parser.set_defaults(func=_cmd_tiers)
 

@@ -8,7 +8,7 @@ This CLI is the relay sibling of official `imagegen`'s `scripts/image_gen.py`: s
 - `reference`: chat-model-driven reference generation via `POST /v1/responses` + hosted `image_generation` tool (use when changing aspect ratio from the reference or for free style reinterpretation; ignores `style.mssk_*`, use `--reasoning-effort`)
 - `generate-batch`: run many generation jobs concurrently from a JSONL file (`--out-dir` required)
 - `setup`: persist web-pipeline defaults (`--web-mode`, `--effort`, `--agent-model`, `--ask-policy confirm|remember`) into `config.json`, or inspect safely with `--show [--json]` (never exposes `api_key`)
-- `tiers`: list web-pipeline surface & reasoning tiers (`tiers` → `tiers --mode chat|work [--json]`)
+- `tiers`: list web-pipeline surface, models, and reasoning tiers (`tiers` → `tiers --mode chat|work [--models|--efforts] [--json]`)
 - `models`: list image-capable models exposed by the relay (`GET /v1/models`)
 
 Real calls require **network access** + `config.json` (or `IMAGE_RELAY_URL`/`IMAGE_RELAY_KEY`). `--dry-run` requires neither, writes zero files (does not touch `.imagegen/conv-*`), and echoes the exact wire payload (redacting base64 images on `reference`).
@@ -160,7 +160,7 @@ Notes:
 | `--strict-n` | On `generate` with `gpt-image-2` and `--n > 1`, run `n` sequential `n=1` calls |
 | `--skip-existing` | On `generate-batch`, skip already-completed non-empty outputs |
 | `--preset RATIO@2k\|4k` / `--exact-size WxH` / `--fit` | Ratio hint + exact local Lanczos resample |
-| `--web-mode chat\|work` / `--effort TIER` / `--agent-model SLUG` | Web-pipeline controls (`chat` 3 tiers: `none/standard/extended`, slugs `gpt-6-thinking`/`gpt-5-6-thinking` or `-instant`; `work` 5 tiers: `min/standard/extended/xhigh/max`, legacy `minimal` auto-maps to `min`, `work` + `--effort none` rejected; `--agent-model auto` overrides config back to auto) |
+| `--web-mode chat\|work` / `--effort TIER` / `--agent-model SLUG` | Web-pipeline controls (`chat` 3 tiers: `none/standard/extended`, slugs `gpt-6-thinking`/`gpt-5-6-thinking` or `-instant`; `work` 5 tiers: `min/standard/extended/xhigh/max`; aliases `high→extended`, `medium→standard`, `minimal/low→min\|standard` auto-normalized to avoid 422; `work` + `--effort none` rejected; `--agent-model auto` overrides config back to auto) |
 | `--conv-key NAME` / `--new-conv` | Pin or rotate `<cwd>/.imagegen/conv-<hash>` (persisted after live call succeeds) |
 | `--gif-speed 0.25..2` | GIF playback speed multiplier (`animation.frame_duration_ms` only) |
 | `--check-model` / `--strict-size` / `--report-json PATH` | Model probe / official hard size validation / structured report |

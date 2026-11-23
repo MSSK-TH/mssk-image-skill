@@ -34,26 +34,25 @@ Rules:
 
 Before the **first** web-pipeline image in a conversation (skip entirely for `codex-gpt-image-2` or `reference`), check status via `setup --show --json` (**never read `config.json` directly**, so `api_key` never enters chat):
 
-- **Case A — Never configured (`configured_web` is `false`)**: run the **two-step** selection below (never dump both steps at once, never split model & tier into three turns), then persist once with `setup`.
+- **Case A — Never configured (`configured_web` is `false`)**: run the **step-by-step selection** below (one single-choice question per item — **never** combine model & tier into one question requiring `(1,2)` / `(1,3)` pairs!), then persist once with `setup`.
 - **Case B — Configured (`configured_web` is `true`) & `web_ask_policy` is `"confirm"` (default)**:
   - If the user **already named** a mode, model, or tier in their prompt, skip asking and apply their choice to **this conversation only** via CLI flags (do not overwrite `config.json`).
   - Otherwise ask **one single line** (never dump the full menu upfront):
     `本次新对话生图：1) 沿用默认（<模式> · <模型> · <档位>）  2) 换一个`
     - `1` / "沿用" / "随便" → generate immediately with saved defaults.
-    - `2` / "换" → run the two-step selection below and apply it **only to this conversation** by passing **all three** CLI flags (`--web-mode`, `--agent-model`, `--effort`) on every call in this conversation (preventing stale fields from leaking out of `config.json`). **Do NOT call `setup`** unless the user explicitly asks to update the global default ("设为默认" / "以后都用这个").
+    - `2` / "换" → run the step-by-step selection below and apply it **only to this conversation** by passing **all three** CLI flags (`--web-mode`, `--agent-model`, `--effort`) on every call in this conversation (preventing stale fields from leaking out of `config.json`). **Do NOT call `setup`** unless the user explicitly asks to update the global default ("设为默认" / "以后都用这个").
   - Once confirmed or chosen once in a conversation, **never ask again** on follow-up turns of the same conversation.
 - **Case C — `web_ask_policy` is `"remember"`**: skip confirmation, proceed with saved defaults and note them in one line; any verbal override applies to this conversation via CLI flags.
 
-Two-step selection menu (used in Case A or when user picks `2) 换一个` in Case B):
+Step-by-step selection flow (used in Case A or when user picks `2) 换一个` in Case B):
 
-1. **Step 1 — 模式** (`tiers`): ask `模式：1)聊天  2)工作` (must come first because the tier list depends on surface).
-2. **Step 2 — 模型 + 档位** (`tiers --mode <chat|work>`): ask model and tier **together in one message**:
-   - 聊天（`chat`，3 档）：**2 个模型家族**（实测上游 `/backend-api/models`）—— `1) GPT-6`（思考档 `gpt-6-thinking` / 即时档 `gpt-6-instant`）`2) GPT-5.6 Sol`（思考档 `gpt-5-6-thinking` / 即时档 `gpt-5-6-instant`，注意连字符 `5-6` 无 `-sol`）/
-     `档位：1)即时(none)  2)中(standard)  3)高(extended)`
-   - 工作（`work`，5 档）：**10 个 `-wm` 模型**（6.2 至 5.6）——
-     `档位：1)轻度(min)  2)中(standard)  3)高(extended)  4)极高(xhigh)  5)最高(max)`（无即时档；
-     `work + --effort none` 会被拒；旧写法 `minimal` 会自动映射为 `min` 并提示）
-   - **两种 surface 的模型范围与 slug 命名不同，不要混用**：chat 走 `versions[]` 的 `-instant`/`-thinking`（`5-6` 用连字符），work 走 `-wm` 家族（全部 10 个模型共享 5 档 `min/standard/extended/xhigh/max`）。不确定就传 `--agent-model auto`。
+1. **Question 1 — 模式** (`tiers`): single-choice `聊天` vs `工作` (must come first because both model list and tier list depend on surface).
+2. **Question 2（模型） & Question 3（档位）— MUST be two separate single-choice questions** (`tiers --mode <chat|work> --models` / `--efforts` / `--json`):
+   - **NEVER combine model and tier into a single question or ask the user for `(1,2)` / `(1,3)` paired coordinates.**
+   - If your client provides a multi-question single-choice widget (e.g. `request_user_input`), present **模型** as one single-choice question and **档位** as a **second separate** single-choice question in that widget. In plain text chat without a multi-question widget, ask **模型** first, then **档位** in the next turn (one single choice per turn).
+   - 聊天（`chat`，3 档）：**2 个模型家族**—— `GPT-6`（思考档 `gpt-6-thinking` / 即时档 `gpt-6-instant`）、`GPT-5.6 Sol`（思考档 `gpt-5-6-thinking` / 即时档 `gpt-5-6-instant`，注意连字符 `5-6` 无 `-sol`）；**档位**：`即时(none)` / `中(standard)` / `高(extended)`。
+   - 工作（`work`，5 档）：**10 个 `-wm` 模型**（6.2 至 5.6）；**档位**：`轻度(min)` / `中(standard)` / `高(extended)` / `极高(xhigh)` / `最高(max)`（无即时档；`work + --effort none` 会被拒）。
+   - **两种 surface 的模型范围与 slug 命名不同，不要混用**；`--effort` 必须传括号里的真实值（如**高 = `extended`、中 = `standard`、轻度 = `min`**，切勿把“高/中”误写成 `high`/`medium`；即使误传，CLI 与服务端也已自动归一防 422）。不确定模型就传 `--agent-model auto`。
 3. Map names via `tiers --mode <choice> --json`（chat 选 `即时(none)` 时用对应 `instant_value`）. If user says "你随便": use `聊天 + GPT-6 + 高` (`chat` / `gpt-6-thinking` / `extended`) and state what you picked. Save via `setup --web-mode <m> --agent-model <slug> --effort <e>` **only** in Case A or when the user explicitly requests saving as global default; otherwise keep the override scoped to the current conversation via CLI flags (`--agent-model auto` overrides back to auto). Users can switch confirmation behavior anytime via `setup --ask-policy confirm|remember`.
 
 ### Operating discipline (4 rules that prevent wasted renders)
@@ -116,7 +115,7 @@ Derive flags from user intent and state what you picked in one line:
 Ask only when un-derivable and costly to rework: (1) zero aspect-ratio cue on a fresh image, (2) user refers to "the image I made earlier" and no project conversation key exists yet, (3) user asks for multiple variants **and** supplied a reference image (`edit` works best at `n=1`).
 
 ## Workflow
-1. Check `setup --show --json` once before the first web-pipeline image in a conversation: run two-step `tiers` + `setup` when `configured_web` is `false`; when `configured_web` is `true` and `web_ask_policy` is `confirm` (default), ask one concise confirmation line unless the user already named a model/mode (switching applies to this conversation only via CLI flags).
+1. Check `setup --show --json` once before the first web-pipeline image in a conversation: when `configured_web` is `false`, run step-by-step single-choice selection (mode → separate model question → separate tier question, never `(1,2)` pairs) + `setup`; when `configured_web` is `true` and `web_ask_policy` is `confirm` (default), ask one concise confirmation line unless the user already named a model/mode (switching applies to this conversation only via CLI flags).
 2. Decide the intent and subcommand (`generate`, `edit`, `reference`, or `generate-batch`).
 3. Decide whether the output is preview-only or meant for the current project (prefer `output/imagegen/`).
 4. Collect inputs up front: prompt(s), exact text (verbatim), constraints/avoid list, and any input images.

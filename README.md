@@ -7,7 +7,7 @@
 > 只有用 `--max-dim` / `--exact-size` / `--output-format` 这几个参数时才需要 Pillow
 > （装了 `uv` 的话 launcher 会自动带上，不用手动装）。
 
-当前版本 **v1.5.2**（2026-11-23）。
+当前版本 **v1.5.3**（2026-11-23）。
 
 ---
 
@@ -68,11 +68,11 @@ $imagegen-relay 生成一张海边日出的照片，要横版
 
 技能不会盲猜你的模型和推理强度：
 
-- **第一次使用（未配置过）**：严格分两轮问（① 模式：`1)聊天 2)工作` → ② 模型+档位），答完后用 `setup` 存为全局兜底默认。
+- **第一次使用（未配置过）**：分步单选（① 模式 → ② 选模型 → ③ 选档位，模型与档位拆为独立单选，不用输入 `(1,2)` 坐标对），选完后用 `setup` 存为全局兜底默认。
 - **以后每次新对话（默认 `confirm` 策略）**：第 1 次网页生图只问 **1 句轻确认**（如果在提示词里已经点名模型/模式则直接跳过）：
   > `本次新对话生图：1) 沿用默认（模式 · 模型 · 档位）  2) 换一个`
   - 选 `1` 立刻沿用默认画图；
-  - 选 `2` 走两步重新选，且**只在本对话内生效**（不覆盖全局默认，除非你明确说“设为默认”）；同一对话后续轮次不再重复提问。
+  - 选 `2` 按独立单选重新选模型与档位，且**只在本对话内生效**（不覆盖全局默认，除非你明确说“设为默认”）；同一对话后续轮次不再重复提问。
 - 如果希望新对话完全不确认、直接静默沿用全局默认，可随时切换：
   ```bash
   python scripts/image_gen.py setup --ask-policy remember
@@ -171,7 +171,7 @@ imagegen-relay/                  ← 一个标准 skill 目录，整体拷进 sk
 ├── scripts/
 │   ├── image_gen.py            CLI 本体（generate / edit / reference / batch / models / tiers / setup）
 │   ├── relay_errors.py         失败分类（CODE= / HINT= 的唯一来源）
-│   ├── selfcheck.py            66 项零成本自检（不发真实生成请求）
+│   ├── selfcheck.py            72 项零成本自检（不发真实生成请求）
 │   └── remove_chroma_key.py    抠图兜底（与官方 skill 逐字节一致）
 ├── references/
 │   ├── cli.md                  完整命令行参考
@@ -194,7 +194,7 @@ imagegen-relay/                  ← 一个标准 skill 目录，整体拷进 sk
 
 ```bash
 cd imagegen-relay
-python scripts/selfcheck.py        # 66 项，10 秒，零成本
+python scripts/selfcheck.py        # 72 项，10 秒，零成本
 python scripts/selfcheck.py -v     # 带细节
 ```
 
@@ -222,6 +222,12 @@ setup 持久化与清除、`[pipeline]` 上报、11 类错误码、参数校验�
 ---
 
 ## 变更记录
+
+**v1.5.3（2026-11-23）**
+
+- 彻底封堵 `high` / `medium` / `low` / `minimal` 档位别名触发上游 422：`high→extended`、`medium→standard`、`work` 下 `minimal/low→min`、`chat` 思考档下 `minimal/low/min→standard`（CLI 与 DMIT 服务端双端对齐）
+- 模型与档位选择拆分为两道独立单选，不再合并成 `(1,2)` / `(1,3)` 坐标配对；`tiers` 新增 `--models`
+- 自检 66 项 → **72 项**
 
 **v1.5.2（2026-11-23）**
 
