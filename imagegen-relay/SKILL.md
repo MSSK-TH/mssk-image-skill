@@ -176,7 +176,7 @@ from the path the user expected.
 （聊天）档位：1)即时  2)中  3)高                       ← chat has THREE tiers
 
 （工作）模型：1) GPT-6  2) GPT-6.1 Sol  3) GPT-5.6 Sol
-（工作）档位：1)轻度  2)中  3)高  4)极高  5)max         ← work has FIVE
+（工作）档位：1)轻度  2)中  3)高  4)极高              ← work has FOUR
 ```
 
 Then map `name` -> `value` with `tiers --mode <choice> --json` and persist:
@@ -189,9 +189,13 @@ Measured differences (from `webpipe.mjs`):
 
 | | chat | work |
 | --- | --- | --- |
-| tiers | 3: 即时 / 中 / 高 (Instant / Medium / High) | 5: 轻度 / 中 / 高 / 极高 / max |
+| tiers | 3: 即时 / 中 / 高 (Instant / Medium / High) | 4: 轻度 / 中 / 高 / 极高 |
 | what changes | **each tier is its own preset slug** (`gpt-6-instant` vs `gpt-6-thinking`) | slug stays (`-wm` family), only `thinking_effort` changes |
-| effort values | mapped to `none` / `standard` / `extended` | `minimal` / `low` / `standard` / `extended` / `max` |
+| effort values | mapped to `none` / `standard` / `extended` | `minimal` / `low` / `standard` / `extended` |
+
+Note: `webpipe.mjs` carries a fifth work value (`max` -> `max`) that the web UI does **not** offer
+(it is accepted by the server but not exposed). The skill mirrors the UI, so `max` is not listed;
+advanced users can still pass `--effort max` by hand.
 
 Never merge the two lists into one question: picking "GPT-6 thinking" and then "工作" yields a slug
 that does not exist on that surface.

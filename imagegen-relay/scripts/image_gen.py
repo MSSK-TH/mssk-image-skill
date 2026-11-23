@@ -432,13 +432,15 @@ WEB_CHAT_TIERS = [
     {"name": "中", "effort": "standard"},
     {"name": "高", "effort": "extended"},
 ]
-# work：5 档滑杆（对齐 webpipe 的 WORK_PRESETS）
+# work：4 档 —— **对齐网页版 UI 的滑杆**（轻度/中/高/极高）。
+# 注意 webpipe 的 WORK_PRESETS 里还有第 5 项 {title:'max', effort:'max'}，
+# 但那是「服务端实测接受、额外提供」的一档，网页界面并不给用户选。
+# 这里按网页版对齐，不放 max（要更久就选「极高」）。
 WEB_WORK_TIERS = [
     {"name": "轻度", "effort": "minimal"},
     {"name": "中", "effort": "low"},
     {"name": "高", "effort": "standard"},
     {"name": "极高", "effort": "extended"},
-    {"name": "max", "effort": "max"},
 ]
 WEB_MODE_CHOICES = [
     {"name": "聊天", "value": "chat"},
