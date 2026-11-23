@@ -1,9 +1,23 @@
 imagegen-relay  —— 版本戳
 ==================================================
-version : 1.5.0
-date    : 2026-11-23（架构收口 + 现存 bug 全清 + 分层超时 + SKILL.md 瘦身，v1.5.0）
+version : 1.5.1
+date    : 2026-11-23（对照真实上游 chat + work /backend-api/models 全量校准 slug 与 5 档 effort，v1.5.1）
 baseline: 官方 imagegen（.system/imagegen）；以下 6 个文件内容完全一致（文本文件仅行尾符 LF/CRLF 差异）：
           prompting.md / sample-prompts.md / remove_chroma_key.py / LICENSE.txt / 两个图标
+
+v1.5.1 实测校准与诊断加固（2026-11-23）
+------------------------------
+  · 修复 chat 模式 GPT-5.6 Sol 的真实 slug：由错误的 `gpt-5.6-sol-thinking` 改为实测真值 `gpt-5-6-thinking`（即时档 `gpt-5-6-instant`，GPT-6 即时档 `gpt-6-instant`），消除 prepare 阶段 `conduit_token` 失败降级。
+  · 修复 work 模式档位全面错位与 422 报错：
+      - `EFFORT_ORDER` 补入上游真实轻度值 `"min"`；
+      - `WEB_WORK_TIERS` 对齐上游真实 5 档：`轻度(min) / 中(standard) / 高(extended) / 极高(xhigh) / 最高(max)`；
+      - `work` 模式下历史写法 `--effort minimal` 自动映射为 `min` 并给明确告警，消除 `422 Invalid conversation body`；
+      - 传旧错误 slug（`gpt-5.6-sol-thinking`）、`-instant` 搭思考档或跨模式混用 `-wm` 时提前给出告警。
+  · 细化网页管线降级/失败诊断：
+      - `relay_errors.py` 新增 `webpipe_invalid_request`（`conduit_token` / `422 Invalid conversation body`，不重试）与 `webpipe_blocked`（`webpipe 403` / Cloudflare / Sentinel，不重试）；
+      - `_report_pipeline` 降级警告附带诊断建议，`_report_record` 补齐独立 `"degraded_reason"` 字段；
+      - `_resolve_timeouts` 按显式 `--timeout` 缩放 `slow_after`（`min(base_slow, max(20, timeout*0.6))`），避免重任务短超时下 `[slow]` 永不触发。
+  · `WEB_WORK_MODELS` 按上游版本选择器新到旧排序（6.2 Astra → 5.6 Luna，共 10 个已核验 `-wm` 模型），同步更新 SKILL.md / cli.md / relay-api.md / selfcheck.py。
 
 v1.5.0 新增与修复（2026-11-23）
 ------------------------------

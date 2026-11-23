@@ -324,8 +324,22 @@ def check_tiers() -> None:
     record("第2步一次列模型+档位（chat 3 档）", ok, out[-200:] if not ok else "")
 
     code, out, _ = run(["tiers", "--mode", "work"])
-    ok = code == 0 and "模型" in out and "档位" in out and "极高" in out and "max" not in out
-    record("第2步一次列模型+档位（work 4 档，无 max）", ok, out[-200:] if not ok else "")
+    ok = code == 0 and "模型" in out and "档位" in out and "轻度" in out and "极高" in out and "最高" in out
+    record("第2步一次列模型+档位（work 5 档）", ok, out[-200:] if not ok else "")
+
+    code, out, _ = run(["tiers", "--mode", "work", "--json"])
+    try:
+        wdata = json.loads(out[out.index("{") : out.rindex("}") + 1])
+        w_effs = [e["value"] for e in wdata["efforts"]]
+        ok = (
+            code == 0
+            and len(wdata["models"]) == 10
+            and all(m["value"].endswith("-wm") for m in wdata["models"])
+            and w_effs == ["min", "standard", "extended", "xhigh", "max"]
+        )
+    except Exception:
+        ok = False
+    record("tiers --mode work --json 含 10 个 -wm 模型与 5 档真值", ok, out[-200:] if not ok else "")
 
     code, out, _ = run(["tiers", "--mode", "chat", "--efforts"])
     ok = code == 0 and "档位" in out and "模型" not in out
@@ -337,11 +351,18 @@ def check_tiers() -> None:
     code, out, _ = run(["tiers", "--mode", "chat", "--json"])
     try:
         data = json.loads(out[out.index("{") : out.rindex("}") + 1])
-        ok = (code == 0 and len(data["models"]) >= 2 and len(data["efforts"]) == 3
-              and all(m.get("value") for m in data["models"]))
+        slugs = [m.get("value") for m in data["models"]]
+        instants = [m.get("instant_value") for m in data["models"]]
+        c_effs = [e["value"] for e in data["efforts"]]
+        ok = (
+            code == 0
+            and slugs == ["gpt-6-thinking", "gpt-5-6-thinking"]
+            and instants == ["gpt-6-instant", "gpt-5-6-instant"]
+            and c_effs == ["none", "standard", "extended"]
+        )
     except Exception:
         ok = False
-    record("tiers --json 结构正确", ok, out[-200:] if not ok else "")
+    record("tiers --mode chat --json 含真实 slug 与 3 档", ok, out[-200:] if not ok else "")
 
 
 # ─────────────────────────────────────────── 6. setup、--show 脱敏与 reference 隔离
@@ -386,11 +407,28 @@ def check_setup() -> None:
         code, out, _ = run(["generate", "--prompt", "x", "--dry-run"])
         record("setup 后命令自动沿用", code == 0 and all(k in out for k in ("mssk_mode", "mssk_effort", "mssk_model")))
 
-        code, out, _ = run(["generate", "--prompt", "x", "--effort", "low", "--agent-model", "auto", "--dry-run"])
+        code, out, _ = run(["generate", "--prompt", "x", "--effort", "min", "--agent-model", "auto", "--dry-run"])
         record(
-            "命令行覆盖 config（含 --agent-model auto）",
-            code == 0 and '"mssk_effort": "low"' in out and "mssk_model" not in out,
+            "命令行覆盖 config（含 --effort min 与 --agent-model auto）",
+            code == 0 and '"mssk_effort": "min"' in out and "mssk_model" not in out,
             out[-260:],
+        )
+
+        # work 模式下旧写法 minimal 自动映射为 min 并给告警
+        code, out, err = run(["generate", "--prompt", "x", "--web-mode", "work", "--effort", "minimal", "--dry-run"])
+        record(
+            "work + --effort minimal 自动归一为 min 并告警",
+            code == 0 and '"mssk_effort": "min"' in out and "422" in err,
+            (out + err)[-260:],
+        )
+
+        # setup work + minimal 落盘为 min
+        code, _, err = run(["setup", "--web-mode", "work", "--effort", "minimal"])
+        cfg_min = json.loads(CONFIG.read_text(encoding="utf-8"))
+        record(
+            "setup work + minimal 落盘为 min",
+            code == 0 and cfg_min.get("web_effort") == "min" and "min" in err,
+            json.dumps(cfg_min, ensure_ascii=False),
         )
 
         # setup 后跑 reference（未显式传网页参数）绝不误报 Warning
@@ -429,7 +467,25 @@ def check_pipeline() -> None:
     record("pipeline: 正常网页管线", "网页管线" in out and "surface=" in out and info["pipeline"] == "web", out.strip())
 
     out, info = grab({"data": [], "degraded": True, "degraded_reason": "webpipe 403"}, "gpt-image-2")
-    record("pipeline: 降级有醒目警告", "备用通道" in out and "403" in out and info["pipeline"] == "degraded", out.strip())
+    record(
+        "pipeline: 降级有醒目警告与风控诊断建议",
+        "备用通道" in out and "403" in out and "webpipe_blocked" in out and info["pipeline"] == "degraded",
+        out.strip(),
+    )
+
+    out_c, info_c = grab(
+        {"data": [], "degraded": True, "degraded_reason": "prepare 没返回 conduit_token"},
+        "gpt-image-2",
+    )
+    rec_c = image_gen._report_record(
+        command="generate", model="gpt-image-2", prompt="p",
+        artifacts=[], timing={"total": 1.0}, base_url="https://x", pipeline_info=info_c,
+    )
+    record(
+        "pipeline: 降级附带 slug/effort 诊断且 report 含独立 degraded_reason",
+        "webpipe_invalid_request" in out_c and rec_c.get("degraded_reason") == "prepare 没返回 conduit_token",
+        f"{out_c.strip()} | {rec_c.get('degraded_reason')}",
+    )
 
     out, info = grab({"data": []}, "codex-gpt-image-2")
     record("pipeline: 显式原生", "原生端点" in out and info["pipeline"] == "native", out.strip())
@@ -466,6 +522,10 @@ def check_errors() -> None:
         "network error talking to https://x": "network_error",
         "Too many requests": "rate_limited",
         "Invalid value": "bad_request",
+        "prepare 没返回 conduit_token": "webpipe_invalid_request",
+        "请求体被上游拒绝（422 Invalid conversation body）：model=gpt-6-astra-wm": "webpipe_invalid_request",
+        "webpipe 403 forbidden": "webpipe_blocked",
+        "cloudflare cf_chl challenge": "webpipe_blocked",
         "invalid token": "token_invalid",
         "抱歉，我无法基于这张参考图": "model_refusal",
         "完全没见过的错误": "upstream_error",
@@ -476,6 +536,18 @@ def check_errors() -> None:
         if got != want:
             bad.append(f"{text!r} -> {got}（期望 {want}）")
     record(f"错误分类 {len(cases)} 例", not bad, "; ".join(bad))
+
+    # 网页管线参数/风控失败绝不标为可重试
+    cls_inv = relay_errors.classify_error("prepare 没返回 conduit_token")
+    cls_blk = relay_errors.classify_error("webpipe 403")
+    record(
+        "webpipe_invalid_request / webpipe_blocked 均标为 RETRYABLE=no",
+        cls_inv["code"] == "webpipe_invalid_request"
+        and cls_inv["retryable"] is False
+        and cls_blk["code"] == "webpipe_blocked"
+        and cls_blk["retryable"] is False,
+        f"{cls_inv} / {cls_blk}",
+    )
 
     # HTTP 401 裸状态码兜底
     record("HTTP 401 裸响应兜底为 token_invalid", relay_errors.classify_error("Unauthorized", http_status=401)["code"] == "token_invalid")
@@ -604,14 +676,18 @@ def check_outputs_and_timeouts() -> None:
             str(rep_data),
         )
 
-    # 分层超时：normal vs heavy vs 显式覆盖
+    # 分层超时：normal vs heavy vs 显式覆盖（slow_after 随短 --timeout 自动缩放）
     t_norm = image_gen._resolve_timeouts(argparse.Namespace(timeout=None, deadline=None), command="generate", n=1, web_mode="chat", effort=None)
     t_heavy = image_gen._resolve_timeouts(argparse.Namespace(timeout=None, deadline=None), command="generate", n=4, web_mode="chat", effort=None)
     t_exp = image_gen._resolve_timeouts(argparse.Namespace(timeout=400.0, deadline=None), command="generate", n=1, web_mode="chat", effort=None)
+    t_short_heavy = image_gen._resolve_timeouts(argparse.Namespace(timeout=150.0, deadline=200.0), command="generate", n=1, web_mode="work", effort="extended")
     record(
-        "分层超时策略（常规 150/240，重任务 300/480，显式覆盖）",
-        t_norm[:2] == (150.0, 240.0) and t_heavy[:2] == (300.0, 480.0) and t_exp[:2] == (400.0, 400.0),
-        f"{t_norm} / {t_heavy} / {t_exp}",
+        "分层超时策略（常规 150/240，重任务 300/480，显式覆盖与 slow_after 缩放）",
+        t_norm == (150.0, 240.0, 90.0)
+        and t_heavy == (300.0, 480.0, 180.0)
+        and t_exp[:2] == (400.0, 400.0)
+        and t_short_heavy == (150.0, 200.0, 90.0),
+        f"{t_norm} / {t_heavy} / {t_exp} / {t_short_heavy}",
     )
 
     # _run_with_refusal_retry 共享同一 deadline，过期立即报 deadline_exceeded
@@ -638,6 +714,27 @@ def check_validation() -> None:
     for name, argv in bad_cases.items():
         code, _, _ = run(argv)
         record(f"拒绝 {name}", code != 0, f"退出码 {code}（应为非 0）")
+
+    # 旧错误 slug 与 instant 搭 effort 提前告警
+    env_ok = {"IMAGE_RELAY_URL": "https://selfcheck.invalid/v1", "IMAGE_RELAY_KEY": "k"}
+    code, _, err = run(
+        ["generate", "--prompt", "x", "--web-mode", "chat", "--agent-model", "gpt-5.6-sol-thinking", "--dry-run"],
+        env_extra=env_ok,
+    )
+    record(
+        "chat + 旧 slug gpt-5.6-sol-thinking 提前提示真实值 gpt-5-6-thinking",
+        code == 0 and "gpt-5-6-thinking" in err,
+        err.strip(),
+    )
+    code, _, err = run(
+        ["generate", "--prompt", "x", "--web-mode", "chat", "--agent-model", "gpt-6-instant", "--effort", "extended", "--dry-run"],
+        env_extra=env_ok,
+    )
+    record(
+        "chat + -instant 搭 --effort extended 提前告警",
+        code == 0 and "不支持 thinking_effort" in err,
+        err.strip(),
+    )
 
     # 有 key 但缺 api_url 应干净退出（不能抛 ValueError 堆栈）
     backup = CONFIG.read_bytes() if CONFIG.exists() else None

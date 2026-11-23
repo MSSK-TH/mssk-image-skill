@@ -7,7 +7,7 @@
 > 只有用 `--max-dim` / `--exact-size` / `--output-format` 这几个参数时才需要 Pillow
 > （装了 `uv` 的话 launcher 会自动带上，不用手动装）。
 
-当前版本 **v1.5.0**（2026-11-23）。
+当前版本 **v1.5.1**（2026-11-23）。
 
 ---
 
@@ -78,27 +78,27 @@ $imagegen-relay 生成一张海边日出的照片，要横版
 **第 2 问 —— 模型 + 档位**（一次问完，因为同一模式内档位与模型无关）
 
 ```
-（聊天）模型：1) GPT-6   2) GPT-6.1 Sol   3) GPT-5.6 Sol
-（聊天）档位：1)即时     2)中            3)高
+（聊天）模型：1) GPT-6   2) GPT-5.6 Sol
+（聊天）档位：1)即时(none)   2)中(standard)   3)高(extended)
 
-（工作）模型：1) GPT-6   2) GPT-6.1 Sol   3) GPT-5.6 Sol
-（工作）档位：1)轻度     2)中            3)高     4)极高
+（工作）模型：1) GPT-6.2 Astra  2) GPT-6.2 Sol  …  10) GPT-5.6 Luna（共 10 个 -wm 模型）
+（工作）档位：1)轻度(min)  2)中(standard)  3)高(extended)  4)极高(xhigh)  5)最高(max)
 ```
 
 答完它会固化下来，**以后不再问**：
 
 ```bash
-python scripts/image_gen.py setup --agent-model gpt-6-thinking --effort high --web-mode chat
+python scripts/image_gen.py setup --agent-model gpt-6-thinking --effort extended --web-mode chat
 ```
 
 之后每条命令都沿用这三个值；临时换就在命令行加参数覆盖。
 
 | 模式 | 档位 | 什么时候用 |
 |---|---|---|
-| **聊天**（3 档） | 即时 / 中 / 高 | 日常出图，通过率更高 |
-| **工作**（4 档） | 轻度 / 中 / 高 / 极高 | 做卡片、网页素材、需要反复改的图 |
+| **聊天**（3 档） | 即时(`none`) / 中(`standard`) / 高(`extended`) | 日常出图，通过率更高（`GPT-5.6 Sol` 思考档 slug 为 `gpt-5-6-thinking`，即时档 `gpt-5-6-instant`） |
+| **工作**（5 档） | 轻度(`min`) / 中(`standard`) / 高(`extended`) / 极高(`xhigh`) / 最高(`max`) | 做卡片、网页素材、需要反复改的图 |
 
-> 工作模式没有"即时"档。`--effort max` 是命令行高级用法（界面不展示）。
+> 工作模式没有"即时"档（`work + --effort none` 会被拒）；旧写法 `--effort minimal` 会自动映射为 `min` 并告警。
 
 ---
 
@@ -170,7 +170,7 @@ imagegen-relay/                  ← 一个标准 skill 目录，整体拷进 sk
 ├── scripts/
 │   ├── image_gen.py            CLI 本体（generate / edit / reference / batch / models / tiers / setup）
 │   ├── relay_errors.py         失败分类（CODE= / HINT= 的唯一来源）
-│   ├── selfcheck.py            58 项零成本自检（不发真实生成请求）
+│   ├── selfcheck.py            65 项零成本自检（不发真实生成请求）
 │   └── remove_chroma_key.py    抠图兜底（与官方 skill 逐字节一致）
 ├── references/
 │   ├── cli.md                  完整命令行参考
@@ -193,7 +193,7 @@ imagegen-relay/                  ← 一个标准 skill 目录，整体拷进 sk
 
 ```bash
 cd imagegen-relay
-python scripts/selfcheck.py        # 58 项，10 秒，零成本
+python scripts/selfcheck.py        # 65 项，10 秒，零成本
 python scripts/selfcheck.py -v     # 带细节
 ```
 
@@ -210,7 +210,8 @@ setup 持久化与清除、`[pipeline]` 上报、11 类错误码、参数校验�
 | 出图很慢（1 分钟以上） | 可能走了回退通道。看输出里的 `[pipeline]` 行有没有 `degraded` |
 | 报 `content_refusal` / `content_safety` | 内容安全判定。重试或换参考图；没有"审核开关" |
 | `CODE=no_image_data` | 服务端 HTTP 200 但没给图，偶发；再发一次通常就出来 |
-| `CODE=bad_request` | 参数被拒（多半是档位不支持）；降一档再试 |
+| `CODE=bad_request` / `webpipe_invalid_request` | 参数或 slug/档位与当前模式不匹配；跑 `tiers --mode <chat\|work>` 核对实测清单 |
+| `CODE=webpipe_blocked` | 网页管线触发上游 403/风控，不要连重；稍后再试或切 `--model codex-gpt-image-2` |
 | 提示 `Output already exists` | 加 `--force`，或换输出路径 |
 | 完全不出图 | 先跑 `setup --show --json` 确认配置；再跑 `selfcheck.py` |
 | `Python 3 was not found` | 装 Python 3.9+，或确认 `python` 在 PATH 里 |
@@ -220,6 +221,14 @@ setup 持久化与清除、`[pipeline]` 上报、11 类错误码、参数校验�
 ---
 
 ## 变更记录
+
+**v1.5.1（2026-11-23）**
+
+- 对照上游真实 `/backend-api/models` 校准 `chat` 模型 slug：`GPT-5.6 Sol` 由 `gpt-5.6-sol-thinking` 修正为 `gpt-5-6-thinking`（即时档 `gpt-5-6-instant`，GPT-6 即时档 `gpt-6-instant`）
+- 校准 `work` 模式真实 5 档：`轻度(min) / 中(standard) / 高(extended) / 极高(xhigh) / 最高(max)`，`EFFORT_ORDER` 补入 `min`，历史写法 `minimal` 自动映射为 `min` 并告警
+- 错用旧 slug、`-instant` 搭思考档或跨模式混用 `-wm` 时提前告警
+- `relay_errors.py` 新增 `webpipe_invalid_request`（`conduit_token` / `422`）与 `webpipe_blocked`（403 / 风控），均标 `RETRYABLE=no`；降级告警附带诊断建议，`--report-json` 补独立 `degraded_reason` 字段；`slow_after` 随短 `--timeout` 缩放
+- 自检 58 项 → **65 项**
 
 **v1.5.0（2026-11-23）**
 

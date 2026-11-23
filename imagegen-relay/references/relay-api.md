@@ -57,16 +57,16 @@ Four `codex exec` captures against a custom provider `base_url` confirmed that t
 | `mssk_model` | `web_model` | Upstream reasoning model slug (omitted for `auto`) |
 | `mssk_gif_speed` | `gif_speed` | GIF playback speed multiplier (`0.25`..`2`, scales `animation.frame_duration_ms` only) |
 
-### Surface & Tier Mechanics (`webpipe.mjs`)
+### Surface & Tier Mechanics (`webpipe.mjs`, verified 2026-11-23 against live `/backend-api/models`)
 
 | | `chat` surface | `work` surface |
 | --- | --- | --- |
-| UI tiers | 3: `即时` / `中` / `高` | 4: `轻度` / `中` / `高` / `极高` (`max` accepted on CLI for advanced use) |
-| What changes | Each tier maps to its own preset slug (`gpt-6-instant` vs `gpt-6-thinking`) | Slug stays in `-wm` family; only `thinking_effort` changes |
-| `effort` values | `none` (omitted) / `standard` / `extended` (account presets may also accept `medium`/`high`/`xhigh`) | `minimal` / `low` / `standard` / `extended` (no `none` tier) |
-| Same tiers across models? | Yes | Yes |
+| UI tiers | 3: `即时` / `中` / `高` | 5: `轻度` / `中` / `高` / `极高` / `最高` |
+| What changes | Preset slug per lane: `gpt-6-instant` / `gpt-6-thinking` and `gpt-5-6-instant` / `gpt-5-6-thinking` (hyphen `5-6`, no `-sol`) | Slug stays in the 10-model `-wm` family (`gpt-6.2-astra-wm` … `gpt-5.6-luna-wm`); only `thinking_effort` changes |
+| `effort` values | `none` (omitted, for `-instant`) / `standard` / `extended` | `min` / `standard` / `extended` / `xhigh` / `max` (no `none` tier; upstream returns `422` on `"minimal"`, which the CLI auto-maps to `min`) |
+| Same tiers across models? | Yes | Yes (all 10 `-wm` models share the exact 5 tiers) |
 
-Because `/web/models` on the execution layer is a top-level route and `new-api` only forwards `/v1/*`, the CLI cannot query the account's live web-model list; candidate slugs in `tiers` are common defaults, and an unavailable slug/tier returns `bad_request`.
+Because `/web/models` on the execution layer is a top-level route and `new-api` only forwards `/v1/*`, the CLI cannot query the account's live web-model list; candidate slugs in `tiers` are calibrated from real upstream `/backend-api/models` captures. When the web pipeline fails and auto-falls back to native, `degraded_reason` exposes the exact cause (`prepare 没返回 conduit_token` → invalid/mismatched slug; `422 Invalid conversation body` → invalid `thinking_effort`; `webpipe 403` / Cloudflare / Sentinel → risk control) and is recorded as a standalone `"degraded_reason"` field in `--report-json`.
 
 ## Edit Contracts: Codex JSON vs OpenAI Multipart
 

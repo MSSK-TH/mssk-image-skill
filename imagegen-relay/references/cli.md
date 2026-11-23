@@ -160,7 +160,7 @@ Notes:
 | `--strict-n` | On `generate` with `gpt-image-2` and `--n > 1`, run `n` sequential `n=1` calls |
 | `--skip-existing` | On `generate-batch`, skip already-completed non-empty outputs |
 | `--preset RATIO@2k\|4k` / `--exact-size WxH` / `--fit` | Ratio hint + exact local Lanczos resample |
-| `--web-mode chat\|work` / `--effort TIER` / `--agent-model SLUG` | Web-pipeline controls (`work` + `--effort none` rejected; `--effort max` is an advanced CLI-only tier hidden from `tiers`'s 4-tier UI menu; `--agent-model auto` overrides config back to auto) |
+| `--web-mode chat\|work` / `--effort TIER` / `--agent-model SLUG` | Web-pipeline controls (`chat` 3 tiers: `none/standard/extended`, slugs `gpt-6-thinking`/`gpt-5-6-thinking` or `-instant`; `work` 5 tiers: `min/standard/extended/xhigh/max`, legacy `minimal` auto-maps to `min`, `work` + `--effort none` rejected; `--agent-model auto` overrides config back to auto) |
 | `--conv-key NAME` / `--new-conv` | Pin or rotate `<cwd>/.imagegen/conv-<hash>` (persisted after live call succeeds) |
 | `--gif-speed 0.25..2` | GIF playback speed multiplier (`animation.frame_duration_ms` only) |
 | `--check-model` / `--strict-size` / `--report-json PATH` | Model probe / official hard size validation / structured report |

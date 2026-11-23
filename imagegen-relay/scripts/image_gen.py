@@ -2,7 +2,7 @@
 """Relay CLI for explicit image generation or editing with gpt-image-2.
 
 This is the relay counterpart of the official ``imagegen`` skill's
-``scripts/image_gen.py`` (v1.5.0).
+``scripts/image_gen.py`` (v1.5.1).
 
 Kept aligned with the official implementation:
   * subcommands ``generate`` / ``edit`` / ``generate-batch`` (plus relay ``reference`` /
@@ -117,7 +117,7 @@ DEFAULT_TIMEOUT_SECONDS = DEFAULT_STANDARD_TIMEOUT_SECONDS
 DEFAULT_DEADLINE_SECONDS = DEFAULT_STANDARD_DEADLINE_SECONDS
 HEAVY_EFFORTS = frozenset({"extended", "xhigh", "max"})
 
-USER_AGENT = "imagegen-relay/1.5 (stdlib)"
+USER_AGENT = "imagegen-relay/1.5.1 (stdlib)"
 MAX_ERROR_TEXT = 400
 MAX_IMAGE_BYTES = 50 * 1024 * 1024
 MAX_BATCH_JOBS = 500
@@ -169,37 +169,30 @@ TRANSPARENT_PROMPT_LINE = (
 # --------------------------------------------------------------------------
 # [relay] Web-pipeline surface / model / effort definitions (Single Source of Truth)
 # --------------------------------------------------------------------------
-# chat surface：3 档（即时/中/高），每档独立 preset slug；
-# work surface：4 档 UI 滑杆（轻度/中/高/极高），slug 带 -wm 后缀，只变 thinking_effort。
-# CLI 查不到账号真实模型清单（/web/models 是顶层路由，网关只转发 /v1/*），以下为常见参考值。
-
-# ⚠️ chat 与 work 的模型范围不同，两份独立清单。
+# 2026-11-23 对照真实上游 /backend-api/models（普通网页 chat + Codex Browser work）双端核对：
+#   - chat surface：3 档（即时/中/高），2 个模型家族，slug 按 lane 分列（-instant / -thinking）：
+#       · GPT-6       → gpt-6-thinking（中 standard / 高 extended）；即时档 gpt-6-instant（none）
+#       · GPT-5.6 Sol → gpt-5-6-thinking（中 standard / 高 extended，注意连字符 5-6 无 -sol！）；
+#                       即时档 gpt-5-6-instant（none）
+#   - work surface：5 档（轻度 min / 中 standard / 高 extended / 极高 xhigh / 最高 max），
+#       全部 10 个 -wm 模型共享同一套 5 档 thinking_efforts，slug 固定带 -wm 后缀。
 #
-# chat（2026-11-23 按网页版下拉框实测，只有两个）：
-#   - GPT-6
-#   - GPT-5.6 Sol
-#   slug 是 preset 级（-thinking / -instant），由模型 + 档位共同决定。
-#
-# work（按网页版下拉框：**全部模型都有**，5.6 起至 6.2 共 10 个，各加 `-wm` 后缀；5.5 已下线）。
-#   ⚠️ shim 注释里只列了 7 个（缺 6.1 Terra / 6.2 / 5.5），那是注释不全，以网页版为准。
-#
-# 真值来源：shim 的 /web/models（顶层路由，经网关查不到；直连时若号池有空 Cookie 会 401）。
-# 选错会返回 bad_request，换一个；完全不确定就传 --agent-model auto。
+# CLI 查不到账号实时模型清单（/web/models 是顶层路由，网关只转发 /v1/*）；不确定就传 --agent-model auto。
 WEB_CHAT_MODELS = [
-    {"name": "GPT-6", "value": "gpt-6-thinking"},
-    {"name": "GPT-5.6 Sol", "value": "gpt-5.6-sol-thinking"},
+    {"name": "GPT-6", "value": "gpt-6-thinking", "instant_value": "gpt-6-instant"},
+    {"name": "GPT-5.6 Sol", "value": "gpt-5-6-thinking", "instant_value": "gpt-5-6-instant"},
 ]
 WEB_WORK_MODELS = [
-    {"name": "GPT-5.6 Sol", "value": "gpt-5.6-sol-wm"},
-    {"name": "GPT-5.6 Terra", "value": "gpt-5.6-terra-wm"},
-    {"name": "GPT-5.6 Luna", "value": "gpt-5.6-luna-wm"},
+    {"name": "GPT-6.2 Astra", "value": "gpt-6.2-astra-wm"},
+    {"name": "GPT-6.2 Sol", "value": "gpt-6.2-sol-wm"},
+    {"name": "GPT-6.1 Sol", "value": "gpt-6.1-sol-wm"},
+    {"name": "GPT-6.1 Terra", "value": "gpt-6.1-terra-wm"},
     {"name": "GPT-6 Astra", "value": "gpt-6-astra-wm"},
     {"name": "GPT-6 Sol", "value": "gpt-6-sol-wm"},
     {"name": "GPT-6 Luna", "value": "gpt-6-luna-wm"},
-    {"name": "GPT-6.1 Sol", "value": "gpt-6.1-sol-wm"},
-    {"name": "GPT-6.1 Terra", "value": "gpt-6.1-terra-wm"},
-    {"name": "GPT-6.2 Astra", "value": "gpt-6.2-astra-wm"},
-    {"name": "GPT-6.2 Sol", "value": "gpt-6.2-sol-wm"},
+    {"name": "GPT-5.6 Sol", "value": "gpt-5.6-sol-wm"},
+    {"name": "GPT-5.6 Terra", "value": "gpt-5.6-terra-wm"},
+    {"name": "GPT-5.6 Luna", "value": "gpt-5.6-luna-wm"},
 ]
 
 
@@ -214,20 +207,24 @@ WEB_CHAT_TIERS = [
     {"name": "高", "effort": "extended"},
 ]
 WEB_WORK_TIERS = [
-    {"name": "轻度", "effort": "minimal"},
-    {"name": "中", "effort": "low"},
-    {"name": "高", "effort": "standard"},
-    {"name": "极高", "effort": "extended"},
+    {"name": "轻度", "effort": "min"},
+    {"name": "中", "effort": "standard"},
+    {"name": "高", "effort": "extended"},
+    {"name": "极高", "effort": "xhigh"},
+    {"name": "最高", "effort": "max"},
 ]
+WEB_WORK_VALID_EFFORTS = frozenset(t["effort"] for t in WEB_WORK_TIERS)
 WEB_MODE_CHOICES = [
     {"name": "聊天", "value": "chat"},
     {"name": "工作", "value": "work"},
 ]
 
-# 合法 --effort 值：同时兼容 work 滑杆（minimal/low/standard/extended/max）
-# 与 chat 账号预设可能声明的值（medium/high/xhigh），以及 none（即时，不传 thinking_effort）。
+# 合法 --effort 值：覆盖 work 真实 5 档（min/standard/extended/xhigh/max）、
+# chat 3 档（none/standard/extended）以及兼容历史写法/账号扩展预设（minimal/low/medium/high）。
+# 其中 work 模式下传 minimal 会被自动映射为 min 并给告警（上游 422 拒绝 minimal）。
 EFFORT_ORDER = (
     "none",
+    "min",
     "minimal",
     "low",
     "standard",
@@ -537,16 +534,46 @@ def _validate_web_controls(
     effort: Optional[str],
     agent_model: Optional[str] = None,
     *,
-    warn_slug_mismatch: bool = False,
-) -> None:
+    warn_slug_mismatch: bool = True,
+) -> Optional[str]:
+    mode = (web_mode or "").strip().lower() or "chat"
     eff = str(effort or "").strip().lower()
-    if web_mode == "work" and eff == "none":
-        _die("work 模式没有即时档（--effort none）；请选 minimal/low/standard/extended，或改用 --web-mode chat。")
-    if warn_slug_mismatch and agent_model and agent_model not in ("", "auto"):
-        if web_mode == "work" and not agent_model.endswith("-wm"):
-            _warn(f"work 模式通常使用 -wm 后缀模型（如 gpt-6-astra-wm），当前指定为 {agent_model}")
-        elif web_mode == "chat" and agent_model.endswith("-wm"):
-            _warn(f"chat 模式通常不使用 -wm 后缀模型，当前指定为 {agent_model}")
+    model_str = str(agent_model or "").strip()
+
+    if mode == "work" and eff == "none":
+        _die("work 模式没有即时档（--effort none）；请选 min/standard/extended/xhigh/max，或改用 --web-mode chat。")
+
+    # 旧版 v1.4/v1.5 曾把 work 轻度档错写为 minimal，上游会以 422 Invalid conversation body 拒绝；自动归一为 min。
+    if mode == "work" and eff == "minimal":
+        _warn("work 模式轻度档的真实值为 min（上游会以 422 拒绝 minimal），已自动映射为 min。")
+        effort = "min"
+        eff = "min"
+    elif mode == "work" and eff and eff not in WEB_WORK_VALID_EFFORTS:
+        _warn(
+            f"work 模式实测 5 档为 min/standard/extended/xhigh/max，当前指定 --effort {effort} "
+            "可能触发上游 422；轻度请用 min，中档请用 standard。"
+        )
+
+    if mode == "chat" and model_str.lower() == "gpt-5.6-sol-thinking":
+        _warn(
+            "chat 模式下 GPT-5.6 Sol 的真实 slug 为 gpt-5-6-thinking（即时档 gpt-5-6-instant），"
+            "旧写法 gpt-5.6-sol-thinking 会在 prepare 阶段失效降级。"
+        )
+    if mode == "chat" and model_str.endswith("-instant") and eff and eff not in ("none", "auto"):
+        _warn(
+            f"chat 模式下 {model_str} 为即时档模型（不支持 thinking_effort），搭配 --effort {effort} "
+            "可能被上游拒绝；思考档请改用对应的 -thinking slug（如 gpt-6-thinking / gpt-5-6-thinking）。"
+        )
+
+    if warn_slug_mismatch and model_str and model_str.lower() != "auto":
+        if mode == "work" and not model_str.endswith("-wm"):
+            _warn(f"work 模式通常使用 -wm 后缀模型（如 gpt-6.2-sol-wm / gpt-6-astra-wm），当前指定为 {model_str}")
+        elif mode == "chat" and model_str.endswith("-wm"):
+            _warn(
+                f"chat 模式通常不使用 -wm 后缀模型，当前指定为 {model_str}"
+                "（临时切 chat 时可加 --agent-model auto 或指定 gpt-6-thinking / gpt-5-6-thinking）"
+            )
+    return effort
 
 
 def _cmd_tiers(args: argparse.Namespace) -> int:
@@ -635,7 +662,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     effective_mode = args.web_mode if args.web_mode is not None else cfg.get("web_mode")
     effective_effort = args.effort if args.effort is not None else cfg.get("web_effort")
     effective_model = args.agent_model if args.agent_model is not None else cfg.get("web_agent_model")
-    _validate_web_controls(
+    normalized_effort = _validate_web_controls(
         effective_mode,
         effective_effort,
         effective_model,
@@ -650,12 +677,16 @@ def _cmd_setup(args: argparse.Namespace) -> int:
             cfg["web_agent_model"] = args.agent_model
             changed.append(f"web_agent_model={args.agent_model}")
     if args.effort is not None:
-        if args.effort in ("", "none"):
+        eff_to_save = normalized_effort if normalized_effort is not None else args.effort
+        if eff_to_save in ("", "none"):
             cfg.pop("web_effort", None)
             changed.append("web_effort=<清除，即时档>")
         else:
-            cfg["web_effort"] = args.effort
-            changed.append(f"web_effort={args.effort}")
+            cfg["web_effort"] = eff_to_save
+            changed.append(f"web_effort={eff_to_save}")
+    elif normalized_effort != effective_effort and normalized_effort:
+        cfg["web_effort"] = normalized_effort
+        changed.append(f"web_effort={normalized_effort}（自动归一旧值 {effective_effort}）")
     if args.web_mode is not None:
         cfg["web_mode"] = args.web_mode
         changed.append(f"web_mode={args.web_mode}")
@@ -1225,7 +1256,8 @@ def _resolve_timeouts(
     else:
         default_dl = DEFAULT_HEAVY_DEADLINE_SECONDS if heavy else DEFAULT_STANDARD_DEADLINE_SECONDS
         deadline_s = max(default_dl, timeout_s)
-    slow_after = 180.0 if heavy else 90.0
+    base_slow = 180.0 if heavy else 90.0
+    slow_after = min(base_slow, max(20.0, timeout_s * 0.6))
     return timeout_s, deadline_s, slow_after
 
 
@@ -1980,7 +2012,12 @@ def _report_pipeline(
         "agent_model": agent_effective,
     }
     if degraded:
-        _warn(f"本次图片来自备用通道（{note}）—— 不是网页管线出的图{detail}")
+        diag_suffix = ""
+        if reason:
+            cls = classify_error(reason)
+            if cls["code"] in ("webpipe_invalid_request", "webpipe_blocked", "bad_request"):
+                diag_suffix = f"\n  诊断建议（{cls['code']}）：{cls['hint']}"
+        _warn(f"本次图片来自备用通道（{note}）—— 不是网页管线出的图{detail}{diag_suffix}")
     else:
         _info(f"[pipeline] {note}{detail}")
     return info
@@ -2425,6 +2462,7 @@ def _report_record(
         "image_source": first.source if first else None,
         "pipeline": pinfo.get("pipeline"),
         "pipeline_note": pinfo.get("note"),
+        "degraded_reason": pinfo.get("degraded_reason"),
         "surface": pinfo.get("surface"),
         "effort": pinfo.get("effort"),
         "agent_model": pinfo.get("agent_model"),
@@ -3708,14 +3746,15 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
         "--web-mode",
         choices=("chat", "work"),
         default=None,
-        help="网页管线的 surface：chat（默认，生图通过率更高）/ work（做卡片/素材，4 档滑杆）",
+        help="网页管线的 surface：chat（默认，生图通过率更高，3 档）/ work（做卡片/素材，5 档滑杆）",
     )
     parser.add_argument(
         "--effort",
         choices=EFFORT_ORDER,
         default=None,
         help=f"网页管线推理档：{'/'.join(EFFORT_ORDER)}（chat 3 档：none/standard/extended；"
-        "work 4 档：minimal/low/standard/extended；reference 路由请用 --reasoning-effort）",
+        "work 5 档：min/standard/extended/xhigh/max，旧写法 minimal 自动映射为 min；"
+        "reference 路由请用 --reasoning-effort）",
     )
     parser.add_argument(
         "--agent-model",
@@ -3950,10 +3989,11 @@ def main() -> int:
     _apply_preset(args)
 
     if args.command in WEB_PIPELINE_COMMANDS:
-        _validate_web_controls(
+        args.effort = _validate_web_controls(
             getattr(args, "web_mode", None),
             getattr(args, "effort", None),
             getattr(args, "agent_model", None),
+            warn_slug_mismatch=True,
         )
 
     if getattr(args, "concurrency", 1) < 1 or getattr(args, "concurrency", 1) > 25:

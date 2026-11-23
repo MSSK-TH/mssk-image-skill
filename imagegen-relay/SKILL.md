@@ -36,17 +36,13 @@ Before the first web-pipeline image, check status via `setup --show --json` (**n
 
 1. **Step 1 — 模式** (`tiers`): ask `模式：1)聊天  2)工作` (must come first because the tier list depends on surface).
 2. **Step 2 — 模型 + 档位** (`tiers --mode <chat|work>`): ask model and tier **together in one message**:
-   - 聊天（`chat`，3 档）：**只有 2 个模型**（网页版下拉框实测）—— `1) GPT-6   2) GPT-5.6 Sol` /
+   - 聊天（`chat`，3 档）：**2 个模型家族**（实测上游 `/backend-api/models`）—— `1) GPT-6`（思考档 `gpt-6-thinking` / 即时档 `gpt-6-instant`）`2) GPT-5.6 Sol`（思考档 `gpt-5-6-thinking` / 即时档 `gpt-5-6-instant`，注意连字符 `5-6` 无 `-sol`）/
      `档位：1)即时(none)  2)中(standard)  3)高(extended)`
-   - 工作（`work`，4 档）：**10 个模型**（`-wm` 后缀那批，5.6 起至 6.2；5.5 已下线）——
-     `档位：1)轻度(minimal)  2)中(low)  3)高(standard)  4)极高(extended)`（无即时档；
-     `work + --effort none` 会被拒；CLI 高级用法另放行未在网页 UI 展示的第 5 档 `--effort max`）
-   - **两种 surface 的模型范围本来就不同，不要套用同一份**：chat 走 `versions[].display_text` + presets
-     （网页版只给 2 个），work 走 `models[]` 里带 `-wm` 后缀那批（网页版给全部 10 个，5.6～6.2）。
-     shim 注释里只写了 7 个，那是注释不全，**以网页版下拉框为准**。
-   - 真值在 shim 的 `/web/models`（顶层路由，经网关查不到）。选错会返回 `bad_request`，换一个；
-     完全不确定就传 `--agent-model auto`。
-3. Map names via `tiers --mode <choice> --json` and save once: `setup --web-mode <m> --agent-model <slug> --effort <e>`. If user says "你随便": use `聊天 + GPT-6 + 高` (`chat` / `gpt-6-thinking` / `extended`) and state what you picked. After `setup`, **never ask again**; CLI flags override per run (`--agent-model auto` overrides back to auto).
+   - 工作（`work`，5 档）：**10 个 `-wm` 模型**（6.2 至 5.6）——
+     `档位：1)轻度(min)  2)中(standard)  3)高(extended)  4)极高(xhigh)  5)最高(max)`（无即时档；
+     `work + --effort none` 会被拒；旧写法 `minimal` 会自动映射为 `min` 并提示）
+   - **两种 surface 的模型范围与 slug 命名不同，不要混用**：chat 走 `versions[]` 的 `-instant`/`-thinking`（`5-6` 用连字符），work 走 `-wm` 家族（全部 10 个模型共享 5 档 `min/standard/extended/xhigh/max`）。不确定就传 `--agent-model auto`。
+3. Map names via `tiers --mode <choice> --json` and save once: `setup --web-mode <m> --agent-model <slug> --effort <e>`（chat 选 `即时(none)` 时用对应 `instant_value`）. If user says "你随便": use `聊天 + GPT-6 + 高` (`chat` / `gpt-6-thinking` / `extended`) and state what you picked. After `setup`, **never ask again**; CLI flags override per run (`--agent-model auto` overrides back to auto).
 
 ### Operating discipline (4 rules that prevent wasted renders)
 
@@ -99,7 +95,7 @@ Derive flags from user intent and state what you picked in one line:
 | "avatar" / "icon" / "square" | `--size 1254x1254` (or `--preset 1:1@2k`) |
 | "4K" / "high-res" | `--preset <ratio>@4k` (state clearly: locally upscaled) |
 | "more detail" / "legible text" / "refine" | `--effort extended` |
-| "quick idea" / "rough" | `--effort none` (chat) or `--web-mode work --effort minimal` |
+| "quick idea" / "rough" | `--effort none` (chat) or `--web-mode work --effort min` |
 | "card" / "site asset" / "will iterate" | `--web-mode work` |
 | "give me 4 options" (text-only) | `--n 4 --strict-n` (exact 4) or `--n 4` (allows extra free variants) |
 | "same character" / "put this in X" / "改图" | `edit --image <path>` (or `reference` if changing aspect ratio) |
@@ -249,7 +245,7 @@ More principles: `references/prompting.md`. Copy/paste specs: `references/sample
 - **`--n > 1` on web pipeline**: upstream drains the whole turn and may return >`n` files and take 3–4 min. Pass `--strict-n` (runs `n` sequential `n=1` calls) or `--model codex-gpt-image-2` when you need strictly `n` outputs.
 - **Animated GIF**: request a loop animation (`…的动画GIF，循环播放`). The CLI writes `.gif` verbatim (never re-encodes via Pillow), writes `<name>-sprite.png` if provided, and `--gif-speed {0.25..2}` scales `animation.frame_duration_ms`.
 - **Conversation continuity**: isolated per project (`<cwd>/.imagegen/conv-<hash>`). New topic → `--new-conv`; parallel tasks in one folder → `--conv-key <task>`.
-- **Higher `--effort` is not always better**: slower and refused more often; raise only for dense text, fine detail, or refinement. (`work` UI shows 4 tiers `minimal/low/standard/extended`; `--effort max` is an advanced CLI-only passthrough not listed in `tiers`.)
+- **Higher `--effort` is not always better**: slower and refused more often; raise only for dense text, fine detail, or refinement. (`work` has 5 verified tiers: `min/standard/extended/xhigh/max`; legacy `minimal` auto-maps to `min`.)
 - **Defaults**: `--preflight off`, `--retry-refusal 0`, layered timeouts (`150s/240s` normal single-image; `300s/480s` heavy `n>1`/`work`/`extended+`/`reference`). Never fabricate a local PIL composite and call it generation.
 
 ## Failure handling (`CODE=` / `RETRYABLE=`)
@@ -264,6 +260,8 @@ Every failure writes `CODE=`, `RETRYABLE=`, `HINT=`, `RAW=` to stderr (with auto
 | `timeout` / `rate_limited` / `network_error` | yes | Wait briefly and retry once; on repeated timeout, try `--new-conv` or `--model codex-gpt-image-2` |
 | `upstream_error` | yes | Retry once verbatim, then report `RAW` |
 | `content_safety` | no | Upstream moderation decision: relay verbatim, do not loop-retry; see `references/safety-refusals.md` |
+| `webpipe_invalid_request` | no | Web pipeline rejected slug or `thinking_effort` (`conduit_token` / `422 Invalid conversation body`) — fix `--web-mode`/`--agent-model`/`--effort` via `tiers` |
+| `webpipe_blocked` | no | Web pipeline hit upstream 403 / Cloudflare / Sentinel challenge — wait, switch to `codex-gpt-image-2`, or ask relay owner to refresh cookies |
 | `model_refusal` | no | Chat model declined (`reference` route): rephrase or switch to `edit` / `--model codex-gpt-image-2` |
 | `deadline_exceeded` | no | Budget exhausted, nothing written — raise `--deadline`, try `--new-conv`, or switch to `codex-gpt-image-2` |
 | `upstream_overloaded` / `relay_cpu` | no | Upstream `NO_MORE_RETRY` or relay CPU saturated — wait, do not retry immediately |

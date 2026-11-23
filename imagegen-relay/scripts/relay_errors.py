@@ -135,6 +135,18 @@ _TRANSLATE_RULES = [
     (re.compile(r"token_revoked|invalidated oauth", re.I), "中转站的授权凭据被踢了"),
     (re.compile(r"no access to model", re.I), "这个令牌没有该模型的权限"),
     (re.compile(r"no available channel|model_not_found|has no channel", re.I), "中转站没有该模型的可用渠道"),
+    (
+        re.compile(r"prepare\s*没返回\s*conduit_token|conduit_token", re.I),
+        "网页管线会话准备失败（多为 model slug 不存在或与当前 chat/work 模式不匹配）",
+    ),
+    (
+        re.compile(r"422\s+Invalid conversation body|Invalid conversation body", re.I),
+        "网页管线请求体被上游 422 拒绝（多为 thinking_effort 档位不被该模型/模式接受）",
+    ),
+    (
+        re.compile(r"webpipe\s*403|cloudflare|cf_chl|just a moment|sentinel|challenge_required", re.I),
+        "网页管线触发上游风控/人机校验或会话 403",
+    ),
     (re.compile(r"--deadline|deadline budget|overall deadline", re.I), "单任务总时间预算（--deadline）已耗尽，已安全中止"),
     (re.compile(r"timed out|read operation timed out|\btimeout\b", re.I), "等待中转站/上游响应超时"),
 ]
@@ -258,6 +270,28 @@ _RULES = [
         ),
         True,
         "连接中转站失败（网络中断、DNS 解析失败或沙盒未放行出站）。检查网络与 config.json 的 api_url 后重试一次。",
+    ),
+    (
+        "webpipe_invalid_request",
+        re.compile(
+            r"prepare\s*没返回\s*conduit_token|conduit_token|"
+            r"422\s+Invalid conversation body|Invalid conversation body|invalid\s+model\s+slug",
+            re.I,
+        ),
+        False,
+        "网页管线在会话准备或请求体校验阶段被上游拒绝（常见原因：model slug 不存在或与当前 chat/work 模式不匹配，"
+        "如把 chat 的 gpt-5-6-thinking 写成 gpt-5.6-sol-thinking；或传入了不支持的 thinking_effort，"
+        "如把 work 的 min 写成了 minimal）。运行 tiers --mode <chat|work> 核对实测清单后再试。",
+    ),
+    (
+        "webpipe_blocked",
+        re.compile(
+            r"webpipe\s*403|cloudflare|cf_chl|just a moment|sentinel|challenge_required",
+            re.I,
+        ),
+        False,
+        "网页管线触发了上游风控/人机校验或会话 403（非提示词或参数问题）。"
+        "不要连续重试；稍后再试、切 --model codex-gpt-image-2，或通知运维刷新号池 Cookie / 出口 IP。",
     ),
     (
         "bad_request",
