@@ -159,49 +159,51 @@ automatic fallback carries `degraded: true` + `degraded_reason`. So:
 pipeline". If it says `degraded`, say so and quote the reason: the image is real but it did not come
 from the path the user expected.
 
-### 5b-0. First web-pipeline image: two questions, then remember (2026-11-19)
+### 5b-0. First web-pipeline image: three questions, then remember (2026-11-19)
 
-`chat` and `work` do **not** share their tier list, so they must be asked separately.
+**One question at a time. Do not merge them.** Each answer determines what the next list contains.
 
-**Question 1** -- `image_gen.py tiers` prints just the modes:
+**Step 1** — `image_gen.py tiers`
 
 ```
 模式：  1)聊天   2)工作
 ```
 
-**Question 2** -- `image_gen.py tiers --mode <choice>` prints that surface's models and tiers:
+**Step 2** — `image_gen.py tiers --mode <their mode>`
 
 ```
 （聊天）模型：1) GPT-6  2) GPT-6.1 Sol  3) GPT-5.6 Sol
-（聊天）档位：1)即时  2)中  3)高                       ← chat has THREE tiers
-
 （工作）模型：1) GPT-6  2) GPT-6.1 Sol  3) GPT-5.6 Sol
+```
+
+**Step 3** — `image_gen.py tiers --mode <their mode> --efforts`
+
+```
+（聊天）档位：1)即时  2)中  3)高                      ← chat has THREE
 （工作）档位：1)轻度  2)中  3)高  4)极高              ← work has FOUR
 ```
 
-Then map `name` -> `value` with `tiers --mode <choice> --json` and persist:
+Then map the three names to real values with the matching `--json` call and persist:
 
 ```bash
 image_gen.py setup --agent-model gpt-6-thinking --effort high --web-mode chat
 ```
 
-Measured differences (from `webpipe.mjs`):
+Ask each step only after the previous answer; never print two lists in one message.
+
+Why this order (from `webpipe.mjs`):
 
 | | chat | work |
 | --- | --- | --- |
 | tiers | 3: 即时 / 中 / 高 (Instant / Medium / High) | 4: 轻度 / 中 / 高 / 极高 |
 | what changes | **each tier is its own preset slug** (`gpt-6-instant` vs `gpt-6-thinking`) | slug stays (`-wm` family), only `thinking_effort` changes |
-| effort values | mapped to `none` / `standard` / `extended` | `minimal` / `low` / `standard` / `extended` |
+| effort values | `none` / `standard` / `extended` | `minimal` / `low` / `standard` / `extended` |
 
-Note: `webpipe.mjs` carries a fifth work value (`max` -> `max`) that the web UI does **not** offer
-(it is accepted by the server but not exposed). The skill mirrors the UI, so `max` is not listed;
-advanced users can still pass `--effort max` by hand.
+`webpipe.mjs` also carries a fifth work value (`max` -> `max`) that the web UI does **not** offer; the
+skill mirrors the UI, so it is not listed (advanced users may pass `--effort max` by hand).
 
-Never merge the two lists into one question: picking "GPT-6 thinking" and then "工作" yields a slug
-that does not exist on that surface.
-
-After `setup`, every command inherits the three values; a CLI flag overrides for one run.
-**Never ask again.** If the user says "你随便": 聊天 + GPT-6 + 高, and say which three you used.
+After `setup`, every command inherits the three values; a CLI flag overrides for one run. **Never ask
+again.** If the user says "你随便": 聊天 + GPT-6 + 高, and say which three you used.
 
 ### 5b. Web-pipeline controls: surface, effort, agent model (2026-11-19)
 

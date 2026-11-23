@@ -157,18 +157,24 @@ def check_tiers() -> None:
     record("tiers 第一步只列模式", ok, out[-200:] if not ok else "")
 
     code, out = run(["tiers", "--mode", "chat"])
-    ok = code == 0 and out.count(")") >= 6 and "极高" not in out.split("档位")[-1]
+    ok = code == 0 and "模型" in out and "档位" not in out
+    record("第2步只列模型（不混档位）", ok, out[-200:] if not ok else "")
+
+    code, out = run(["tiers", "--mode", "chat", "--efforts"])
+    ok = code == 0 and "档位" in out and "即时" in out and "极高" not in out
     record("chat 档位 = 即时/中/高（3 档）", ok, out[-200:] if not ok else "")
 
-    code, out = run(["tiers", "--mode", "work"])
-    tier_line = out.split("档位")[-1] if "档位" in out else ""
-    ok = code == 0 and "轻度" in tier_line and "极高" in tier_line and "max" not in tier_line
-    record("work 档位 = 轻度/中/高/极高（4 档，无 max）", ok, tier_line[-200:] if not ok else "")
+    code, out = run(["tiers", "--mode", "work", "--efforts"])
+    ok = code == 0 and "轻度" in out and "极高" in out and "max" not in out
+    record("work 档位 = 轻度/中/高/极高（4 档，无 max）", ok, out[-200:] if not ok else "")
+
+    code, out = run(["tiers", "--efforts"])
+    record("--efforts 缺 --mode 应报错", code != 0, f"退出码 {code}")
 
     code, out = run(["tiers", "--mode", "chat", "--json"])
     try:
         data = json.loads(out[out.index("{"):out.rindex("}") + 1])
-        ok = code == 0 and len(data["models"]) == 3 and len(data["efforts"]) == 3
+        ok = code == 0 and len(data["models"]) == 3 and "efforts" not in data
     except Exception:
         ok = False
     record("tiers --json 结构正确", ok, out[-200:] if not ok else "")
