@@ -337,7 +337,8 @@ def check_tiers() -> None:
     code, out, _ = run(["tiers", "--mode", "chat", "--json"])
     try:
         data = json.loads(out[out.index("{") : out.rindex("}") + 1])
-        ok = code == 0 and len(data["models"]) == 3 and len(data["efforts"]) == 3
+        ok = (code == 0 and len(data["models"]) >= 3 and len(data["efforts"]) == 3
+              and all(m.get("value") for m in data["models"]))
     except Exception:
         ok = False
     record("tiers --json 结构正确", ok, out[-200:] if not ok else "")

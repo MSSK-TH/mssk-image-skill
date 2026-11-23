@@ -173,11 +173,36 @@ TRANSPARENT_PROMPT_LINE = (
 # work surface：4 档 UI 滑杆（轻度/中/高/极高），slug 带 -wm 后缀，只变 thinking_effort。
 # CLI 查不到账号真实模型清单（/web/models 是顶层路由，网关只转发 /v1/*），以下为常见参考值。
 
-WEB_MODELS = [
-    {"name": "GPT-6", "chat_slug": "gpt-6-thinking", "work_slug": "gpt-6-astra-wm"},
-    {"name": "GPT-6.1 Sol", "chat_slug": "gpt-6.1-sol-thinking", "work_slug": "gpt-6.1-sol-wm"},
-    {"name": "GPT-5.6 Sol", "chat_slug": "gpt-5.6-sol-thinking", "work_slug": "gpt-5.6-sol-wm"},
+# ⚠️ 模型清单的来源与限制（2026-11-23 实测）
+#   shim 源码明确写着「不同账号/不同时间可选的 slug 不一样」，所以客户端拿不到权威列表：
+#   · 真实列表在 shim 的 /web/models，但那是顶层路由，经网关查不到；
+#   · 直连 shim 时，若号池里残留空 Cookie 会返回 401。
+#   下面这份「模型家族」来自网关渠道配置里 owner 手填的可用集（含 6.1 / 6.2），
+#   是当前最可靠的参考。slug 按 mode 规则拼：
+#       chat  → <base>-thinking（思考档）／<base>-instant（即时档）
+#       work  → <base>-wm
+#   选错了会返回 bad_request，换一个即可；完全不确定就传 --agent-model auto。
+WEB_MODEL_BASES = [
+    ("GPT-5.5", "gpt-5.5"),
+    ("GPT-5.6 Sol", "gpt-5.6-sol"),
+    ("GPT-5.6 Terra", "gpt-5.6-terra"),
+    ("GPT-5.6 Luna", "gpt-5.6-luna"),
+    ("GPT-6 Astra", "gpt-6-astra"),
+    ("GPT-6 Sol", "gpt-6-sol"),
+    ("GPT-6 Luna", "gpt-6-luna"),
+    ("GPT-6.1 Sol", "gpt-6.1-sol"),
+    ("GPT-6.1 Terra", "gpt-6.1-terra"),
+    ("GPT-6.2 Astra", "gpt-6.2-astra"),
+    ("GPT-6.2 Sol", "gpt-6.2-sol"),
 ]
+
+
+def _models_for(mode: str) -> list:
+    """按 surface 拼出该模式下的模型 slug。"""
+    suffix = "-thinking" if mode == "chat" else "-wm"
+    return [{"name": name, "value": base + suffix} for name, base in WEB_MODEL_BASES]
+
+
 WEB_CHAT_TIERS = [
     {"name": "即时", "effort": "none"},
     {"name": "中", "effort": "standard"},
@@ -536,9 +561,9 @@ def _cmd_tiers(args: argparse.Namespace) -> int:
         print("  " + "   ".join("%d)%s" % (i, m["name"]) for i, m in enumerate(WEB_MODE_CHOICES, 1)))
         return 0
 
-    slug_key = "chat_slug" if mode == "chat" else "work_slug"
+    model_list = _models_for(mode)
     tiers = _tiers_for(mode)
-    models = [{"name": m["name"], "value": m[slug_key]} for m in WEB_MODELS]
+    models = model_list
     label = "聊天" if mode == "chat" else "工作"
 
     if getattr(args, "json", False):
