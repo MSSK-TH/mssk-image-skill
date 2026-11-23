@@ -944,7 +944,7 @@ def _result_extra(item: Dict[str, Any]) -> Dict[str, Any]:
 _LAST_PIPELINE = {}
 
 
-def _report_pipeline(payload, model):
+def _report_pipeline(payload, model, web_mode=None, effort=None, agent_model=None):
     """把「这次到底走的是网页管线还是原生」讲清楚（2026-11-19）。
 
     shim 的响应约定：
@@ -962,13 +962,37 @@ def _report_pipeline(payload, model):
         via, note = "degraded", "网页管线失败 → 自动降级到原生（原因：%s）" % (reason or "未给")
     else:
         via, note = "web", "网页管线（Cookie 会话）"
+    # 【2026-11-19】surface / effort 只对网页管线有意义；原生端点没有这两个概念。
+    #   没显式传 --web-mode 时，实际生效的是 shim 的默认值 chat —— 这里如实标「默认」，
+    #   不要写成"你选了 chat"，因为调用方并没有选。
+    surface = None
+    effort_shown = None
+    if via == "web":
+        surface = str(web_mode or "chat")
+        surface_note = "默认" if not web_mode else "指定"
+        effort_shown = str(effort) if effort else "默认（即时档）"
     _LAST_PIPELINE.clear()
-    _LAST_PIPELINE.update({"pipeline": via, "note": note, "degraded_reason": reason or None})
+    _LAST_PIPELINE.update({
+        "pipeline": via,
+        "note": note,
+        "degraded_reason": reason or None,
+        "surface": surface,
+        "surface_source": ("default" if (via == "web" and not web_mode) else ("flag" if via == "web" else None)),
+        "effort": (str(effort) if (via == "web" and effort) else None),
+        "agent_model": (str(agent_model) if (via == "web" and agent_model) else None),
+    })
+    detail = ""
+    if via == "web":
+        detail = " · surface=%s（%s） · effort=%s" % (surface, surface_note, effort_shown)
+        if agent_model:
+            detail += " · agent_model=%s" % agent_model
+    elif via == "degraded":
+        detail = " · surface/effort 已失效（没走网页管线）"
     # 与 web 端一致：降级要像「备用通道」标签那样醒目，不能混在普通输出里
     if degraded:
-        _warn(f"本次图片来自备用通道（{note}）—— 不是网页管线出的图")
+        _warn(f"本次图片来自备用通道（{note}）—— 不是网页管线出的图{detail}")
     else:
-        _info(f"[pipeline] {note}")
+        _info(f"[pipeline] {note}{detail}")
     return dict(_LAST_PIPELINE)
 
 def _parse_images(payload: Dict[str, Any], *, creds: RelayCredentials, timeout: float) -> List[ImageResult]:
@@ -2105,7 +2129,13 @@ def _generate(args: argparse.Namespace) -> None:
                 f"[generation] upstream refused (attempt {attempt}/{refusal_attempts}); "
                 "retrying with a neutral variation (the gate is stochastic)"
             )
-    _report_pipeline(decoded, getattr(args, "model", ""))
+    _report_pipeline(
+        decoded,
+        getattr(args, "model", ""),
+        getattr(args, "web_mode", None),
+        getattr(args, "effort", None),
+        getattr(args, "agent_model", None),
+    )
     results = _parse_images(decoded, creds=creds, timeout=args.timeout)
     local_started = time.time()
     artifacts = _write_results(
@@ -2298,7 +2328,13 @@ def _edit(args: argparse.Namespace) -> None:
             )
 
     _info(f"[edit] contract used: {contract}")
-    _report_pipeline(decoded, getattr(args, "model", ""))
+    _report_pipeline(
+        decoded,
+        getattr(args, "model", ""),
+        getattr(args, "web_mode", None),
+        getattr(args, "effort", None),
+        getattr(args, "agent_model", None),
+    )
     results = _parse_images(decoded, creds=creds, timeout=args.timeout)
     local_started = time.time()
     artifacts = _write_results(
@@ -2730,7 +2766,13 @@ def _run_generate_batch(args: argparse.Namespace) -> int:
                 label=job_label,
                 deadline=time.monotonic() + args.deadline,
             )
-            _report_pipeline(decoded, getattr(args, "model", ""))
+            _report_pipeline(
+        decoded,
+        getattr(args, "model", ""),
+        getattr(args, "web_mode", None),
+        getattr(args, "effort", None),
+        getattr(args, "agent_model", None),
+    )
             results = _parse_images(decoded, creds=creds, timeout=args.timeout)
             local_started = time.time()
             artifacts = _write_results(

@@ -131,13 +131,19 @@ took **221 s** instead of the usual 25-30 s. That is the shim's design, not a fa
 
 ### 5a-2. How to tell which pipeline actually served the image (2026-11-19)
 
-Every run now prints one line:
+Every run now prints one line, **including the surface and effort actually in effect**:
 
 ```
-[pipeline] 网页管线（Cookie 会话）                                    ← 正常，走网页管线
-[pipeline] 网页管线失败 → 自动降级到原生（原因：webpipe 403 Unusual activity）   ← 降级了
-[pipeline] 按 --model 指定，走原生端点（不经网页管线）                  ← 你显式要的原生
+[pipeline] 网页管线（Cookie 会话） · surface=chat（默认） · effort=默认（即时档）
+[pipeline] 网页管线（Cookie 会话） · surface=work（指定） · effort=extended · agent_model=gpt-6-thinking
+Warning: 本次图片来自备用通道（…降级…） · surface/effort 已失效（没走网页管线）
+[pipeline] 按 --model 指定，走原生端点（不经网页管线）
 ```
+
+Note the wording **「默认」vs「指定」**: when `--web-mode` is absent the shim uses its own default
+(`chat`); the CLI has not chosen anything, so it says `默认`, never "you selected chat". Same for
+`effort`. When the run degrades, surface/effort are meaningless -- the line says so instead of
+printing a surface that was never applied.
 
 The same info lands in `--report-json` as `pipeline` (`web` / `degraded` / `native`) plus
 `pipeline_note`.
