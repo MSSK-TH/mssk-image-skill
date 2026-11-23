@@ -29,3 +29,6 @@ imagegen-relay/config.json
 __pycache__/
 *.pyc
 *.pyo
+
+# 会话钥匙（按项目生成，属于本地运行态）
+.imagegen/
