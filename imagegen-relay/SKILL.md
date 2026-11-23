@@ -38,13 +38,12 @@ Before the first web-pipeline image, check status via `setup --show --json` (**n
 2. **Step 2 — 模型 + 档位** (`tiers --mode <chat|work>`): ask model and tier **together in one message**:
    - 聊天（`chat`，3 档）：**只有 2 个模型**（网页版下拉框实测）—— `1) GPT-6   2) GPT-5.6 Sol` /
      `档位：1)即时(none)  2)中(standard)  3)高(extended)`
-   - 工作（`work`，4 档）：**7 个模型**（`-wm` 后缀那批）—— 6 Astra / 6 Sol / 6 Luna / 6.1 Sol /
-     5.6 Sol / 5.6 Terra / 5.6 Luna /
+   - 工作（`work`，4 档）：**11 个模型**（`-wm` 后缀那批，覆盖 5.5 / 5.6 / 6 / 6.1 / 6.2 全系）——
      `档位：1)轻度(minimal)  2)中(low)  3)高(standard)  4)极高(extended)`（无即时档；
      `work + --effort none` 会被拒；CLI 高级用法另放行未在网页 UI 展示的第 5 档 `--effort max`）
    - **两种 surface 的模型范围本来就不同，不要套用同一份**：chat 走 `versions[].display_text` + presets
-     （网页版只给 2 个），work 走 `models[]` 里带 `-wm` 后缀那批。work 的 7 个是从 shim 注释推的，
-     还没对着网页版下拉框逐个核对。
+     （网页版只给 2 个），work 走 `models[]` 里带 `-wm` 后缀那批（网页版给全部 11 个）。
+     shim 注释里只写了 7 个，那是注释不全，**以网页版下拉框为准**。
    - 真值在 shim 的 `/web/models`（顶层路由，经网关查不到）。选错会返回 `bad_request`，换一个；
      完全不确定就传 `--agent-model auto`。
 3. Map names via `tiers --mode <choice> --json` and save once: `setup --web-mode <m> --agent-model <slug> --effort <e>`. If user says "你随便": use `聊天 + GPT-6 + 高` (`chat` / `gpt-6-thinking` / `extended`) and state what you picked. After `setup`, **never ask again**; CLI flags override per run (`--agent-model auto` overrides back to auto).
