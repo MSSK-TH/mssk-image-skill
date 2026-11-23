@@ -112,13 +112,17 @@ def humanize_moderation_text(message: str = "") -> str:
     if "判定阶段" not in text and "类别" not in text:
         return text
     stage_m = re.search(r"判定阶段[=:：]\s*([A-Za-z_-]+)", text)
-    cats_m = re.search(r"类别[=:：]\s*([A-Za-z0-9_/-，,\s]+?)(?:，|,|请求|$)", text)
+    cats_m = re.search(r"类别[=:：]\s*([A-Za-z0-9_/-，,\s]+?)(?:，|,|；|;|\[|请求|$)", text)
     rid_m = re.search(r"请求\s*ID[=:：]\s*([0-9a-fA-F-]{8,})", text)
-    return humanize_moderation(
+    deg_m = re.search(r"\[网页管线先降级[：:]([^\]]+)\]", text)
+    out = humanize_moderation(
         stage=stage_m.group(1) if stage_m else "",
         categories=cats_m.group(1) if cats_m else "",
         request_id=rid_m.group(1) if rid_m else "",
     )
+    if deg_m:
+        out += f" · 网页管线先降级：{deg_m.group(1).strip()}"
+    return out
 
 
 _TRANSLATE_RULES = [

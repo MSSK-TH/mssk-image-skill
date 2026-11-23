@@ -574,14 +574,15 @@ def check_errors() -> None:
 
     # sexual/minors 正确翻译 + 人话后 _is_refusal_error 仍能触发（stage=output=True, stage=input=False）
     exc_out = image_gen._relay_error_from_http(
-        400, '{"error":{"message":"内容安全系统拒绝（原生端点）：判定阶段=output，类别=sexual/minors"}}'.encode("utf-8")
+        400, '{"error":{"message":"内容安全系统拒绝（原生端点）：判定阶段=output，类别=sexual/minors；[网页管线先降级：违反内容政策]"}}'.encode("utf-8")
     )
     exc_in = image_gen._relay_error_from_http(
         400, '{"error":{"message":"内容安全系统拒绝（原生端点）：判定阶段=input，类别=sexual"}}'.encode("utf-8")
     )
     record(
-        "sexual/minors 完整映射 + 人话拒绝可被 --retry-refusal 识别",
+        "sexual/minors 完整映射 + 保留网页先降级线索 + --retry-refusal 识别",
         "未成年人性化" in str(exc_out)
+        and "网页管线先降级：违反内容政策" in str(exc_out)
         and image_gen._is_refusal_error(exc_out) is True
         and image_gen._is_refusal_error(exc_in) is False,
         str(exc_out),
