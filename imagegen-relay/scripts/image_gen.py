@@ -491,8 +491,10 @@ EFFORT_LABEL: Dict[str, str] = {
 # work 模式滑杆的官方五档（webpipe WORK_PRESETS），chat 模式用它那套动态值
 EFFORT_ORDER = [
     "none", "minimal", "low", "standard", "medium",
-    "high", "extended", "xhigh", "max", "ultra",
+    "high", "extended", "xhigh", "max",
 ]
+# 注：web 前端的 EFFORT_LABEL 里有个 "ultra"，但注释写明「ultra 不存在」（实测），
+#     所以这里不作为合法取值；传了会被 argparse 拒绝。
 WORK_EFFORTS = ("minimal", "low", "standard", "extended", "max")
 
 
@@ -3281,10 +3283,12 @@ def main() -> int:
     args = parser.parse_args()
 
     # 【2026-11-19】命令行没给 → 用 config.json 里记住的选择（首次提问后存下的）
-    _defaults = _config_defaults()
-    for _attr in ("agent_model", "effort", "web_mode"):
-        if getattr(args, _attr, None) in (None, "") and _defaults.get(_attr):
-            setattr(args, _attr, _defaults[_attr])
+    # ⚠️ setup 例外：它就是用来「改配置」的，不能被旧值盖住（否则清除模型永远清不掉）。
+    if getattr(args, "command", "") != "setup":
+        _defaults = _config_defaults()
+        for _attr in ("agent_model", "effort", "web_mode"):
+            if getattr(args, _attr, None) in (None, "") and _defaults.get(_attr):
+                setattr(args, _attr, _defaults[_attr])
 
     _apply_preset(args)
 
