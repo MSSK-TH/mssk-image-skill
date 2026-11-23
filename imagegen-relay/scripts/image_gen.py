@@ -412,28 +412,42 @@ def _emit_failure(exc: "RelayError", args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------- 网页模型与档位
-# 【2026-11-19】给使用者看的只有名字，slug 由 CLI 自己换算。
-#   问一次：模型 + 档位 + 模式。选完写进 config.json（setup），之后不再问。
+# 【2026-11-19】按 webpipe.mjs 的真实结构分两套（不再混成一套）：
 #
-# 为什么 skill 查不到真实模型列表：shim 的 /web/models 是顶层路由，中转站只转发 /v1/*。
-# 下面是常见模型，不保证你的账号都有；报 bad_request 就换一个。
-WEB_MODEL_CHOICES = [
-    {"name": "GPT-6", "chat": "gpt-6-thinking", "work": "gpt-6-astra-wm"},
-    {"name": "GPT-6.1 Sol", "chat": "gpt-6.1-sol-thinking", "work": "gpt-6.1-sol-wm"},
-    {"name": "GPT-5.6 Sol", "chat": "gpt-5.6-sol-thinking", "work": "gpt-5.6-sol-wm"},
+#   chat 模式：模型有 3 个推理档 Instant / Medium / High，
+#             **每档是独立的 preset slug**（gpt-6-instant / gpt-6-thinking …）
+#   work 模式：模型是 slug 带 -wm 后缀那批，档位是固定 5 档滑杆
+#             （轻度 minimal / 中 low / 高 standard / 极高 extended / max max）
+#
+# 为什么 skill 查不到真实列表：shim 的 /web/models 是顶层路由，中转站只转发 /v1/*。
+# 下面是常见值，不保证你的账号都有；报 bad_request 就换一档（错误分类会提示）。
+WEB_MODELS = [
+    {"name": "GPT-6", "chat_slug": "gpt-6-thinking", "work_slug": "gpt-6-astra-wm"},
+    {"name": "GPT-6.1 Sol", "chat_slug": "gpt-6.1-sol-thinking", "work_slug": "gpt-6.1-sol-wm"},
+    {"name": "GPT-5.6 Sol", "chat_slug": "gpt-5.6-sol-thinking", "work_slug": "gpt-5.6-sol-wm"},
 ]
-# 人话档位 → 两种 surface 各自的真实值（上游两套词，见 webpipe WORK_PRESETS）
-WEB_EFFORT_CHOICES = [
-    {"name": "即时", "chat": "none", "work": None},
-    {"name": "轻度", "chat": "minimal", "work": "minimal"},
-    {"name": "中", "chat": "medium", "work": "standard"},
-    {"name": "高", "chat": "high", "work": "extended"},
-    {"name": "极高", "chat": "xhigh", "work": "max"},
+# chat：3 档（对齐网页版的 Instant / Medium / High）
+WEB_CHAT_TIERS = [
+    {"name": "即时", "effort": "none"},
+    {"name": "中", "effort": "standard"},
+    {"name": "高", "effort": "extended"},
+]
+# work：5 档滑杆（对齐 webpipe 的 WORK_PRESETS）
+WEB_WORK_TIERS = [
+    {"name": "轻度", "effort": "minimal"},
+    {"name": "中", "effort": "low"},
+    {"name": "高", "effort": "standard"},
+    {"name": "极高", "effort": "extended"},
+    {"name": "max", "effort": "max"},
 ]
 WEB_MODE_CHOICES = [
     {"name": "聊天", "value": "chat"},
     {"name": "工作", "value": "work"},
 ]
+
+
+def _tiers_for(mode: str):
+    return WEB_CHAT_TIERS if mode == "chat" else WEB_WORK_TIERS
 
 
 def _config_defaults() -> Dict[str, str]:
@@ -527,40 +541,38 @@ def _cmd_setup(args: argparse.Namespace) -> int:
 
 
 def _cmd_tiers(args: argparse.Namespace) -> int:
-    """两步提问：① 先选模式 ② 再列该模式下的模型与档位。
+    """两步提问：① 选模式 ② 列该模式下的模型与档位。
 
-    【2026-11-19】不能一次列完三组 —— 模式和模型/档位是**联动**的：
-      · work 模式根本没有 gpt-6-thinking（那边是 -wm 后缀那批）
-      · work 模式没有「即时」档（滑杆只有五档）
-    所以先问模式，再按模式列。避免用户选了 chat 的模型却要 work 模式。
+    chat 与 work 的档位数不同（3 vs 5），选项也不同，所以必须分开问。
     """
     mode = getattr(args, "mode", None)
 
-    # 第一步：没给 --mode → 只列模式
     if not mode:
         if getattr(args, "json", False):
             print(json.dumps({"modes": WEB_MODE_CHOICES}, ensure_ascii=False, indent=2))
             return 0
         print("模式：")
         print("  " + "   ".join("%d)%s" % (i, m["name"]) for i, m in enumerate(WEB_MODE_CHOICES, 1)))
-        print()
-        print("选完再列对应的模型和档位：image_gen.py tiers --mode chat|work")
         return 0
 
-    # 第二步：按模式列模型 + 档位
-    efforts = [{"name": e["name"], "value": e[mode]} for e in WEB_EFFORT_CHOICES if e.get(mode)]
-    models = [{"name": m["name"], "value": m[mode]} for m in WEB_MODEL_CHOICES if m.get(mode)]
+    tiers = _tiers_for(mode)
+    slug_key = "chat_slug" if mode == "chat" else "work_slug"
+    models = [{"name": m["name"], "value": m[slug_key]} for m in WEB_MODELS]
 
     if getattr(args, "json", False):
-        print(json.dumps({"mode": mode, "models": models, "efforts": efforts},
-                         ensure_ascii=False, indent=2))
+        print(json.dumps(
+            {"mode": mode, "models": models,
+             "efforts": [{"name": t["name"], "value": t["effort"]} for t in tiers]},
+            ensure_ascii=False, indent=2,
+        ))
         return 0
 
-    print("模型（%s 模式）：" % ("聊天" if mode == "chat" else "工作"))
+    label = "聊天" if mode == "chat" else "工作"
+    print("模型（%s）：" % label)
     for i, m in enumerate(models, 1):
         print("  %d) %s" % (i, m["name"]))
-    print("档位（%s 模式）：" % ("聊天" if mode == "chat" else "工作"))
-    print("  " + "   ".join("%d)%s" % (i, e["name"]) for i, e in enumerate(efforts, 1)))
+    print("档位（%s）：" % label)
+    print("  " + "   ".join("%d)%s" % (i, t["name"]) for i, t in enumerate(tiers, 1)))
     return 0
 
 

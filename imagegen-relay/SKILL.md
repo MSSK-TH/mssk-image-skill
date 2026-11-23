@@ -161,38 +161,43 @@ from the path the user expected.
 
 ### 5b-0. First web-pipeline image: two questions, then remember (2026-11-19)
 
-**Do not ask all three at once** -- surface changes the model list *and* the effort list, so asking
-them together makes the user pick a model that does not exist in the surface they then choose.
+`chat` and `work` do **not** share their tier list, so they must be asked separately.
 
-**Question 1** -- run `image_gen.py tiers`, read it out:
+**Question 1** -- `image_gen.py tiers` prints just the modes:
 
 ```
 模式：  1)聊天   2)工作
 ```
 
-**Question 2** -- run `image_gen.py tiers --mode <their choice>`, read that out:
+**Question 2** -- `image_gen.py tiers --mode <choice>` prints that surface's models and tiers:
 
 ```
 （聊天）模型：1) GPT-6  2) GPT-6.1 Sol  3) GPT-5.6 Sol
-（聊天）档位：1)即时  2)轻度  3)中  4)高  5)极高
+（聊天）档位：1)即时  2)中  3)高                       ← chat has THREE tiers
 
 （工作）模型：1) GPT-6  2) GPT-6.1 Sol  3) GPT-5.6 Sol
-（工作）档位：1)轻度  2)中  3)高  4)极高          ← 工作模式没有「即时」
+（工作）档位：1)轻度  2)中  3)高  4)极高  5)max         ← work has FIVE
 ```
 
-Then map `name` -> `value` with `image_gen.py tiers --mode <choice> --json` and persist:
+Then map `name` -> `value` with `tiers --mode <choice> --json` and persist:
 
 ```bash
 image_gen.py setup --agent-model gpt-6-thinking --effort high --web-mode chat
 ```
 
-Why two steps (measured): `gpt-6-thinking` only exists on the chat surface (work uses the `-wm`
-suffix family), and the work slider has five steps with no instant. A single combined question lets
-someone pick "GPT-6 thinking" and then "工作" -- a combination that cannot run.
+Measured differences (from `webpipe.mjs`):
 
-From then on every command inherits those three; a CLI flag overrides for one run. **Never ask again.**
+| | chat | work |
+| --- | --- | --- |
+| tiers | 3: 即时 / 中 / 高 (Instant / Medium / High) | 5: 轻度 / 中 / 高 / 极高 / max |
+| what changes | **each tier is its own preset slug** (`gpt-6-instant` vs `gpt-6-thinking`) | slug stays (`-wm` family), only `thinking_effort` changes |
+| effort values | mapped to `none` / `standard` / `extended` | `minimal` / `low` / `standard` / `extended` / `max` |
 
-If the user says "你随便": `聊天` → `GPT-6` → `高`, and tell them which three you used.
+Never merge the two lists into one question: picking "GPT-6 thinking" and then "工作" yields a slug
+that does not exist on that surface.
+
+After `setup`, every command inherits the three values; a CLI flag overrides for one run.
+**Never ask again.** If the user says "你随便": 聊天 + GPT-6 + 高, and say which three you used.
 
 ### 5b. Web-pipeline controls: surface, effort, agent model (2026-11-19)
 
