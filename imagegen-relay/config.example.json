@@ -1,4 +1,8 @@
 {
   "api_url": "https://relay.example.com:9443/v1",
-  "api_key": "sk-your-relay-token-here"
+  "api_key": "sk-your-relay-token-here",
+  "_comment_web": "下面三项可选：首次出图时由 agent 问过你之后，用 image_gen.py setup 写入",
+  "web_agent_model": "gpt-6-thinking",
+  "web_effort": "high",
+  "web_mode": "chat"
 }

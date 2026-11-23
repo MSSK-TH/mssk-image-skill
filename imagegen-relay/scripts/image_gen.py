@@ -411,6 +411,38 @@ def _emit_failure(exc: "RelayError", args: argparse.Namespace) -> None:
     raise SystemExit(1)
 
 
+# ---------------------------------------------------------------- 网页模型与档位
+# 【2026-11-19】按使用者要求：网页管线的「驱动模型」和「推理档」**不再静默默认**，
+#   而是首次使用时问使用者，选完写进 config.json，之后自动沿用。
+#
+# 为什么 skill 查不到真实模型列表：
+#   shim 的 /web/models 是**顶层路由**，中转站(new-api)只转发 /v1/*，所以经中转站取不到。
+#   下面是「常见 slug 参考」，不保证你的账号都有；报 bad_request 时换一个即可。
+# chat surface 常见 preset slug（thinking = 先思考再画，instant = 直接画）
+WEB_MODEL_HINTS = [
+    ("gpt-6-thinking", "GPT-6 思考档（chat）"),
+    ("gpt-6-instant", "GPT-6 即时档（chat）"),
+    ("gpt-5.6-sol-thinking", "GPT-5.6 Sol 思考档（chat）"),
+    ("gpt-5.6-sol", "GPT-5.6 Sol（chat）"),
+]
+# work surface 常见 -wm 后缀模型
+WEB_MODEL_HINTS_WORK = [
+    ("gpt-6-astra-wm", "GPT-6 Astra（work）"),
+    ("gpt-6.1-sol-wm", "GPT-6.1 Sol（work）"),
+    ("gpt-5.6-sol-wm", "GPT-5.6 Sol（work）"),
+]
+
+
+def _config_defaults() -> Dict[str, str]:
+    """从 config.json 读「上次选好的模型/档位/surface」，没有就返回空串。"""
+    cfg = _load_config_json()
+    return {
+        "agent_model": str(cfg.get("web_agent_model") or ""),
+        "effort": str(cfg.get("web_effort") or ""),
+        "web_mode": str(cfg.get("web_mode") or ""),
+    }
+
+
 # ---------------------------------------------------------------- 网页管线档位
 # 【2026-11-19】与 image-web/public/app.js 的 EFFORT_LABEL 保持一致：
 #   web 前端用 presetMap[模型][档位] -> {slug, effort}，这里用「档位 -> effort」一维表。
@@ -445,6 +477,52 @@ EFFORT_ORDER = [
 WORK_EFFORTS = ("minimal", "low", "standard", "extended", "max")
 
 
+def _cmd_setup(args: argparse.Namespace) -> int:
+    """把「驱动模型 / 推理档 / surface」写进 config.json，之后各命令自动沿用。
+
+    【2026-11-19】网页管线的模型与档位不再静默默认：由 agent 首次问使用者，
+    问完用本命令固化。已存在的键会保留（只覆盖这三项）。
+    """
+    path = _skill_root() / "config.json"
+    cfg: Dict[str, Any] = {}
+    if path.exists():
+        try:
+            cfg = json.loads(path.read_text(encoding="utf-8-sig"))
+        except Exception as exc:
+            _die(f"config.json 不是合法 JSON，先修好它：{path} ({exc})")
+    changed = []
+    if args.agent_model is not None:
+        if args.agent_model in ("", "auto"):
+            cfg.pop("web_agent_model", None)
+            changed.append("web_agent_model=<清除，回到 auto>")
+        else:
+            cfg["web_agent_model"] = args.agent_model
+            changed.append(f"web_agent_model={args.agent_model}")
+    if args.effort is not None:
+        if args.effort in ("", "none"):
+            cfg.pop("web_effort", None)
+            changed.append("web_effort=<清除，即时档>")
+        else:
+            cfg["web_effort"] = args.effort
+            changed.append(f"web_effort={args.effort}")
+    if args.web_mode is not None:
+        cfg["web_mode"] = args.web_mode
+        changed.append(f"web_mode={args.web_mode}")
+    if not changed:
+        _die("什么都没改：至少给一个 --agent-model / --effort / --web-mode")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except Exception:
+        pass
+    print(f"已写入 {path}")
+    for c in changed:
+        print("  ·", c)
+    print("之后各命令不传这三个参数时自动沿用；要临时覆盖就在命令行加。")
+    return 0
+
+
 def _cmd_tiers(args: argparse.Namespace) -> int:
     """打印网页管线可用的推理档（与 web 前端同一套名字）。"""
     mode = getattr(args, "mode", None) or "chat"
@@ -462,11 +540,24 @@ def _cmd_tiers(args: argparse.Namespace) -> int:
         print("  %-8s %s" % (t["effort"], t["label"]))
     print()
     print("用法：--effort extended")
-    print("说明：档位越高越慢、越容易被上游拒；不确定就用默认（不传）。")
+    print("说明：档位越高越慢、越容易被上游拒；不确定就不传（= 即时档）。")
     if mode == "chat":
         print("      工作模式（--web-mode work）只有 minimal/low/standard/extended/max 五档。")
     else:
         print("      工作模式的档位就是上游滑杆的五档，没有「即时」。")
+
+    hints = WEB_MODEL_HINTS_WORK if mode == "work" else WEB_MODEL_HINTS
+    print()
+    print("驱动模型（--agent-model）：这些是常见 slug，不保证你的账号都有")
+    print("-" * 46)
+    for slug, desc in hints:
+        print("  %-24s %s" % (slug, desc))
+    print("  %-24s %s" % ("（不传 = auto）", "由 shim 每次动态选，不透明，不推荐"))
+    print()
+    print("建议流程：问使用者要哪个模型 + 哪一档，然后固化下来不再问：")
+    print("  image_gen.py setup --agent-model %s --effort %s%s"
+          % (hints[0][0], "extended" if mode == "work" else "high",
+             " --web-mode work" if mode == "work" else ""))
     return 0
 
 
@@ -3084,6 +3175,14 @@ def main() -> int:
     tiers_parser.add_argument("--mode", choices=("chat", "work"), default="chat")
     tiers_parser.add_argument("--json", action="store_true")
     tiers_parser.set_defaults(func=_cmd_tiers)
+    # [relay] 把「驱动模型 / 推理档 / surface」固化进 config.json（首次提问后调用）
+    setup_parser = subparsers.add_parser(
+        "setup", help="记住网页管线的模型/档位/surface（写进 config.json）"
+    )
+    setup_parser.add_argument("--agent-model", default=None, help="上游 slug；传 auto 或空串表示清除")
+    setup_parser.add_argument("--effort", choices=tuple(EFFORT_ORDER), default=None)
+    setup_parser.add_argument("--web-mode", choices=("chat", "work"), default=None)
+    setup_parser.set_defaults(func=_cmd_setup)
 
     # [relay] the official skill's *primary* path, wired to this relay:
     # reference-image generation through Responses + the hosted image_generation tool.
@@ -3118,13 +3217,19 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    # 【2026-11-19】命令行没给 → 用 config.json 里记住的选择（首次提问后存下的）
+    _defaults = _config_defaults()
+    for _attr in ("agent_model", "effort", "web_mode"):
+        if getattr(args, _attr, None) in (None, "") and _defaults.get(_attr):
+            setattr(args, _attr, _defaults[_attr])
+
     _apply_preset(args)
 
     global _EXACT_SIZE_REQUEST, _EXACT_FIT_REQUEST
     _EXACT_SIZE_REQUEST = getattr(args, "exact_size", None)
     _EXACT_FIT_REQUEST = getattr(args, "exact_fit", "cover")
 
-    if args.command in ("models", "tiers"):
+    if args.command in ("models", "tiers", "setup"):
         args.func(args)
         return 0
 
