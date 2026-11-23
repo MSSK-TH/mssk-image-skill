@@ -1409,7 +1409,9 @@ def _read_prompt(prompt: Optional[str], prompt_file: Optional[str]) -> str:
         path = Path(prompt_file)
         if not path.exists():
             _die(f"Prompt file not found: {path}")
-        return path.read_text(encoding="utf-8").strip()
+        # 【2026-11-23】用 utf-8-sig 读：Windows 记事本保存的 UTF-8 带 BOM（EF BB BF），
+        # 普通 utf-8 解码会在提示词开头留下 \ufeff，strip() 去不掉，会污染发给上游的文本。
+        return path.read_text(encoding="utf-8-sig").strip()
     if prompt:
         return prompt.strip()
     _die("Missing prompt. Use --prompt or --prompt-file.")

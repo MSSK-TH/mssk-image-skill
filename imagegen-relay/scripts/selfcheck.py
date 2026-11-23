@@ -80,6 +80,12 @@ def check_dry_run() -> None:
             ok = "endpoint" in out or "wire_payload" in out or "jobs" in out
             record(f"dry-run: {name}", ok, "" if ok else out[-300:])
 
+        # prompt-file 带 BOM 时不能把 \ufeff 漏进提示词
+        bom = Path(td) / "bom.txt"
+        bom.write_bytes(b"\xef\xbb\xbf" + "画一只猫".encode("utf-8"))
+        code, out = run(["generate", "--prompt-file", str(bom), "--dry-run"])
+        record("prompt-file 能去掉 BOM", "\\ufeff" not in out and code == 0, out[-200:])
+
 
 # ─────────────────────────────────────────── 2. style 注入矩阵
 def check_style_matrix() -> None:

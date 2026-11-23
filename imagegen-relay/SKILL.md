@@ -458,6 +458,36 @@ matters, say it twice and check `data.length` before reporting.
 - Any task where the user clearly wants deterministic code-native output instead of a generated
   bitmap
 
+## Operating discipline (learned the hard way)
+
+Four rules that prevent most wasted renders. They are cheap to follow and expensive to skip.
+
+**1. New topic -> `--new-conv`; parallel tasks in one folder -> their own `--conv-key`.**
+Conversation continuity is per project directory (see 5c), so a *new* subject in the same folder would
+silently continue the previous upstream conversation and inherit its style. Start a fresh one with
+`--new-conv`. When several independent jobs run in the same folder, give each `--conv-key <task>` so
+they do not overwrite each other.
+
+**2. Multi-line prompts on Windows: use `--prompt-file` with a UTF-8 file.**
+Passing long or multi-line text through PowerShell quoting mangles newlines and quotes. Write the
+brief to a file and point `--prompt-file` at it -- the CLI reads it as `utf-8-sig`, so a BOM from
+Notepad is stripped automatically (before 2026-11-23 a BOM leaked into the prompt as `\ufeff`).
+`--prompt` and `--prompt-file` are mutually exclusive.
+
+**3. If the subject drifts completely off-brief, start a new conversation instead of editing.**
+Continuing an existing thread anchors the model to the wrong subject -- each further edit inherits the
+drift. `--new-conv` (or a different `--conv-key`) is the fix; do not keep polishing an unrelated image.
+
+**4. While waiting, watch the heartbeat, then check the channel line and the file.**
+A `[waiting] …s elapsed` heartbeat every 20 s means the render is alive; silence with no heartbeat means
+the process died. When it finishes, three things must line up before you report success:
+
+- a `[pipeline]` line (which route actually served it -- see 5a-2),
+- a `Wrote <path>` line,
+- the file existing at the `--out` you asked for.
+
+If `Wrote` is missing, nothing was written -- do not tell the user "done".
+
 ## Decision tree
 
 Two separate questions:
