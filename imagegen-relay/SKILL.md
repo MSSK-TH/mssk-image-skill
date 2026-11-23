@@ -36,17 +36,18 @@ Before the first web-pipeline image, check status via `setup --show --json` (**n
 
 1. **Step 1 — 模式** (`tiers`): ask `模式：1)聊天  2)工作` (must come first because the tier list depends on surface).
 2. **Step 2 — 模型 + 档位** (`tiers --mode <chat|work>`): ask model and tier **together in one message**:
-   - 聊天（`chat`，3 档）：11 个模型（**含 5.5 / 6.1 / 6.2 系列**）/
+   - 聊天（`chat`，3 档）：**只有 2 个模型**（网页版下拉框实测）—— `1) GPT-6   2) GPT-5.6 Sol` /
      `档位：1)即时(none)  2)中(standard)  3)高(extended)`
-   - 工作（`work`，4 档，对齐网页 UI）：**只有 7 个模型**（`-wm` 后缀那批：6 Astra/Sol/Luna、6.1 Sol、
-     5.6 Sol/Terra/Luna；**没有 6.2、没有 6.1-terra、没有 5.5**）/
+   - 工作（`work`，4 档）：**7 个模型**（`-wm` 后缀那批）—— 6 Astra / 6 Sol / 6 Luna / 6.1 Sol /
+     5.6 Sol / 5.6 Terra / 5.6 Luna /
      `档位：1)轻度(minimal)  2)中(low)  3)高(standard)  4)极高(extended)`（无即时档；
      `work + --effort none` 会被拒；CLI 高级用法另放行未在网页 UI 展示的第 5 档 `--effort max`）
-   - **两种 surface 的模型范围本来就不同**：chat 用上游 `versions[].display_text` + presets，
-     work 用 `models[]` 里带 `-wm` 后缀的那批。不要把一份清单套到两边。
-   - **两份清单都只是参考**：shim 源码明确写着「不同账号/不同时间可选 slug 不一样」，真实列表在 shim 的
-     `/web/models`（顶层路由，经网关查不到）。选错会返回 `bad_request`，换一个；完全不确定就传 `--agent-model auto`。
-3. Map names via `tiers --mode <choice> --json` and save once: `setup --web-mode <m> --agent-model <slug> --effort <e>`. If user says "你随便": use `聊天 + GPT-6 Astra + 高` (`chat` / `gpt-6-astra-thinking` / `extended`) and state what you picked. After `setup`, **never ask again**; CLI flags override per run (`--agent-model auto` overrides back to auto).
+   - **两种 surface 的模型范围本来就不同，不要套用同一份**：chat 走 `versions[].display_text` + presets
+     （网页版只给 2 个），work 走 `models[]` 里带 `-wm` 后缀那批。work 的 7 个是从 shim 注释推的，
+     还没对着网页版下拉框逐个核对。
+   - 真值在 shim 的 `/web/models`（顶层路由，经网关查不到）。选错会返回 `bad_request`，换一个；
+     完全不确定就传 `--agent-model auto`。
+3. Map names via `tiers --mode <choice> --json` and save once: `setup --web-mode <m> --agent-model <slug> --effort <e>`. If user says "你随便": use `聊天 + GPT-6 + 高` (`chat` / `gpt-6-thinking` / `extended`) and state what you picked. After `setup`, **never ask again**; CLI flags override per run (`--agent-model auto` overrides back to auto).
 
 ### Operating discipline (4 rules that prevent wasted renders)
 

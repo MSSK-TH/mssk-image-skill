@@ -173,30 +173,23 @@ TRANSPARENT_PROMPT_LINE = (
 # work surface：4 档 UI 滑杆（轻度/中/高/极高），slug 带 -wm 后缀，只变 thinking_effort。
 # CLI 查不到账号真实模型清单（/web/models 是顶层路由，网关只转发 /v1/*），以下为常见参考值。
 
-# ⚠️ chat 与 work 的模型**范围不同**，必须两份独立清单（不要再拿一份 base 拼后缀）。
+# ⚠️ chat 与 work 的模型范围不同，两份独立清单。
 #
-# 来源与限制（2026-11-23 实测）：
-#   · chat：模型来自上游 versions[].display_text + intelligence_presets[]，
-#           本清单取自网关渠道里 owner 手填的可用集（含 5.5 / 6.1 / 6.2 系列）。
-#   · work：模型是上游 models[] 里 slug 带 `-wm` 后缀的那批，
-#           按 shim 源码注释只有 7 个（6 Astra/Sol/Luna、6.1 Sol、5.6 Sol/Terra/Luna），**没有 6.2**。
-#   · 真实完整列表在 shim 的 /web/models，但那是顶层路由，经网关查不到；
-#     直连时若号池残留空 Cookie 会 401。所以两份都只是当前最可靠的参考。
-#   · 选错会返回 bad_request，换一个即可；完全不确定就传 --agent-model auto。
+# chat（2026-11-23 按网页版下拉框实测，只有两个）：
+#   - GPT-6
+#   - GPT-5.6 Sol
+#   slug 是 preset 级（-thinking / -instant），由模型 + 档位共同决定。
+#
+# work（来自 shim 源码注释：models[] 里 slug 带 `-wm` 后缀的那批）：
+#   GPT-6 Astra / GPT-6 Sol / GPT-6 Luna / GPT-6.1 Sol / GPT-5.6 Sol / Terra / Luna
+#   ⚠️ 这份是从代码注释推的，没能对着网页版下拉框逐个核对。
+#
+# 真值来源：shim 的 /web/models（顶层路由，经网关查不到；直连时若号池有空 Cookie 会 401）。
+# 选错会返回 bad_request，换一个；完全不确定就传 --agent-model auto。
 WEB_CHAT_MODELS = [
-    {"name": "GPT-5.5", "value": "gpt-5.5"},
-    {"name": "GPT-5.6 Sol", "value": "gpt-5.6-sol"},
-    {"name": "GPT-5.6 Terra", "value": "gpt-5.6-terra"},
-    {"name": "GPT-5.6 Luna", "value": "gpt-5.6-luna"},
-    {"name": "GPT-6 Astra", "value": "gpt-6-astra"},
-    {"name": "GPT-6 Sol", "value": "gpt-6-sol"},
-    {"name": "GPT-6 Luna", "value": "gpt-6-luna"},
-    {"name": "GPT-6.1 Sol", "value": "gpt-6.1-sol"},
-    {"name": "GPT-6.1 Terra", "value": "gpt-6.1-terra"},
-    {"name": "GPT-6.2 Astra", "value": "gpt-6.2-astra"},
-    {"name": "GPT-6.2 Sol", "value": "gpt-6.2-sol"},
+    {"name": "GPT-6", "value": "gpt-6-thinking"},
+    {"name": "GPT-5.6 Sol", "value": "gpt-5.6-sol-thinking"},
 ]
-# work 只有这 7 个（-wm 后缀），别把 6.2 / 6.1-terra / 5.5 塞进来
 WEB_WORK_MODELS = [
     {"name": "GPT-6 Astra", "value": "gpt-6-astra-wm"},
     {"name": "GPT-6 Sol", "value": "gpt-6-sol-wm"},
