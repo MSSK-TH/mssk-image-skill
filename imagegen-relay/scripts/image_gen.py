@@ -180,7 +180,7 @@ TRANSPARENT_PROMPT_LINE = (
 #   - GPT-5.6 Sol
 #   slug 是 preset 级（-thinking / -instant），由模型 + 档位共同决定。
 #
-# work（按用户确认的网页版下拉框：**全部模型都有**，即 chat 渠道配置那 11 个 + `-wm` 后缀）。
+# work（按网页版下拉框：**全部模型都有**，5.6 起至 6.2 共 10 个，各加 `-wm` 后缀；5.5 已下线）。
 #   ⚠️ shim 注释里只列了 7 个（缺 6.1 Terra / 6.2 / 5.5），那是注释不全，以网页版为准。
 #
 # 真值来源：shim 的 /web/models（顶层路由，经网关查不到；直连时若号池有空 Cookie 会 401）。
@@ -190,7 +190,6 @@ WEB_CHAT_MODELS = [
     {"name": "GPT-5.6 Sol", "value": "gpt-5.6-sol-thinking"},
 ]
 WEB_WORK_MODELS = [
-    {"name": "GPT-5.5", "value": "gpt-5.5-wm"},
     {"name": "GPT-5.6 Sol", "value": "gpt-5.6-sol-wm"},
     {"name": "GPT-5.6 Terra", "value": "gpt-5.6-terra-wm"},
     {"name": "GPT-5.6 Luna", "value": "gpt-5.6-luna-wm"},

@@ -38,11 +38,11 @@ Before the first web-pipeline image, check status via `setup --show --json` (**n
 2. **Step 2 — 模型 + 档位** (`tiers --mode <chat|work>`): ask model and tier **together in one message**:
    - 聊天（`chat`，3 档）：**只有 2 个模型**（网页版下拉框实测）—— `1) GPT-6   2) GPT-5.6 Sol` /
      `档位：1)即时(none)  2)中(standard)  3)高(extended)`
-   - 工作（`work`，4 档）：**11 个模型**（`-wm` 后缀那批，覆盖 5.5 / 5.6 / 6 / 6.1 / 6.2 全系）——
+   - 工作（`work`，4 档）：**10 个模型**（`-wm` 后缀那批，5.6 起至 6.2；5.5 已下线）——
      `档位：1)轻度(minimal)  2)中(low)  3)高(standard)  4)极高(extended)`（无即时档；
      `work + --effort none` 会被拒；CLI 高级用法另放行未在网页 UI 展示的第 5 档 `--effort max`）
    - **两种 surface 的模型范围本来就不同，不要套用同一份**：chat 走 `versions[].display_text` + presets
-     （网页版只给 2 个），work 走 `models[]` 里带 `-wm` 后缀那批（网页版给全部 11 个）。
+     （网页版只给 2 个），work 走 `models[]` 里带 `-wm` 后缀那批（网页版给全部 10 个，5.6～6.2）。
      shim 注释里只写了 7 个，那是注释不全，**以网页版下拉框为准**。
    - 真值在 shim 的 `/web/models`（顶层路由，经网关查不到）。选错会返回 `bad_request`，换一个；
      完全不确定就传 `--agent-model auto`。
