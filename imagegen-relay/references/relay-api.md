@@ -68,12 +68,12 @@ Four `codex exec` captures against a custom provider `base_url` confirmed that t
 
 Because `/web/models` on the execution layer is a top-level route and `new-api` only forwards `/v1/*`, the CLI cannot query the account's live web-model list; candidate slugs in `tiers` are calibrated from real upstream `/backend-api/models` captures. When the web pipeline fails and auto-falls back to native, `degraded_reason` exposes the exact cause (`prepare 没返回 conduit_token` → invalid/mismatched slug; `422 Invalid conversation body` → invalid `thinking_effort`; `webpipe 403` / Cloudflare / Sentinel → risk control) and is recorded as a standalone `"degraded_reason"` field in `--report-json`.
 
-## Edit Contracts: Codex JSON vs OpenAI Multipart
+## Edit Contracts: OpenAI Multipart vs Codex JSON
 
+- **OpenAI Images contract** (`new-api` & `image-web` default): `multipart/form-data` with repeated `image` file parts, optional `mask`, `background`, and top-level `web_conv_key` / `web_mode` / `web_model` / `web_effort` / `gif_speed` fields (all passed untouched through `new-api` with zero base64 inflation).
 - **Codex JSON contract** (`codex-rs/codex-api/src/endpoint/images.rs`): JSON body with `images: [{"image_url": "data:image/...;base64,..."}]` + `style.mssk_*`.
-- **OpenAI Images contract** (`new-api` default): `multipart/form-data` with repeated `image` file parts, optional `mask`, and top-level `web_*` / `gif_speed` fields.
 
-`edit` probes Codex JSON first and falls back on HTTP 400 `"image is required"` (cached in-process per `base_url`). To skip the probe on `new-api` permanently, set `"edit_contract": "openai-multipart"` in `config.json` (which also skips base64 encoding for `edit`).
+`edit` uses `openai-multipart` first by default (matching `image-web`, skipping base64 encoding, and preserving conversation continuity & model selection through `new-api`), falling back lazily to `codex-json` only if a gateway rejects multipart with HTTP 400/415. You can pin `"edit_contract": "openai-multipart"` or `"codex-json"` in `config.json`.
 
 ## Responses Route (`reference` subcommand)
 

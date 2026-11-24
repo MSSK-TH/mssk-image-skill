@@ -120,6 +120,41 @@ def check_dry_run() -> None:
             ok = code == 0 and ("endpoint" in out or "wire_payload" in out)
             record(f"dry-run: {name}", ok, "" if ok else (out + err)[-300:])
 
+        # 管线区分默认 augment：网页管线(gpt-image-2)默认原样直传，原生(codex-gpt-image-2)默认自动增广
+        code, out, _ = run(["generate", "--prompt", "画一只小狗", "--dry-run"], cwd=td, env_extra=env_ok)
+        record(
+            "网页管线默认原样直传（不加 Primary request 前缀）",
+            code == 0 and '"prompt": "画一只小狗"' in out and "Primary request:" not in out,
+            out[-260:],
+        )
+        code, out, _ = run(
+            ["generate", "--model", "codex-gpt-image-2", "--prompt", "画一只小狗", "--dry-run"],
+            cwd=td, env_extra=env_ok,
+        )
+        record(
+            "原生管线默认启用增广（含 Primary request）",
+            code == 0 and '"prompt": "Primary request: 画一只小狗"' in out,
+            out[-260:],
+        )
+        code, out, _ = run(
+            ["generate", "--prompt", "画一只小狗", "--augment", "--dry-run"],
+            cwd=td, env_extra=env_ok,
+        )
+        record(
+            "网页管线显式 --augment 仍可开启增广",
+            code == 0 and '"prompt": "Primary request: 画一只小狗"' in out,
+            out[-260:],
+        )
+        code, out, _ = run(
+            ["generate", "--model", "codex-gpt-image-2", "--prompt", "画一只小狗", "--no-augment", "--dry-run"],
+            cwd=td, env_extra=env_ok,
+        )
+        record(
+            "原生管线显式 --no-augment 仍可原样直传",
+            code == 0 and '"prompt": "画一只小狗"' in out and "Primary request:" not in out,
+            out[-260:],
+        )
+
         # edit & batch dry-run 必须如实反映 style / web_*
         code, out, _ = run(cases["edit --dry-run"], cwd=td, env_extra=env_ok)
         record(
@@ -683,7 +718,8 @@ def check_outputs_and_timeouts() -> None:
 
     with tempfile.TemporaryDirectory() as td:
         target = Path(td) / "anim.png"
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        out_buf = io.StringIO()
+        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(io.StringIO()):
             arts = image_gen._write_results(
                 [image_gen.ImageResult(raw=gif_bytes, actual_size="320x240", revised_prompt=None, source="b64_json", mime="image/gif", sprite=png_bytes)],
                 [target],
@@ -693,6 +729,13 @@ def check_outputs_and_timeouts() -> None:
                 downscale_max_dim=None,
                 downscale_suffix="-web",
             )
+        wrote_stdout = out_buf.getvalue()
+        expected_abs = str((Path(td) / "anim.gif").resolve())
+        record(
+            "Wrote 行直接打印绝对路径、尺寸与大小",
+            f"Wrote {expected_abs} (320x240, " in wrote_stdout and "KB)" in wrote_stdout,
+            wrote_stdout.strip(),
+        )
         rec = image_gen._report_record(
             command="generate", model="gpt-image-2", prompt="p",
             artifacts=arts, timing={"total": 1.0}, base_url="https://x",

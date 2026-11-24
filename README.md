@@ -7,7 +7,7 @@
 > 只有用 `--max-dim` / `--exact-size` / `--output-format` 这几个参数时才需要 Pillow
 > （装了 `uv` 的话 launcher 会自动带上，不用手动装）。
 
-当前版本 **v1.5.3**（2026-11-23）。
+当前版本 **v1.6.0**（2026-11-24）。
 
 ---
 
@@ -222,6 +222,13 @@ setup 持久化与清除、`[pipeline]` 上报、11 类错误码、参数校验�
 ---
 
 ## 变更记录
+
+**v1.6.0（2026-11-24）**
+
+- **双管线职责明确分离**：网页管线（`gpt-image-2`，默认）定位为纯直通发射器，CLI 默认 `--no-augment` 原样直发用户提示词（由远端 ChatGPT 网页大脑负责理解与构思）；原生管线（`codex-gpt-image-2`）保持自动 `--augment` 结构化，互不干扰
+- **极速减轮优化**：`SKILL.md` 精简并内联 `chat`/`work` 速查表（免去生图前调 `tiers`、免去无故 `--dry-run` / 默认 `view_image`）；合并写提示词与启动为单条命令；拉高 `yield_time_ms: 120000`；`image_gen.py` 写盘后直接输出 `Wrote <绝对路径> (<宽>x<高>, <大小>KB)` 免去额外验图 shell；`run.ps1` 惰性探测 Pillow
+- **对齐网页端会话续接与原地改图**（配合服务端 `shim/server.mjs` 修复）：`edit` 默认优先走 `openai-multipart`（透传 `web_conv_key / web_mode / web_model / web_effort / background` 且免去 base64 编码，遇不支持 multipart 时延迟回退 `codex-json`）；同一 Codex 对话默认对应同一网页对话，修改刚生成的图直接走 `generate` 原地追问（不重传原图 `--image`）
+- 自检 72 项 → **77 项**
 
 **v1.5.3（2026-11-23）**
 

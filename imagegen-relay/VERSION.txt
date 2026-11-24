@@ -1,9 +1,26 @@
 imagegen-relay  —— 版本戳
 ==================================================
-version : 1.5.3
-date    : 2026-11-23（彻底封堵 high/medium/low/minimal 别名 422 + 模型与档位拆分为独立单选，v1.5.3）
+version : 1.6.0
+date    : 2026-11-24（网页管线直通极速模式 + 1:1 网页对话续接与原地改图 + edit 优先 multipart，v1.6.0）
 baseline: 官方 imagegen（.system/imagegen）；以下 6 个文件内容完全一致（文本文件仅行尾符 LF/CRLF 差异）：
           prompting.md / sample-prompts.md / remove_chroma_key.py / LICENSE.txt / 两个图标
+
+v1.6.0 网页直通极速模式与同对话改图对齐（2026-11-24）
+------------------------------
+  · 明确双管线职责边界（网页直通 vs 原生结构化）：
+      - 网页管线（`gpt-image-2`，默认）定位于纯直通发射器：CLI 默认 `--no-augment`，原样直发用户提示词（不再包 `Primary request:` / 14 行模板），把理解与优化留给远端 ChatGPT 网页大脑；
+      - 原生管线（`codex-gpt-image-2`）保持自动 `--augment` 提示词结构化，互不干扰。
+  · `SKILL.md` 精简为高密度执行手册（~105 行），彻底砍掉 Codex 端多轮空转：
+      - 内联 `chat` / `work` 完整模型与档位速查表（禁止生图前调 `tiers`、禁止无故 `--dry-run`、禁止默认 `view_image`）；
+      - 合并提示词写入与启动为单条命令（短提示词直接 `--prompt`，多行用同命令 PowerShell here-string）；
+      - 拉高 `yield_time_ms: 120000` 减少中途轮询；
+      - `image_gen.py` 写盘后直接输出 `Wrote <绝对路径> (<宽>x<高>, <大小>KB)`，彻底免去出图后再起 shell 核验文件尺寸；
+      - `bin/run.ps1` 仅在需要 Pillow 的参数时才探测 `import PIL`，省掉冷启动开销。
+  · 对齐网页端会话续接与改图体验（配合 DMIT `server.mjs` 修复）：
+      - `edit` 默认改为优先走 `openai-multipart`（与 `image-web` 100% 同协议，直接透传 `web_conv_key / web_mode / web_model / web_effort / background` 且省去 33% base64 编码；遇不支持 multipart 的中转再延迟回退 `codex-json`）；
+      - 同一 Codex 对话 = 同一网页对话：默认全程复用同一会话钥匙，不再擅自 `--new-conv`；
+      - 修改当前对话刚生成的图（网页管线）直接走 `generate` 原地追问修改（不重传原图 `--image`）；仅附加外部/本地图或走无状态原生端点时走 `edit --image`。
+  · 自检 72 项 → **77 项**。
 
 v1.5.3 档位别名防呆与单选交互优化（2026-11-23）
 ------------------------------

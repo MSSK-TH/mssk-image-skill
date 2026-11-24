@@ -1449,46 +1449,62 @@ def _post_edit_with_retries(
     deadline: Optional[float] = None,
     slow_after: float = 90.0,
     cached_contract: Optional[str] = None,
+    build_json_images: Optional[Callable[[], List[Dict[str, str]]]] = None,
 ) -> Tuple[Tuple[HttpResponse, Dict[str, Any]], str]:
-    """[relay] Speak whichever edits contract the relay implements (configurable via config.json edit_contract)."""
+    """[relay] Speak whichever edits contract the relay implements.
+
+    Default ("auto") tries ``openai-multipart`` first — identical to image-web,
+    passes ``web_conv_key``/``web_*`` untouched through new-api, and avoids 33%
+    base64 inflation. Falls back to ``codex-json`` if a gateway rejects multipart.
+    """
     contract = cached_contract or _load_edit_contract(creds.base_url)
 
-    if contract != "openai-multipart":
+    if contract != "codex-json":
         try:
-            result = _post_json_with_retries(
+            result = _post_multipart_with_retries(
                 creds,
                 "images/edits",
-                json_payload,
+                fields,
+                files,
                 attempts=attempts,
                 timeout=timeout,
                 label=label,
                 deadline=deadline,
                 slow_after=slow_after,
             )
-            _save_edit_contract(creds.base_url, "codex-json")
-            return result, "codex-json"
+            _save_edit_contract(creds.base_url, "openai-multipart")
+            return result, "openai-multipart"
         except RelayError as exc:
             message = str(exc).lower()
-            if "image is required" not in message and "images is required" not in message:
+            if (
+                exc.status not in (400, 415)
+                or not any(
+                    tok in message
+                    for tok in ("invalid json", "unsupported media", "application/json", "multipart")
+                )
+            ):
                 raise
-            _save_edit_contract(creds.base_url, "openai-multipart")
+            _save_edit_contract(creds.base_url, "codex-json")
             _info(
-                "Relay uses the OpenAI Images contract (multipart image); falling back now "
-                '(set "edit_contract": "openai-multipart" in config.json to skip this probe).'
+                "Relay expects the Codex JSON edits contract; falling back now "
+                '(set "edit_contract": "codex-json" in config.json to skip this probe).'
             )
 
-    result = _post_multipart_with_retries(
+    payload_to_send = dict(json_payload)
+    if not payload_to_send.get("images") and build_json_images is not None:
+        payload_to_send["images"] = build_json_images()
+    result = _post_json_with_retries(
         creds,
         "images/edits",
-        fields,
-        files,
+        payload_to_send,
         attempts=attempts,
         timeout=timeout,
         label=label,
         deadline=deadline,
         slow_after=slow_after,
     )
-    return result, "openai-multipart"
+    _save_edit_contract(creds.base_url, "codex-json")
+    return result, "codex-json"
 
 
 # --------------------------------------------------------------------------
@@ -1755,9 +1771,28 @@ def _fields_from_args(args: argparse.Namespace) -> Dict[str, Optional[str]]:
     }
 
 
+def _resolve_augment(
+    explicit: Optional[bool],
+    model: str,
+    fields: Dict[str, Optional[str]],
+) -> bool:
+    """按管线区分提示词增广默认行为：
+    - 显式传 --augment / --no-augment：始终服从；
+    - 传了任意 11 个结构化字段之一：自动 True（避免字段被静默丢弃）；
+    - 网页管线（gpt-image-2 等非 codex-* 模型）：默认 False（原样直传，交由对端 GPT-6/6.2 理解）；
+    - 原生端点（codex-*）：默认 True（无对端对话大脑，由本地 CLI/Agent 做结构化补全）。
+    """
+    if explicit is not None:
+        return bool(explicit)
+    if any(fields.values()):
+        return True
+    return str(model or "").strip().lower().startswith("codex-")
+
+
 def _augment_prompt(args: argparse.Namespace, prompt: str) -> str:
     fields = _fields_from_args(args)
-    return _augment_prompt_fields(args.augment, prompt, fields)
+    aug = _resolve_augment(args.augment, getattr(args, "model", DEFAULT_MODEL), fields)
+    return _augment_prompt_fields(aug, prompt, fields)
 
 
 def _augment_prompt_fields(
@@ -2417,12 +2452,15 @@ def _write_results(
             )
 
         _atomic_write_bytes(out_path, payload)
-        print(f"Wrote {out_path}")
+        pixels = _image_size_of(payload)
+        size_kb = max(1, (len(payload) + 1023) // 1024)
+        dim_tag = f"{pixels[0]}x{pixels[1]}, " if pixels else ""
+        print(f"Wrote {out_path.resolve()} ({dim_tag}{size_kb}KB)")
 
         artifact = WrittenArtifact(
             path=str(out_path),
             actual_size=result.actual_size,
-            pixels=_image_size_of(payload),
+            pixels=pixels,
             revised_prompt=result.revised_prompt,
             source=result.source,
             mime=result.mime or ("image/gif" if is_gif else None),
@@ -2455,7 +2493,10 @@ def _write_results(
                 result.raw, max_dim=downscale_max_dim, output_format=output_format
             )
             _atomic_write_bytes(derived, resized)
-            print(f"Wrote {derived}")
+            d_pixels = _image_size_of(resized)
+            d_kb = max(1, (len(resized) + 1023) // 1024)
+            d_tag = f"{d_pixels[0]}x{d_pixels[1]}, " if d_pixels else ""
+            print(f"Wrote {derived.resolve()} ({d_tag}{d_kb}KB)")
             artifact.downscaled = str(derived)
 
         artifacts.append(artifact)
@@ -2679,10 +2720,11 @@ def _generate(args: argparse.Namespace, creds: RelayCredentials) -> None:
         strict_size=args.strict_size,
     )
 
+    gen_fields = _fields_from_args(args)
     prompt, preflight_applied, _preflight_changes = _prepare_prompt(
         raw_prompt,
-        augment=args.augment,
-        fields=_fields_from_args(args),
+        augment=_resolve_augment(args.augment, args.model, gen_fields),
+        fields=gen_fields,
         quality=args.quality,
         background=args.background,
         preflight_mode=args.preflight,
@@ -2893,10 +2935,11 @@ def _edit(args: argparse.Namespace, creds: RelayCredentials) -> None:
         if mask_path.stat().st_size > MAX_IMAGE_BYTES:
             _warn(f"Mask exceeds 50MB limit: {mask_path}")
 
+    edit_fields = _fields_from_args(args)
     prompt, preflight_applied, _preflight_changes = _prepare_prompt(
         raw_prompt,
-        augment=args.augment,
-        fields=_fields_from_args(args),
+        augment=_resolve_augment(args.augment, args.model, edit_fields),
+        fields=edit_fields,
         quality=args.quality,
         background=args.background,
         preflight_mode=args.preflight,
@@ -2978,6 +3021,8 @@ def _edit(args: argparse.Namespace, creds: RelayCredentials) -> None:
     deadline = time.monotonic() + deadline_s
 
     base_fields: Dict[str, str] = {"model": args.model, "n": str(args.n)}
+    if args.background:
+        base_fields["background"] = args.background
     base_fields.update(mp_style_fields)
 
     files: List[Tuple[str, str, bytes, str]] = [
@@ -2988,12 +3033,9 @@ def _edit(args: argparse.Namespace, creds: RelayCredentials) -> None:
         files.append(("mask", mask_path.name, mask_path.read_bytes(), _guess_content_type(mask_path)))
 
     cached_contract = _load_edit_contract(creds.base_url)
-    # 若已缓存该中转站走 openai-multipart，则跳过昂贵的 base64/PNG 重编码
-    image_refs = (
-        []
-        if cached_contract == "openai-multipart"
-        else [{"image_url": _data_uri_for(path, args.max_dim)} for path in image_paths]
-    )
+    # 默认优先走 openai-multipart，跳过昂贵的 base64/PNG 重编码；仅显式固定 codex-json 或回退时才编码
+    build_json_images = lambda: [{"image_url": _data_uri_for(path, args.max_dim)} for path in image_paths]
+    image_refs = build_json_images() if cached_contract == "codex-json" else []
 
     def do_call(attempt_prompt: str, dl: float) -> Tuple[Tuple[HttpResponse, Dict[str, Any]], str]:
         fields = dict(base_fields, prompt=attempt_prompt)
@@ -3023,6 +3065,7 @@ def _edit(args: argparse.Namespace, creds: RelayCredentials) -> None:
             deadline=dl,
             slow_after=slow_after,
             cached_contract=cached_contract,
+            build_json_images=build_json_images,
         )
 
     ((response, decoded), contract), final_prompt = _run_with_refusal_retry(
@@ -3216,10 +3259,11 @@ def _reference(args: argparse.Namespace, creds: RelayCredentials) -> None:
         is_responses_route=True,
     )
 
+    edit_fields = _fields_from_args(args)
     prompt, preflight_applied, _preflight_changes = _prepare_prompt(
         raw_prompt,
-        augment=args.augment,
-        fields=_fields_from_args(args),
+        augment=_resolve_augment(args.augment, args.model, edit_fields),
+        fields=edit_fields,
         quality=args.quality,
         background=args.background,
         preflight_mode=args.preflight,
@@ -3448,7 +3492,7 @@ def _prepare_batch_job(
 
     augmented, job_preflight, _changes = _prepare_prompt(
         raw_prompt,
-        augment=args.augment,
+        augment=_resolve_augment(args.augment, model, fields),
         fields=fields,
         quality=job_payload.get("quality"),
         background=job_payload.get("background"),
@@ -3758,7 +3802,7 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--augment", dest="augment", action="store_true")
     parser.add_argument("--no-augment", dest="augment", action="store_false")
-    parser.set_defaults(augment=True)
+    parser.set_defaults(augment=None)
 
     # Prompt augmentation hints (official 11 fields)
     for flag in (

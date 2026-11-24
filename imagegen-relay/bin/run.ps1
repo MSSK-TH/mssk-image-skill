@@ -65,12 +65,22 @@ if ($pyCmd) {
 $uvCmd = Get-Command uv -ErrorAction SilentlyContinue
 
 if ($exe) {
+    $needsPil = $false
+    foreach ($a in $args) {
+        if ($a -match '^(--preset|--exact-size|--downscale-max-dim|--output-format|--max-dim)$') {
+            $needsPil = $true; break
+        }
+    }
+    if (-not $needsPil -or (-not $uvCmd)) {
+        & $exe @pre $cliPath @args
+        exit $LASTEXITCODE
+    }
     $hasPil = $false
     try {
         & $exe @pre -c "import PIL" 2>$null
         if ($LASTEXITCODE -eq 0) { $hasPil = $true }
     } catch { }
-    if ($hasPil -or (-not $uvCmd)) {
+    if ($hasPil) {
         & $exe @pre $cliPath @args
         exit $LASTEXITCODE
     }
