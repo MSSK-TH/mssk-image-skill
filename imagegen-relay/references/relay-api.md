@@ -57,12 +57,12 @@ Four `codex exec` captures against a custom provider `base_url` confirmed that t
 | `mssk_model` | `web_model` | Upstream reasoning model slug (omitted for `auto`) |
 | `mssk_gif_speed` | `gif_speed` | GIF playback speed multiplier (`0.25`..`2`, scales `animation.frame_duration_ms` only) |
 
-### Surface & Tier Mechanics (`webpipe.mjs`, verified 2026-11-23 against live `/backend-api/models`)
+### Surface & Tier Mechanics (`webpipe.mjs`, verified 2026-11-24 against live `/backend-api/models`)
 
 | | `chat` surface | `work` surface |
 | --- | --- | --- |
 | UI tiers | 3: `即时` / `中` / `高` | 5: `轻度` / `中` / `高` / `极高` / `最高` |
-| What changes | Preset slug per lane: `gpt-6-instant` / `gpt-6-thinking` and `gpt-5-6-instant` / `gpt-5-6-thinking` (hyphen `5-6`, no `-sol`) | Slug stays in the 10-model `-wm` family (`gpt-6.2-astra-wm` … `gpt-5.6-luna-wm`); only `thinking_effort` changes |
+| What changes | Preset slug per lane: `gpt-6-2-instant` / `gpt-6-2-thinking` (hyphen `6-2`), `gpt-6-instant` / `gpt-6-thinking`, and `gpt-5-6-instant` / `gpt-5-6-thinking` (hyphen `5-6`, no `-sol`) | Slug stays in the 10-model `-wm` family (`gpt-6.2-astra-wm` … `gpt-5.6-luna-wm`); only `thinking_effort` changes |
 | `effort` values | `none` (omitted, for `-instant`) / `standard` / `extended` | `min` / `standard` / `extended` / `xhigh` / `max` (no `none` tier; upstream returns `422` on `"minimal"`, which the CLI auto-maps to `min`) |
 | Same tiers across models? | Yes | Yes (all 10 `-wm` models share the exact 5 tiers) |
 
@@ -70,7 +70,7 @@ Because `/web/models` on the execution layer is a top-level route and `new-api` 
 
 ## Edit Contracts: OpenAI Multipart vs Codex JSON
 
-- **OpenAI Images contract** (`new-api` & `image-web` default): `multipart/form-data` with repeated `image` file parts, optional `mask`, `background`, and top-level `web_conv_key` / `web_mode` / `web_model` / `web_effort` / `gif_speed` fields (all passed untouched through `new-api` with zero base64 inflation).
+- **OpenAI Images contract** (`new-api` & `image-web` default): `multipart/form-data` with repeated `image` file parts, optional `mask`, `size`, `quality`, `background`, and top-level `web_conv_key` / `web_mode` / `web_model` / `web_effort` / `gif_speed` fields (all passed untouched through `new-api` with zero base64 inflation).
 - **Codex JSON contract** (`codex-rs/codex-api/src/endpoint/images.rs`): JSON body with `images: [{"image_url": "data:image/...;base64,..."}]` + `style.mssk_*`.
 
 `edit` uses `openai-multipart` first by default (matching `image-web`, skipping base64 encoding, and preserving conversation continuity & model selection through `new-api`), falling back lazily to `codex-json` only if a gateway rejects multipart with HTTP 400/415. You can pin `"edit_contract": "openai-multipart"` or `"codex-json"` in `config.json`.

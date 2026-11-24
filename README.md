@@ -7,7 +7,7 @@
 > 只有用 `--max-dim` / `--exact-size` / `--output-format` 这几个参数时才需要 Pillow
 > （装了 `uv` 的话 launcher 会自动带上，不用手动装）。
 
-当前版本 **v1.6.0**（2026-11-24）。
+当前版本 **v1.6.1**（2026-11-24）。
 
 ---
 
@@ -79,7 +79,7 @@ $imagegen-relay 生成一张海边日出的照片，要横版
   ```
 
 ```
-（聊天）模型：1) GPT-6   2) GPT-5.6 Sol
+（聊天）模型：1) GPT-6.2   2) GPT-6   3) GPT-5.6 Sol
 （聊天）档位：1)即时(none)   2)中(standard)   3)高(extended)
 
 （工作）模型：1) GPT-6.2 Astra  2) GPT-6.2 Sol  …  10) GPT-5.6 Luna（共 10 个 -wm 模型）
@@ -89,14 +89,14 @@ $imagegen-relay 生成一张海边日出的照片，要横版
 保存/更新全局默认示例：
 
 ```bash
-python scripts/image_gen.py setup --agent-model gpt-6-thinking --effort extended --web-mode chat
+python scripts/image_gen.py setup --agent-model gpt-6-2-thinking --effort extended --web-mode chat
 ```
 
 之后不传这三个参数时自动沿用；单次或单对话临时切换由命令行参数覆盖。
 
 | 模式 | 档位 | 什么时候用 |
 |---|---|---|
-| **聊天**（3 档） | 即时(`none`) / 中(`standard`) / 高(`extended`) | 日常出图，通过率更高（`GPT-5.6 Sol` 思考档 slug 为 `gpt-5-6-thinking`，即时档 `gpt-5-6-instant`） |
+| **聊天**（3 档） | 即时(`none`) / 中(`standard`) / 高(`extended`) | 日常出图，通过率更高（`GPT-6.2` slug 为 `gpt-6-2-thinking` / `gpt-6-2-instant`；`GPT-5.6 Sol` 为 `gpt-5-6-thinking` / `gpt-5-6-instant`） |
 | **工作**（5 档） | 轻度(`min`) / 中(`standard`) / 高(`extended`) / 极高(`xhigh`) / 最高(`max`) | 做卡片、网页素材、需要反复改的图 |
 
 > 工作模式没有"即时"档（`work + --effort none` 会被拒）；旧写法 `--effort minimal` 会自动映射为 `min` 并告警。
@@ -222,6 +222,13 @@ setup 持久化与清除、`[pipeline]` 上报、11 类错误码、参数校验�
 ---
 
 ## 变更记录
+
+**v1.6.1（2026-11-24）**
+
+- **聊天模式新增 `GPT-6.2`**：实测对齐上游真实 slug `gpt-6-2-thinking`（`standard`/`extended`）与 `gpt-6-2-instant`（`none`），小数点误写 `gpt-6.2-thinking` 提前告警并由服务端自动归一
+- **彻底修复参考图改比例误切 `reference` 的路由 bug**：`SKILL.md` 移除 `reference` 主路由，任何带参考图的生图/改图（无论目标 3:4、16:9、9:16 是否与参考图同比例）一律走网页管线 `edit --image`；内联比例表补齐 `3:4` 与 `2:3`；`_edit()` multipart 同步透传显式 `size`/`quality`
+- **锁死「原生仅作网页不可用后路」边界**（配合服务端 `shim/server.mjs` 与 `webpipe.mjs` 官方参考图抓包对齐）：网页管线内容安全/政策拒绝直接返回，严禁重开新对话或降级切原生；仅网页管线连接故障/不可用或用户明确点名时才走 `codex-gpt-image-2`
+- 自检 77 项 → **78 项**
 
 **v1.6.0（2026-11-24）**
 

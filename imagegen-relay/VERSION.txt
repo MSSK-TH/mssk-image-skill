@@ -1,9 +1,24 @@
 imagegen-relay  —— 版本戳
 ==================================================
-version : 1.6.0
-date    : 2026-11-24（网页管线直通极速模式 + 1:1 网页对话续接与原地改图 + edit 优先 multipart，v1.6.0）
+version : 1.6.1
+date    : 2026-11-24（聊天新增 GPT-6.2 + 参考图生图锁死网页管线支持任意比例 + 严控仅故障降级原生 + 官方参考图协议对齐，v1.6.1）
 baseline: 官方 imagegen（.system/imagegen）；以下 6 个文件内容完全一致（文本文件仅行尾符 LF/CRLF 差异）：
           prompting.md / sample-prompts.md / remove_chroma_key.py / LICENSE.txt / 两个图标
+
+v1.6.1 聊天新增 GPT-6.2、参考图路由收口与故障后路边界（2026-11-24）
+------------------------------
+  · 聊天模式（`chat`）新增实测校验的 **GPT-6.2** 家族（排在最前）：
+      - 思考档 `gpt-6-2-thinking`（`standard` / `extended`）、即时档 `gpt-6-2-instant`（`none`）；
+      - 小数点误写 `gpt-6.2-thinking` / `gpt-6.2-instant` 在 CLI 提前告警、服务端自动归一防 422。
+  · 彻底修复参考图生图因画幅不同被误切去 `reference`（`/v1/responses`）的严重路由 bug：
+      - `SKILL.md` 移除了 `reference` 主路由并写死硬规则：**任何带参考图的生图/改图，无论目标画幅（3:4、16:9、9:16 等）是否与原图一致，一律走网页管线 `edit --image`**；
+      - 内联比例表补齐 `3:4` (`1086x1448`) 与 `2:3` (`1024x1536`)，减少翻阅 `references/cli.md`；
+      - `image_gen.py` `_edit()` 在 `openai-multipart` 中同步透传显式 `size` / `quality`（配合 DMIT `server.mjs` `/v1/images/edits` 的 `foldParams`，`--size auto` 时仍 100% 原样直发）。
+  · 明确并锁死「原生仅作网页管线故障后路」边界（CLI 文档 + DMIT `server.mjs` 双端一致）：
+      - 网页管线遇到内容安全/政策拒绝（`e.refusal`）时直接原样返回，**严禁重开新对话重试或降级切去原生**；
+      - 仅当网页管线本身不可用（连接故障/超时/Cookie 失效/403 不可用）或用户明确点名时才走 `codex-gpt-image-2`。
+  · 配合 DMIT `webpipe.mjs` 对照 2026-11-24 浏览器抓包完成官方参考图请求体校准（`sediment://`、`attachments[].mime_type` + `source:'local'`、`/files` 与 `/prepare` 预热字段对齐）。
+  · 自检 77 项 → **78 项**。
 
 v1.6.0 网页直通极速模式与同对话改图对齐（2026-11-24）
 ------------------------------

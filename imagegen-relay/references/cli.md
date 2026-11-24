@@ -3,9 +3,9 @@
 This CLI is the relay sibling of official `imagegen`'s `scripts/image_gen.py`: same core subcommands (`generate`, `edit`, `generate-batch`), same official flags and prompt-augmentation engine, same output-path and batch JSONL semantics — plus relay-specific routes (`reference`, `setup`, `tiers`, `models`) and a stdlib-only HTTP transport (Python 3.9+; Pillow optional for local resample/re-encode).
 
 ## What this CLI does
-- `generate`: generate a new image from a prompt (`POST /v1/images/generations`)
-- `edit`: edit existing image(s) or run ratio-locked reference-driven generation (`POST /v1/images/edits`, primary reference route on this relay)
-- `reference`: chat-model-driven reference generation via `POST /v1/responses` + hosted `image_generation` tool (use when changing aspect ratio from the reference or for free style reinterpretation; ignores `style.mssk_*`, use `--reasoning-effort`)
+- `generate`: generate a new image or run an in-thread follow-up edit (`POST /v1/images/generations`)
+- `edit`: edit local/external image(s) or run reference-driven generation for **any target aspect ratio** (`POST /v1/images/edits`, primary reference route on the web pipeline; supports `--size` / `--preset`)
+- `reference`: explicit opt-in Responses route (`POST /v1/responses` + hosted `image_generation` tool; ignores `style.mssk_*` / web pipeline; **do not auto-select** for aspect-ratio changes — use only when explicitly requested)
 - `generate-batch`: run many generation jobs concurrently from a JSONL file (`--out-dir` required)
 - `setup`: persist web-pipeline defaults (`--web-mode`, `--effort`, `--agent-model`, `--ask-policy confirm|remember`) into `config.json`, or inspect safely with `--show [--json]` (never exposes `api_key`)
 - `tiers`: list web-pipeline surface, models, and reasoning tiers (`tiers` → `tiers --mode chat|work [--models|--efforts] [--json]`)

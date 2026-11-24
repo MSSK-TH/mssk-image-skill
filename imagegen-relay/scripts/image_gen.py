@@ -169,8 +169,9 @@ TRANSPARENT_PROMPT_LINE = (
 # --------------------------------------------------------------------------
 # [relay] Web-pipeline surface / model / effort definitions (Single Source of Truth)
 # --------------------------------------------------------------------------
-# 2026-11-23 对照真实上游 /backend-api/models（普通网页 chat + Codex Browser work）双端核对：
-#   - chat surface：3 档（即时/中/高），2 个模型家族，slug 按 lane 分列（-instant / -thinking）：
+# 2026-11-24 对照真实上游 /backend-api/models（普通网页 chat + Codex Browser work）双端核对：
+#   - chat surface：3 档（即时/中/高），3 个模型家族，slug 按 lane 分列（-instant / -thinking）：
+#       · GPT-6.2     → gpt-6-2-thinking（中 standard / 高 extended，注意连字符 6-2！）；即时档 gpt-6-2-instant（none）
 #       · GPT-6       → gpt-6-thinking（中 standard / 高 extended）；即时档 gpt-6-instant（none）
 #       · GPT-5.6 Sol → gpt-5-6-thinking（中 standard / 高 extended，注意连字符 5-6 无 -sol！）；
 #                       即时档 gpt-5-6-instant（none）
@@ -179,6 +180,7 @@ TRANSPARENT_PROMPT_LINE = (
 #
 # CLI 查不到账号实时模型清单（/web/models 是顶层路由，网关只转发 /v1/*）；不确定就传 --agent-model auto。
 WEB_CHAT_MODELS = [
+    {"name": "GPT-6.2", "value": "gpt-6-2-thinking", "instant_value": "gpt-6-2-instant"},
     {"name": "GPT-6", "value": "gpt-6-thinking", "instant_value": "gpt-6-instant"},
     {"name": "GPT-5.6 Sol", "value": "gpt-5-6-thinking", "instant_value": "gpt-5-6-instant"},
 ]
@@ -573,10 +575,16 @@ def _validate_web_controls(
             "chat 模式下 GPT-5.6 Sol 的真实 slug 为 gpt-5-6-thinking（即时档 gpt-5-6-instant），"
             "旧写法 gpt-5.6-sol-thinking 会在 prepare 阶段失效降级。"
         )
+    if mode == "chat" and model_str.lower() in ("gpt-6.2-thinking", "gpt-6.2-instant"):
+        fixed = model_str.lower().replace("6.2", "6-2")
+        _warn(
+            f"chat 模式下 GPT-6.2 的真实 slug 使用连字符（{fixed}），"
+            f"小数点写法 {model_str} 会在 prepare 阶段被拒。"
+        )
     if mode == "chat" and model_str.endswith("-instant") and eff and eff not in ("none", "auto"):
         _warn(
             f"chat 模式下 {model_str} 为即时档模型（不支持 thinking_effort），搭配 --effort {effort} "
-            "可能被上游拒绝；思考档请改用对应的 -thinking slug（如 gpt-6-thinking / gpt-5-6-thinking）。"
+            "可能被上游拒绝；思考档请改用对应的 -thinking slug（如 gpt-6-2-thinking / gpt-6-thinking / gpt-5-6-thinking）。"
         )
 
     if warn_slug_mismatch and model_str and model_str.lower() != "auto":
@@ -585,7 +593,7 @@ def _validate_web_controls(
         elif mode == "chat" and model_str.endswith("-wm"):
             _warn(
                 f"chat 模式通常不使用 -wm 后缀模型，当前指定为 {model_str}"
-                "（临时切 chat 时可加 --agent-model auto 或指定 gpt-6-thinking / gpt-5-6-thinking）"
+                "（临时切 chat 时可加 --agent-model auto 或指定 gpt-6-2-thinking / gpt-6-thinking / gpt-5-6-thinking）"
             )
     return effort
 
@@ -3021,6 +3029,10 @@ def _edit(args: argparse.Namespace, creds: RelayCredentials) -> None:
     deadline = time.monotonic() + deadline_s
 
     base_fields: Dict[str, str] = {"model": args.model, "n": str(args.n)}
+    if args.size and args.size != "auto":
+        base_fields["size"] = args.size
+    if args.quality and args.quality != "medium":
+        base_fields["quality"] = args.quality
     if args.background:
         base_fields["background"] = args.background
     base_fields.update(mp_style_fields)

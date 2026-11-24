@@ -398,8 +398,8 @@ def check_tiers() -> None:
         c_effs = [e["value"] for e in data["efforts"]]
         ok = (
             code == 0
-            and slugs == ["gpt-6-thinking", "gpt-5-6-thinking"]
-            and instants == ["gpt-6-instant", "gpt-5-6-instant"]
+            and slugs == ["gpt-6-2-thinking", "gpt-6-thinking", "gpt-5-6-thinking"]
+            and instants == ["gpt-6-2-instant", "gpt-6-instant", "gpt-5-6-instant"]
             and c_effs == ["none", "standard", "extended"]
         )
     except Exception:
@@ -824,6 +824,15 @@ def check_validation() -> None:
     record(
         "chat + 旧 slug gpt-5.6-sol-thinking 提前提示真实值 gpt-5-6-thinking",
         code == 0 and "gpt-5-6-thinking" in err,
+        err.strip(),
+    )
+    code, _, err = run(
+        ["generate", "--prompt", "x", "--web-mode", "chat", "--agent-model", "gpt-6.2-thinking", "--dry-run"],
+        env_extra=env_ok,
+    )
+    record(
+        "chat + 小数点写法 gpt-6.2-thinking 提前提示真实值 gpt-6-2-thinking",
+        code == 0 and "gpt-6-2-thinking" in err,
         err.strip(),
     )
     code, _, err = run(
